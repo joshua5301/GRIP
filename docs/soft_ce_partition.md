@@ -110,3 +110,40 @@ condensation runs. Selecting on these validation results is validation tuning.
 Older runs do not contain intermediate moments and cannot supply these snapshots;
 rerun optimization once with a checkpoint schedule. After completion, cached
 optimization and student tables can be reused with the same configuration/revision.
+
+## Uniform cell mass
+
+Set `mass_mode='uniform'` to constrain sum_j P_ij=1 and sum_i P_ij=N/m.
+The objective and CE head are unchanged. BalancedMoments solves
+P_ij = softmax_j(L_ij + v_j), adjusting column potentials v until the largest
+relative column residual is at most balance_tol (default 1e-8). Row sums follow
+from softmax. This is the KL projection of the row-softmax assignment onto the
+balanced transport constraints; it does not add a tunable entropy penalty to J.
+Warm-started potentials accelerate subsequent evaluations. Failure to meet the
+marginal tolerance within balance_steps stops the run. Equality is numerical,
+not exact arithmetic. No stop-gradient approximation is used for balancing.
+
+For an upstream moment gradient, let G be the unnormalized gradient for P,
+a_i=sum_j P_ij G_ij and pi=P^T 1/N. The column derivative solves
+
+(diag(pi)-P^T P/N) b = P-weighted column sums of (G-a)/N.
+
+The all-ones null direction is removed by a gauge term 11^T/m, not damping.
+The logit gradient is P_ij (G_ij-a_i-b_j+sum_k P_ik b_k)/N.
+Material aggregation and backward are chunked. The additional dense m x m
+Gram matrix costs O(N m²) work; balancing also adds repeated O(Nm) passes.
+This can be slower than free-mass optimization even at the same step budget.
+
+Uniform runs start from the same assignment logits as free runs, then balance
+them. Their step-zero representatives therefore differ; retain step zero to
+separate balancing at initialization from subsequent learning. Checkpoints and
+the best representative set retain equal masses within tolerance. Existing hard,
+soft-initial and ridge controls remain explicitly labeled mass_mode='free'.
+Under equal masses, mass-weighted CE equals uniform CE, while retaining the
+same evaluation code. The output reports mass_tv and mass_relative_residual.
+
+To reconstruct a saved best uniform P, load both best_assignment_logits.pt and
+best_assignment_column_dual.pt, then take row_softmax(logits.double()+dual).
+The logits alone do not describe the balanced assignment. Numerical tests cover
+marginals, global moments, finite-difference derivatives, gauge invariance,
+nonconvergence rejection, and uniform bilevel checkpoint reconstruction.

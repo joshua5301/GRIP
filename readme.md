@@ -566,3 +566,7 @@ See [implicit CE protocol](docs/soft_ce_partition.md).
 Use `checkpoint_steps=[0,100,200,300,500,750,1000]` with `steps=1000` to save and
 evaluate current representatives along one CE bilevel trajectory. Checkpoints
 share evaluation seeds and are selected by mean GCN validation accuracy only.
+
+Set `mass_mode='uniform'` for equal-mass soft cells. Balanced assignments use
+converged column potentials and an implicit derivative, with marginal residuals
+recorded alongside the existing CE solver diagnostics and checkpoint evaluation.

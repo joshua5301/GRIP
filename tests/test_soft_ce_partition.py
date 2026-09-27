@@ -152,3 +152,21 @@ def test_checkpoint_selection_uses_validation_and_earlier_step_tiebreak():
         dict(method='test_best', checkpoint_step=200, gcn_val=70., gcn_test=100.),
     ])
     assert model.select_checkpoint(table).method.iloc[0] == 'early'
+
+
+def test_uniform_mass_bilevel_checkpoints_and_saved_assignment(tmp_path):
+    z, q, assignment = problem()
+    result = model.optimize_ce_assignment(
+        z, q, assignment, penalty=.2, steps=2, lr=.02, chunk_size=4,
+        inner_tol=1e-9, cg_rtol=1e-9, folder=tmp_path, checkpoint_steps=[1],
+        mass_mode='uniform', balance_tol=1e-11, balance_steps=1000,
+    )
+    for snapshot in result['checkpoints'].values():
+        torch.testing.assert_close(snapshot['moments'][:, 0], z.new_full((4,), .25), atol=1e-11, rtol=0)
+        torch.testing.assert_close(snapshot['moments'].sum(0), make_material(z, q).mean(0))
+    logits = torch.load(tmp_path / 'best_assignment_logits.pt', weights_only=True)
+    dual = torch.load(tmp_path / 'best_assignment_column_dual.pt', weights_only=True)
+    probability = (logits.double() + dual).softmax(1)
+    moments = probability.T @ make_material(z, q) / len(z)
+    torch.testing.assert_close(moments, result['best_moments'])
+    assert all(row['column_residual'] <= 1e-11 for row in result['history'])

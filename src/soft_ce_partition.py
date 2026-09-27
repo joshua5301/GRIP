@@ -9,6 +9,7 @@ import torch
 import torch.nn.functional as F
 from tqdm.auto import trange
 
+from src.balanced_assignment import BalancedMoments
 from src.node_distances import array_digest
 from src.ntk_transforms import FeatureTransform
 from src.risk_experiment import _fingerprint, _prepare_dataset, _train_student
@@ -130,10 +131,13 @@ def implicit_moment_gradient(moments, dimension, theta, vector, penalty):
 def optimize_ce_assignment(z, q, assignment, penalty=3e-5, steps=300, lr=.01,
                            mixing=.05, chunk_size=4096, inner_max_iter=2000,
                            inner_tol=1e-7, cg_max_iter=512, cg_rtol=1e-6,
-                           save_assignment=True, folder=None, checkpoint_steps=()):
+                           save_assignment=True, folder=None, checkpoint_steps=(),
+                           mass_mode='free', balance_steps=300, balance_tol=1e-8):
     if steps < 0 or any(not np.isfinite(v) or v <= 0 for v in
                         (penalty, lr, chunk_size, inner_max_iter, inner_tol, cg_max_iter, cg_rtol)):
         raise ValueError('Require positive finite solver settings and nonnegative steps')
+    if mass_mode not in ('free', 'uniform') or balance_steps < 1 or not 0 < balance_tol < 1:
+        raise ValueError('Invalid mass constraint settings')
     checkpoints = set(checkpoint_steps)
     if any(not isinstance(step, (int, np.integer)) or not 0 <= step <= steps for step in checkpoints):
         raise ValueError('Checkpoint steps must be integers within the optimization budget')
@@ -146,11 +150,18 @@ def optimize_ce_assignment(z, q, assignment, penalty=3e-5, steps=300, lr=.01,
     folder = Path(folder) if folder is not None else None
     if folder is not None:
         folder.mkdir(parents=True, exist_ok=True)
-    history, theta, best = [], None, float('inf')
+    history, theta, best, dual = [], None, float('inf'), None
     started = time.perf_counter()
     for step in trange(steps + 1, desc='CE inner + CE outer'):
         optimizer.zero_grad(set_to_none=True)
-        moments = AssignmentMoments.apply(logits, material, chunk_size)
+        balance = dict(balance_iterations=0, row_residual=np.nan, column_residual=np.nan)
+        if mass_mode == 'uniform':
+            moments, dual, diagnostic = BalancedMoments.apply(
+                logits, material, chunk_size, balance_steps, balance_tol, dual)
+            balance = dict(balance_iterations=int(diagnostic[0]), row_residual=float(diagnostic[1]),
+                           column_residual=float(diagnostic[2]))
+        else:
+            moments = AssignmentMoments.apply(logits, material, chunk_size)
         if not bool(torch.isfinite(moments).all()) or bool((moments[:, 0] <= 0).any()):
             raise FloatingPointError('Nonfinite moments or empty soft cell')
         centers, labels, mass = decode_moments(moments.detach(), z.shape[1])
@@ -158,7 +169,7 @@ def optimize_ce_assignment(z, q, assignment, penalty=3e-5, steps=300, lr=.01,
                              inner_tol, cg_max_iter=cg_max_iter)
         theta = fitted.pop('theta')
         value, outer_gradient = outer_value_gradient(z, q, theta, chunk_size)
-        row = dict(step=step, J=value, **fitted, cg_iterations=0, cg_residual=np.nan,
+        row = dict(step=step, J=value, **fitted, **balance, cg_iterations=0, cg_residual=np.nan,
                    cg_relative_residual=np.nan, cg_converged=False,
                    min_mass=float(mass.min()), max_mass=float(mass.max()),
                    effective_cells=float(1 / mass.square().sum()))
@@ -174,6 +185,7 @@ def optimize_ce_assignment(z, q, assignment, penalty=3e-5, steps=300, lr=.01,
                 best_moments, best_theta = moments.detach().cpu(), theta.cpu()
                 if save_assignment:
                     best_logits = logits.detach().clone()
+                    best_dual = dual.clone() if dual is not None else None
             if step < steps:
                 multiply, diagonal = hessian_operator(augmented(centers), labels, mass, theta, penalty)
                 vector, diagnostic = conjugate_gradient(multiply, outer_gradient, diagonal,
@@ -207,9 +219,11 @@ def optimize_ce_assignment(z, q, assignment, penalty=3e-5, steps=300, lr=.01,
         optimizer.step()
     result = dict(initial_moments=initial_moments, best_moments=best_moments,
                   theta=best_theta, best_J=best, best_step=best_step, history=history,
-                  penalty=penalty, steps=steps, checkpoints=snapshots)
+                  penalty=penalty, steps=steps, checkpoints=snapshots, mass_mode=mass_mode)
     if folder is not None and save_assignment:
         torch.save(best_logits.cpu(), folder / 'best_assignment_logits.pt')
+        if best_dual is not None:
+            torch.save(best_dual.cpu(), folder / 'best_assignment_column_dual.pt')
     return result
 
 
@@ -227,7 +241,8 @@ def select_checkpoint(table):
 def run_soft_ce(previous_run, output_dir=None, penalty=3e-5, steps=300, lr=.01,
                  chunk_size=4096, inner_max_iter=2000, inner_tol=1e-7,
                  cg_max_iter=512, cg_rtol=1e-6, save_assignment=True,
-                 data_dir='/content/data/', device='cuda', checkpoint_steps=()):
+                 data_dir='/content/data/', device='cuda', checkpoint_steps=(),
+                 mass_mode='free', balance_steps=300, balance_tol=1e-8):
     previous_run = Path(previous_run)
     prior = json.loads((previous_run / 'config.json').read_text())
     original, source = prior['original'], Path(prior['source'])
@@ -255,7 +270,8 @@ def run_soft_ce(previous_run, output_dir=None, penalty=3e-5, steps=300, lr=.01,
     options = dict(penalty=penalty, steps=steps, lr=lr, mixing=prior['mixing'], chunk_size=chunk_size,
                    inner_max_iter=inner_max_iter, inner_tol=inner_tol, cg_max_iter=cg_max_iter,
                    cg_rtol=cg_rtol, save_assignment=save_assignment,
-                   checkpoint_steps=sorted(set(checkpoint_steps)))
+                   checkpoint_steps=sorted(set(checkpoint_steps)), mass_mode=mass_mode,
+                   balance_steps=balance_steps, balance_tol=balance_tol)
     methods = ['hard_baseline', 'soft_initial', 'ridge_optimized', 'ce_optimized']
     controls = {name: torch.load(previous_run / f'{name}.pt', map_location='cpu', weights_only=False)
                 for name in methods}
@@ -274,7 +290,7 @@ def run_soft_ce(previous_run, output_dir=None, penalty=3e-5, steps=300, lr=.01,
         optimized = optimize_ce_assignment(z, q, assignment, folder=root, **options)
         torch.save(optimized, optimized_path)
     old_initial = torch.load(previous_run / 'optimized.pt', map_location='cpu', weights_only=False)['initial_moments']
-    if not torch.allclose(optimized['initial_moments'], old_initial, atol=1e-10, rtol=1e-8):
+    if mass_mode == 'free' and not torch.allclose(optimized['initial_moments'], old_initial, atol=1e-10, rtol=1e-8):
         raise ValueError('Initialization differs from the previous experiment')
     state = {key: value.cpu() if torch.is_tensor(value) else value for key, value in reference['transform'].items()}
     checkpoint_numbers = {}
@@ -324,6 +340,9 @@ def run_soft_ce(previous_run, output_dir=None, penalty=3e-5, steps=300, lr=.01,
         students.to_csv(student_path, index=False)
         student_tables.append(students.assign(method=method))
         summaries.append(dict(method=method, nodes=len(cx), penalty=penalty, teacher_ce=ce,
+                              mass_mode=mass_mode if method in representatives else 'free',
+                              mass_tv=float((mass - 1 / len(mass)).abs().sum() / 2),
+                              mass_relative_residual=float((mass * len(mass) - 1).abs().max()),
                               linear_val=val, linear_test=test, linear_val_ce=val_ce, linear_test_ce=test_ce,
                               **fitted, head_norm=float(theta.norm()), effective_cells=float(1 / mass.square().sum()),
                               gcn_val=students.val.mean(), gcn_val_std=students.val.std(ddof=0),
