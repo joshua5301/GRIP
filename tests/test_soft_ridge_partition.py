@@ -1,4 +1,5 @@
 import torch
+import pytest
 
 from src.soft_ridge_partition import (AssignmentMoments, augmented, decode_moments,
                                       excess_objective, initial_logits, make_material,
@@ -63,14 +64,38 @@ def test_excess_equals_actual_regularized_full_loss_difference():
     torch.testing.assert_close(excess_objective(weight, reference, system), objective(weight) - objective(reference))
 
 
-def test_best_assignment_checkpoint_matches_representatives(tmp_path):
+@pytest.mark.parametrize('outer_loss', ['ridge', 'ce'])
+def test_best_assignment_checkpoint_matches_representatives(tmp_path, outer_loss):
     z, q, assignment, system, reference = problem()
     result = optimize_assignment(z, q, assignment, .02, reference, system, steps=4,
-                                 chunk_size=5, log_every=1, folder=tmp_path)
+                                 chunk_size=5, log_every=1, folder=tmp_path,
+                                 outer_loss=outer_loss, score_temperature=.2)
     best_logits = torch.load(tmp_path / 'best_assignment_logits.pt', weights_only=True)
     reproduced = AssignmentMoments.apply(best_logits, make_material(z, q), 5)
     torch.testing.assert_close(reproduced, result['best_moments'])
-    value = moment_objective(reproduced, z.shape[1], .02, reference, system)
+    value = moment_objective(reproduced, z.shape[1], .02, reference, system,
+                             outer_loss, z, q, .2)
     assert abs(float(value) - result['best_J']) < 1e-12
     history = [r['best_J'] for r in result['history']]
     assert all(b <= a for a, b in zip(history, history[1:]))
+
+
+def test_outer_ce_value_and_assignment_gradient():
+    z, q, assignment, system, reference = problem()
+    logits = initial_logits(assignment, 3, .1, dtype=torch.double).requires_grad_()
+    material = make_material(z, q)
+    def objective(value):
+        moments = AssignmentMoments.apply(value, material, 5)
+        return moment_objective(moments, z.shape[1], .02, reference, system, 'ce', z, q, .2)
+    probability = logits.softmax(1)
+    mass = probability.sum(0) / len(z)
+    centers = probability.T @ z / (len(z) * mass[:, None])
+    labels = probability.T @ q / (len(z) * mass[:, None])
+    weight = ridge_head(centers, labels, mass, .02)
+    expected = torch.nn.functional.cross_entropy(augmented(z) @ weight / .2, q)
+    actual = objective(logits)
+    torch.testing.assert_close(actual, expected)
+    ga, = torch.autograd.grad(actual, logits)
+    gb, = torch.autograd.grad(expected, logits)
+    torch.testing.assert_close(ga, gb, atol=1e-11, rtol=1e-9)
+    assert torch.autograd.gradcheck(objective, (logits,), eps=1e-6, atol=1e-6, rtol=1e-4)

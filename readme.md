@@ -551,3 +551,8 @@ common baseline GCN evaluation.
 through an exact ridge solve, coupling representative features, labels and masses.
 It compares the hard baseline, soft initialization and optimized soft condensation.
 See [objective and memory protocol](docs/soft_ridge_partition.md).
+
+`src.soft_ridge_partition.run_soft_ridge_ce(previous_run, ...)` keeps the inner
+ridge solve but optimizes assignments by outer teacher CE. It reuses prior GCN
+controls, fixes a validation-calibrated score temperature before optimization,
+and evaluates new mass-CE GCN students only for the CE-optimized representatives.

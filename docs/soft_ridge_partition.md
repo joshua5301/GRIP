@@ -75,3 +75,39 @@ diagnoses mass imbalance; all cells retain soft positive mass absent underflow.
 Local numerical training/tests are not part of the workflow. Colab tests check
 chunked gradients against dense autograd and finite differences, mixing and mean
 preservation, exact objective identity, and selected assignment checkpoint fidelity.
+
+## Cross-entropy outer objective
+
+`run_soft_ridge_ce(previous_run, ...)` retains the previous ridge penalty, teacher
+probabilities, hard partition, mixing, GCN settings and evaluation seeds. It starts
+from the original mixed hard assignment, not the ridge-optimized assignment.
+The inner solution remains weighted ridge regression on the coupled cell means:
+
+W(P) = solve(C_aug^T diag(pi) C_aug + lambda I, C_aug^T diag(pi) S).
+
+Only the outer objective changes to
+
+J_CE(P) = -(1/N) sum_i sum_k q_ik log softmax([z_i,1] W(P) / tau)_k.
+
+There is no extra outer weight penalty. Differentiation passes through the ridge
+solve and cell means to assignment logits. Unlike ridge excess, CE requires logits
+on all original nodes each step; it cannot be computed from G and H alone.
+Its minimum is not assumed to occur at the full-data ridge solution.
+
+Ridge outputs are regression scores. The separate positive score temperature tau
+is selected once by ground-truth validation CE of the full-data ridge reference,
+then frozen for optimization and every comparison. It does not change teacher
+label temperature T or argmax predictions of a fixed head. Use
+`score_temperatures=[1.]` to disable calibration. No validation or test labels
+enter the assignment objective; validation does inform the fixed calibration.
+The checkpoint is selected solely by teacher CE on all nodes. This objective
+still targets teacher predictions rather than ground-truth accuracy.
+
+The wrapper verifies comparison provenance and reuses previous GCN evaluations
+for `hard_baseline`, `soft_initial` and `ridge_optimized`. Only `ce_optimized`
+needs new GCN fits. All four ridge heads are reevaluated with the same tau and
+report both teacher CE and ridge excess. Previous ridge J and current CE J have
+different meanings and must not be compared numerically. `temperature_grid.csv`
+records calibration; `optimization.csv` now tracks CE when outer_loss is ce.
+Tests additionally check CE gradients against dense autograd and finite
+differences, and ensure saved checkpoints minimize the chosen outer objective.
