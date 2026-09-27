@@ -509,3 +509,9 @@ variant of original risk clustering: sum the cellwise cross-moment Frobenius nor
 instead of taking the norm after summing cells. The teacher, propagated features,
 initialization, representatives and student pipeline remain the original risk
 ones. See [paired-grid protocol and scope](docs/risk_local.md).
+
+`src.ntk_risk.run_ntk_risk` clusters analytic two-layer GCN NTK features with the
+original global risk objective, then reconstructs each centroid as a within-cell
+convex combination of raw inputs under synthetic adjacency A=I. It compares raw
+means and reconstructed representatives with validation-selected grids and final
+test seeds. See [cross-graph kernel and scope](docs/ntk_risk.md).
