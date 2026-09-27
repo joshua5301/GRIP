@@ -2,7 +2,9 @@ import numpy as np
 import torch
 
 from src.gcn_kernel_features import gcn_two_layer_kernels
-from src.ntk_risk import fit_representatives, graph_kernel, spectral_features, tangent_kernel
+from src.ntk_risk import fit_representatives, graph_kernel, readout_representation, spectral_features, tangent_kernel
+from src.models import GCN
+from src.risk_experiment import _forward
 from torch_geometric.nn.conv.gcn_conv import gcn_norm
 
 
@@ -67,3 +69,41 @@ def test_identity_singletons_have_zero_reconstruction_error():
     result = fit_representatives(x, s, graph_kernel(x, s), torch.arange(2), steps=2)
     np.testing.assert_allclose(result['reconstruction_final'], 0, atol=1e-10)
     torch.testing.assert_close(result['x'], x.float())
+
+
+def test_teacher_representation_includes_final_propagation():
+    torch.manual_seed(17)
+    model = GCN(2, 5, 3, 2, .5).double().eval()
+    x = torch.tensor([[1., .2], [.1, 2.], [-2., 1.]], dtype=torch.float64)
+    edges = torch.tensor([[0, 1, 1, 2], [1, 0, 2, 1]])
+    for adjacency in (None, propagation(edges, len(x))):
+        features = readout_representation(model, x, adjacency)
+        logits = model.layers[-1].lin(features) + model.layers[-1].bias
+        torch.testing.assert_close(logits.log_softmax(1), _forward(model, x, adjacency))
+
+
+def test_teacher_convex_reconstruction_uses_identity_and_freezes_teacher():
+    torch.manual_seed(18)
+    model = GCN(2, 5, 3, 2, .5).double().eval().requires_grad_(False)
+    before = {k: v.clone() for k, v in model.state_dict().items()}
+    x = torch.tensor([[1., .2], [.1, 2.], [-2., 1.]], dtype=torch.float64)
+    s = propagation(torch.tensor([[0, 1, 1, 2], [1, 0, 2, 1]]), len(x))
+    features = readout_representation(model, x, s)
+    assignment = torch.tensor([0, 0, 1])
+    result = fit_representatives(x, s, None, assignment, steps=4,
+                                teacher=model, teacher_features=features)
+    means = torch.stack([x[:2].mean(0), x[2]])
+    targets = torch.stack([features[:2].mean(0), features[2]])
+    errors = (readout_representation(model, means) - targets).square().sum(1)
+    expected = (errors * torch.tensor([2 / 3, 1 / 3])).sum() / features.square().sum(1).mean()
+    torch.testing.assert_close(torch.tensor(result['reconstruction_initial'], dtype=x.dtype),
+                               expected, atol=1e-7, rtol=1e-7)
+    weights = result['weights']
+    torch.testing.assert_close(torch.zeros(2, dtype=x.dtype).index_add_(0, assignment, weights),
+                               torch.ones(2, dtype=x.dtype))
+    assert bool((weights >= 0).all())
+    reconstructed = torch.zeros(2, 2, dtype=x.dtype).index_add_(0, assignment, weights[:, None] * x)
+    torch.testing.assert_close(result['x'].double(), reconstructed, atol=1e-6, rtol=1e-6)
+    assert result['reconstruction_final'] <= result['reconstruction_initial'] + 1e-12
+    for name, value in model.state_dict().items():
+        torch.testing.assert_close(value, before[name])

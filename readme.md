@@ -515,3 +515,8 @@ original global risk objective, then reconstructs each centroid as a within-cell
 convex combination of raw inputs under synthetic adjacency A=I. It compares raw
 means and reconstructed representatives with validation-selected grids and final
 test seeds. See [cross-graph kernel and scope](docs/ntk_risk.md).
+
+`src.ntk_risk.run_representation_risk` compares that NTK with a trained GCN's
+pre-classifier representation using the same global risk solver and raw-input
+convex reconstruction. It defaults to mass CE and `raw_convex`, retaining the
+same kernel-teacher soft labels across representations and all densities.

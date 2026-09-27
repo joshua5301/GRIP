@@ -11,7 +11,8 @@ from torch_geometric import seed_everything
 from src.convex_representatives import cluster_softmax, convex_features
 from src.grid_search import GridStudy
 from src.node_distances import array_digest
-from src.risk_experiment import _fingerprint, _prepare_dataset, _train_student
+from src.models import GCN
+from src.risk_experiment import _accuracy, _fingerprint, _forward, _prepare_dataset, _train_student
 from src.risk_partition import risk_partition
 from src.teacher import fit_logistic, get_kernel_features
 from src.utils import BUDGET
@@ -44,7 +45,51 @@ def spectral_features(kernel):
     return vectors * values.clamp_min(0).sqrt()
 
 
-def fit_representatives(x, propagation, kernel, assignment, steps=1000, lr=.05):
+def readout_representation(model, x, propagation=None):
+    layer = model.layers[0]
+    value = layer.lin(x)
+    if propagation is not None:
+        value = torch.sparse.mm(propagation, value)
+    if layer.bias is not None:
+        value = value + layer.bias
+    value = value.relu()
+    return value if propagation is None else torch.sparse.mm(propagation, value)
+
+
+def prepare_representation_teacher(train, mask, validation, directory, options):
+    seed_everything(options['seed'])
+    model = GCN(train['x'].shape[1], options['hidden'], int(train['y'].max()) + 1,
+                2, options['dropout']).to(train['x'].device)
+    path = directory / 'representation_teacher.pt'
+    if path.exists():
+        saved = torch.load(path, map_location='cpu', weights_only=False)
+    else:
+        optimizer = torch.optim.Adam(model.parameters(), lr=options['lr'], weight_decay=options['weight_decay'])
+        best, records = -1., []
+        for epoch in range(1, options['epochs'] + 1):
+            model.train()
+            optimizer.zero_grad(set_to_none=True)
+            loss = F.nll_loss(_forward(model, train['x'], train['adj'])[mask], train['y'][mask])
+            loss.backward()
+            optimizer.step()
+            if epoch % options['eval_every'] == 0 or epoch == options['epochs']:
+                value = _accuracy(model, validation)
+                records.append(dict(epoch=epoch, validation=value))
+                if value > best:
+                    best = value
+                    saved = dict(state_dict={k: v.detach().cpu().clone() for k, v in model.state_dict().items()},
+                                 best_epoch=epoch, validation=value, options=options)
+        torch.save(saved, path)
+        pd.DataFrame(records).to_csv(directory / 'teacher_validation.csv', index=False)
+    model.load_state_dict(saved['state_dict'])
+    model = model.double().eval().requires_grad_(False)
+    with torch.no_grad():
+        features = readout_representation(model, train['x'].double(), train['adj'].double())
+    return model, features, dict(best_epoch=saved['best_epoch'], validation=saved['validation'])
+
+
+def fit_representatives(x, propagation, kernel, assignment, steps=1000, lr=.05,
+                        teacher=None, teacher_features=None):
     x, propagation = x.double(), propagation.double().to_sparse_coo().coalesce()
     assignment = assignment.to(x.device)
     clusters = int(assignment.max()) + 1
@@ -52,23 +97,34 @@ def fit_representatives(x, propagation, kernel, assignment, steps=1000, lr=.05):
     if bool((counts == 0).any()):
         raise ValueError('Every cell must have a member')
     membership = F.one_hot(assignment, clusters).to(x.dtype) / counts
-    target_norm = (membership * (kernel @ membership)).sum(0)
-    support = torch.sparse.mm(propagation.transpose(0, 1), membership)
-    propagated = torch.sparse.mm(propagation, x) / np.sqrt(x.shape[1])
     mass = counts / counts.sum()
-    scale = kernel.diag().mean().clamp_min(1e-30)
+    if teacher is None:
+        target_norm = (membership * (kernel @ membership)).sum(0)
+        support = torch.sparse.mm(propagation.transpose(0, 1), membership)
+        propagated = torch.sparse.mm(propagation, x) / np.sqrt(x.shape[1])
+        scale = kernel.diag().mean().clamp_min(1e-30)
+
+        def errors(representatives):
+            inputs = representatives / np.sqrt(x.shape[1])
+            cross = (tangent_kernel(inputs, propagated) * support.T).sum(1)
+            return 2 * inputs.square().sum(1) - 2 * cross + target_norm
+    else:
+        teacher.eval().requires_grad_(False)
+        targets = (membership.T @ teacher_features).detach()
+        scale = teacher_features.square().sum(1).mean().detach().clamp_min(1e-30)
+
+        def errors(representatives):
+            return (readout_representation(teacher, representatives) - targets).square().sum(1)
     scores = torch.zeros(len(x), dtype=x.dtype, device=x.device, requires_grad=True)
     optimizer = torch.optim.Adam([scores], lr=lr)
     history, best_loss, best_weights = [], float('inf'), None
     for step in range(steps + 1):
         weights = cluster_softmax(scores, assignment, clusters)
         representatives = convex_features(x, assignment, weights, clusters)
-        inputs = representatives / np.sqrt(x.shape[1])
-        cross = (tangent_kernel(inputs, propagated) * support.T).sum(1)
-        error = 2 * inputs.square().sum(1) - 2 * cross + target_norm
+        error = errors(representatives)
         loss = (mass * error).sum() / scale
         if not bool(torch.isfinite(loss)):
-            raise FloatingPointError('Nonfinite NTK reconstruction loss')
+            raise FloatingPointError('Nonfinite reconstruction loss')
         value = float(loss.detach())
         if value < best_loss:
             best_loss, best_weights = value, weights.detach().clone()
@@ -87,7 +143,10 @@ def run_ntk_risk(datasets, space, output_dir, modes=('raw_mean', 'raw_convex'),
                  data_dir='/content/data/', device='cuda', seed=0,
                  search_seeds=(0, 1, 2), final_seeds=tuple(range(100, 110)),
                  loss_weighting='uniform', epochs=1000, eval_every=10, hidden=256,
-                 max_sweeps=30, reconstruction_steps=1000, reconstruction_lr=.05):
+                 max_sweeps=30, reconstruction_steps=1000, reconstruction_lr=.05,
+                 representation='ntk', representation_teacher=None):
+    if representation not in ('ntk', 'gcn_teacher'):
+        raise ValueError('Require ntk or gcn_teacher representation')
     if set(datasets) - {'cora', 'citeseer'}:
         raise ValueError('Full NTK is implemented for Cora and CiteSeer only')
     if set(modes) - {'raw_mean', 'raw_convex', 's2x_mean'}:
@@ -96,10 +155,14 @@ def run_ntk_risk(datasets, space, output_dir, modes=('raw_mean', 'raw_convex'),
         raise ValueError('Require modes and student seeds')
     revision = subprocess.check_output(['git', 'rev-parse', 'HEAD'], text=True).strip()
     settings = dict(epochs=epochs, eval_every=eval_every, hidden=hidden, loss_weighting=loss_weighting)
+    teacher_options = dict(hidden=256, dropout=.5, lr=.01, weight_decay=5e-4,
+                           epochs=1000, eval_every=10, seed=0)
+    teacher_options.update(representation_teacher or {})
     config = dict(datasets=datasets, space=space, modes=modes, seed=seed,
                   search_seeds=list(search_seeds), final_seeds=list(final_seeds), settings=settings,
                   max_sweeps=max_sweeps, reconstruction_steps=reconstruction_steps,
-                  reconstruction_lr=reconstruction_lr, revision=revision, schema=1)
+                  reconstruction_lr=reconstruction_lr, revision=revision, schema=2,
+                  representation=representation, representation_teacher=teacher_options)
     root = Path(output_dir) / _fingerprint(config)
     root.mkdir(parents=True, exist_ok=True)
     (root / 'config.json').write_text(json.dumps(config, indent=2), encoding='utf-8')
@@ -114,7 +177,13 @@ def run_ntk_risk(datasets, space, output_dir, modes=('raw_mean', 'raw_convex'),
         directory = root / f'{name}_{digest[:12]}'
         directory.mkdir(exist_ok=True)
         kernel_path = directory / 'kernel.pt'
-        if kernel_path.exists():
+        model, teacher_details = None, {}
+        if representation == 'gcn_teacher':
+            model, features, teacher_details = prepare_representation_teacher(
+                train, mask, validation, directory, teacher_options)
+            kernel = None
+            (directory / 'teacher_summary.json').write_text(json.dumps(teacher_details, indent=2), encoding='utf-8')
+        elif kernel_path.exists():
             cached = torch.load(kernel_path, map_location=device, weights_only=False)
             kernel, features = cached['kernel'], cached['features']
         else:
@@ -156,7 +225,8 @@ def run_ntk_risk(datasets, space, output_dir, modes=('raw_mean', 'raw_convex'),
                     torch.save(result, path)
                 if mode == 'raw_convex' and 'raw_convex' not in result:
                     fitted = fit_representatives(x, propagation, kernel, result['assignment'],
-                                                reconstruction_steps, reconstruction_lr)
+                                                reconstruction_steps, reconstruction_lr,
+                                                teacher=model, teacher_features=features if model is not None else None)
                     result['raw_convex'] = fitted.pop('x')
                     result.update(fitted)
                     torch.save(result, path)
@@ -192,7 +262,8 @@ def run_ntk_risk(datasets, space, output_dir, modes=('raw_mean', 'raw_convex'),
                     final.to_csv(final_path, index=False)
                 (mode_dir / 'best.json').write_text(json.dumps(dict(params=best.params, value=best.value,
                                                    partition_path=str(path)), indent=2), encoding='utf-8')
-                row = dict(dataset=name, ratio=ratio, mode=mode, nodes=clusters, loss_weighting=loss_weighting,
+                row = dict(dataset=name, ratio=ratio, mode=mode, representation=representation,
+                           nodes=clusters, loss_weighting=loss_weighting,
                            **best.params, search_val=100 * best.value, final_val=final.val.mean(),
                            final_val_std=final.val.std(ddof=0), test_mean=final.test.mean(), test_std=final.test.std(ddof=0),
                            J_initial=data['history'][0], J_final=data['J'], converged=data['converged'],
@@ -200,6 +271,21 @@ def run_ntk_risk(datasets, space, output_dir, modes=('raw_mean', 'raw_convex'),
                 if mode == 'raw_convex':
                     row.update({k: data[k] for k in ('reconstruction_initial', 'reconstruction_final', 'reconstruction_step')})
                     pd.DataFrame(data['reconstruction_history']).to_csv(mode_dir / 'reconstruction.csv', index=False)
+                if teacher_details:
+                    row.update(representation_teacher_val=100 * teacher_details['validation'],
+                               representation_teacher_epoch=teacher_details['best_epoch'])
                 rows.append(row)
                 pd.DataFrame(rows).to_csv(root / 'summary.csv', index=False)
     return pd.DataFrame(rows)
+
+
+def run_representation_risk(datasets, space, output_dir, representations=('ntk', 'gcn_teacher'),
+                            modes=('raw_convex',), loss_weighting='mass', **settings):
+    results = []
+    for representation in representations:
+        results.append(run_ntk_risk(datasets, space, output_dir, modes=modes,
+                                   loss_weighting=loss_weighting, representation=representation, **settings))
+    combined = pd.concat(results, ignore_index=True)
+    comparison = Path(output_dir) / f"comparison_{_fingerprint(combined.output_dir.unique().tolist())}.csv"
+    combined.to_csv(comparison, index=False)
+    return combined
