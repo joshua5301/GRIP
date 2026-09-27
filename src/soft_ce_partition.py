@@ -130,6 +130,16 @@ def implicit_moment_gradient(moments, dimension, theta, vector, penalty):
     return result
 
 
+def cpu_state(value):
+    if torch.is_tensor(value):
+        return value.detach().cpu().clone()
+    if isinstance(value, dict):
+        return {key: cpu_state(item) for key, item in value.items()}
+    if isinstance(value, (list, tuple)):
+        return [cpu_state(item) for item in value]
+    return value
+
+
 def optimize_ce_assignment(z, q, assignment, penalty=3e-5, steps=300, lr=.01,
                            mixing=.05, chunk_size=4096, inner_max_iter=2000,
                            inner_tol=1e-7, cg_max_iter=512, cg_rtol=1e-6,
@@ -137,7 +147,14 @@ def optimize_ce_assignment(z, q, assignment, penalty=3e-5, steps=300, lr=.01,
                            mass_mode='free', balance_steps=300, balance_tol=1e-8,
                            balance_backend='cached', balance_cg_steps=512, balance_cg_rtol=1e-7,
                            outer_chunk_size=65536, log_every=10, assignment_rank=None, factor_seed=0,
-                           assignment_input='node', assignment_encoder='linear', encoder_hidden=64):
+                           assignment_input='node', assignment_encoder='linear', encoder_hidden=64,
+                           resume_state=None, save_resume=False):
+    resume_config = {key: value for key, value in locals().copy().items()
+                     if key not in ('z', 'q', 'assignment', 'steps', 'folder', 'checkpoint_steps',
+                                    'resume_state', 'save_resume', 'log_every')}
+    if resume_state is not None or save_resume:
+        resume_config['data_digest'] = array_digest(z.detach().cpu().numpy(), q.detach().cpu().numpy(),
+                                                    assignment.cpu().numpy())
     if steps < 0 or any(not np.isfinite(v) or v <= 0 for v in
                         (penalty, lr, chunk_size, inner_max_iter, inner_tol, cg_max_iter, cg_rtol)):
         raise ValueError('Require positive finite solver settings and nonnegative steps')
@@ -178,12 +195,32 @@ def optimize_ce_assignment(z, q, assignment, penalty=3e-5, steps=300, lr=.01,
     if folder is not None:
         folder.mkdir(parents=True, exist_ok=True)
     history, theta, best, dual = [], None, float('inf'), None
+    start_step = 0
+    if resume_state is not None:
+        if resume_state['config'] != resume_config or resume_state['step'] > steps:
+            raise ValueError('Resume state does not match data, solver settings or step budget')
+        with torch.no_grad():
+            for parameter, saved in zip(parameters, resume_state['parameters'], strict=True):
+                parameter.copy_(saved.to(parameter))
+        optimizer.load_state_dict(resume_state['optimizer'])
+        start_step = resume_state['step']
+        theta = resume_state['theta'].to(z)
+        dual = resume_state['dual'].to(z) if resume_state['dual'] is not None else None
+        best, best_step = resume_state['best'], resume_state['best_step']
+        best_moments, best_theta = resume_state['best_moments'], resume_state['best_theta']
+        initial_moments, scale = resume_state['initial_moments'], resume_state['scale']
+        history = [dict(row) for row in resume_state['history'] if row['step'] < start_step]
+        snapshots = dict(resume_state['snapshots'])
+        if save_assignment:
+            best_parameters = [p.to(z.device) for p in resume_state['best_parameters']]
+            best_dual = resume_state['best_dual']
+    elapsed = resume_state['elapsed'] if resume_state is not None else 0.
     started = time.perf_counter()
     def timestamp():
         if z.is_cuda:
             torch.cuda.synchronize(z.device)
         return time.perf_counter()
-    for step in trange(steps + 1, desc='CE inner + CE outer'):
+    for step in trange(start_step, steps + 1, desc='CE inner + CE outer'):
         tick = timestamp()
         optimizer.zero_grad(set_to_none=True)
         if assignment_input != 'node':
@@ -243,7 +280,7 @@ def optimize_ce_assignment(z, q, assignment, penalty=3e-5, steps=300, lr=.01,
                 row['implicit_seconds'] = timestamp() - implicit_start
                 if not diagnostic['cg_converged']:
                     failure = 'Implicit Hessian solve did not converge; increase cg_max_iter'
-        row.update(best_J=best, seconds=time.perf_counter() - started,
+        row.update(best_J=best, seconds=elapsed + time.perf_counter() - started,
                    status='failed' if failure else 'evaluated' if step == steps else 'update')
         history.append(row)
         if folder is not None and (step == steps or failure):
@@ -260,6 +297,17 @@ def optimize_ce_assignment(z, q, assignment, penalty=3e-5, steps=300, lr=.01,
                 checkpoint_dir = folder / 'checkpoints'
                 checkpoint_dir.mkdir(exist_ok=True)
                 torch.save(snapshot, checkpoint_dir / f'step_{step:06d}.pt')
+        if save_resume and (step in checkpoints or step == steps):
+            state = cpu_state(dict(config=resume_config, step=step, parameters=parameters,
+                                   optimizer=optimizer.state_dict(), theta=theta, dual=dual,
+                                   best=best, best_step=best_step, best_moments=best_moments,
+                                   best_theta=best_theta, initial_moments=initial_moments, scale=scale,
+                                   history=history, snapshots=snapshots, elapsed=row['seconds'],
+                                   best_parameters=best_parameters if save_assignment else None,
+                                   best_dual=best_dual if save_assignment else None))
+            if folder is not None:
+                torch.save(state, folder / 'resume.tmp.pt')
+                (folder / 'resume.tmp.pt').replace(folder / 'resume.pt')
         if step == steps:
             break
         backward_start = timestamp()
@@ -276,7 +324,7 @@ def optimize_ce_assignment(z, q, assignment, penalty=3e-5, steps=300, lr=.01,
             raise
         optimizer.step()
         row['backward_seconds'] = timestamp() - backward_start
-        row['seconds'] = time.perf_counter() - started
+        row['seconds'] = elapsed + time.perf_counter() - started
         if folder is not None and step % log_every == 0:
             pd.DataFrame(history).to_csv(folder / 'optimization.csv', index=False)
     result = dict(initial_moments=initial_moments, best_moments=best_moments,

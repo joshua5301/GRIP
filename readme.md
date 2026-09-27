@@ -578,6 +578,11 @@ backend. `outer_chunk_size` and `log_every` control evaluation batching and Driv
 logging; optimization.csv includes synchronized phase timings.
 # Low-rank CE assignments
 
+`src.assignment_sweep.run_assignment_sweep` supports standalone Cora, Citeseer
+and Flickr staged grid searches, with teacher gamma selection, resumable MLP
+optimization, validation-only candidate pruning and final test evaluation.
+See `docs/assignment_sweep.md` for the protocol and compute tradeoffs.
+
 For a nonlinear assignment map, add `assignment_encoder='mlp', encoder_hidden=64`
 to a feature-conditioned run. Its zero-initialized output layer preserves the
 same starting partition as the linear encoder.
