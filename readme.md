@@ -499,3 +499,7 @@ and symmetric edge weights by matching readout feature-label first moments and
 feature second moments across multiple two-layer GCN checkpoints. It supports
 cached grid search, mass CE, independent final test seeds, an initial-graph control,
 and moment/CE/accuracy plots. See [protocol and limitations](docs/graph_moment_condensation.md).
+
+`src.graph_moment_diagnostics.run_graph_moment_diagnostics` reuses a completed run
+to compare initial/optimized graphs at identical selected settings and measure CE
+preservation on independent probe seeds. See [paired diagnostic protocol](docs/graph_moment_diagnostics.md).
