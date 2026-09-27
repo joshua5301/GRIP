@@ -149,7 +149,10 @@ def run_ntk_risk(datasets, space, output_dir, modes=('raw_mean', 'raw_convex'),
                  search_seeds=(0, 1, 2), final_seeds=tuple(range(100, 110)),
                  loss_weighting='uniform', epochs=1000, eval_every=10, hidden=256,
                  max_sweeps=30, reconstruction_steps=1000, reconstruction_lr=.05,
-                 representation='ntk', representation_teacher=None, nystrom=None, partition_block_size=1024):
+                 representation='ntk', representation_teacher=None, nystrom=None, partition_block_size=1024,
+                 feature_transform=None):
+    if feature_transform is not None and (representation != 'ntk' or nystrom is None):
+        raise ValueError('Feature transforms require the explicit Nyström NTK map')
     if representation not in ('ntk', 'gcn_teacher', 's2x'):
         raise ValueError('Require ntk, gcn_teacher or s2x representation')
     if set(datasets) - {'cora', 'citeseer', 'arxiv', 'flickr', 'reddit'}:
@@ -174,7 +177,8 @@ def run_ntk_risk(datasets, space, output_dir, modes=('raw_mean', 'raw_convex'),
                   max_sweeps=max_sweeps, reconstruction_steps=reconstruction_steps,
                   reconstruction_lr=reconstruction_lr, revision=revision, schema=3,
                   nystrom=nystrom_options, partition_block_size=partition_block_size,
-                  representation=representation, representation_teacher=teacher_options)
+                  representation=representation, representation_teacher=teacher_options,
+                  feature_transform=feature_transform)
     root = Path(output_dir) / _fingerprint(config)
     root.mkdir(parents=True, exist_ok=True)
     (root / 'config.json').write_text(json.dumps(config, indent=2), encoding='utf-8')
@@ -223,6 +227,12 @@ def run_ntk_risk(datasets, space, output_dir, modes=('raw_mean', 'raw_convex'),
             kernel = graph_kernel(x, propagation)
             features = spectral_features(kernel)
             torch.save(dict(kernel=kernel.cpu(), features=features.cpu()), kernel_path)
+        if feature_transform is not None:
+            from src.ntk_transforms import fit_transform, TransformedMap
+            features, transform = fit_transform(features, **feature_transform)
+            mapping = TransformedMap(mapping, transform)
+            torch.save(dict(features=features.cpu(), transform=transform.state_dict()),
+                       directory / 'transformed_features.pt')
         feature_cache, logit_cache = {}, {}
         label_directory = Path(output_dir) / ('labels_' + _fingerprint(
             dict(dataset=name, data=signatures, seed=seed, revision=revision)))
