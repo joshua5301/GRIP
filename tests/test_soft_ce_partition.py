@@ -1,0 +1,127 @@
+import pytest
+import torch
+
+import src.soft_ce_partition as model
+from src.soft_ridge_partition import AssignmentMoments, augmented, decode_moments, initial_logits, make_material
+from src.stationarity_risk import head_objective
+
+
+def problem():
+    generator = torch.Generator().manual_seed(41)
+    z = torch.randn(15, 3, generator=generator, dtype=torch.double)
+    q = torch.randn(15, 3, generator=generator, dtype=torch.double).softmax(1)
+    assignment = torch.arange(15) % 4
+    return z, q, assignment
+
+
+def test_hessian_and_pcg_match_dense_autograd():
+    z, q, _ = problem()
+    x = augmented(z)
+    q = q * torch.linspace(.9, 1.1, len(q), dtype=q.dtype)[:, None]
+    mass = torch.arange(1, len(z) + 1, dtype=z.dtype)
+    mass = mass / mass.sum()
+    theta = torch.linspace(-.4, .5, 12, dtype=z.dtype).reshape(3, 4)
+    penalty = .03
+    hessian = torch.autograd.functional.hessian(
+        lambda value: head_objective(x, q, mass, value, penalty), theta,
+    ).reshape(theta.numel(), theta.numel())
+    multiply, diagonal = model.hessian_operator(x, q, mass, theta, penalty)
+    rhs = theta.cos()
+    torch.testing.assert_close(multiply(rhs).flatten(), hessian @ rhs.flatten())
+    torch.testing.assert_close(diagonal.flatten(), hessian.diag())
+    solution, diagnostic = model.conjugate_gradient(multiply, rhs, diagonal, rtol=1e-11)
+    assert diagnostic['cg_converged']
+    expected = torch.linalg.solve(hessian, rhs.flatten()).reshape_as(rhs)
+    torch.testing.assert_close(solution, expected, atol=1e-9, rtol=1e-9)
+    zero, diagnostic = model.conjugate_gradient(multiply, rhs * 0, diagonal)
+    assert diagnostic['cg_converged'] and diagnostic['cg_iterations'] == 0
+    torch.testing.assert_close(zero, rhs * 0)
+
+
+def test_chunked_outer_gradient_matches_autograd():
+    z, q, _ = problem()
+    theta = torch.linspace(-.3, .5, 12, dtype=z.dtype).reshape(3, 4).requires_grad_()
+    expected = -(q * (augmented(z) @ theta.T).log_softmax(1)).sum(1).mean()
+    gradient, = torch.autograd.grad(expected, theta)
+    value, actual = model.outer_value_gradient(z, q, theta.detach(), chunk_size=4)
+    assert abs(value - float(expected.detach())) < 1e-12
+    torch.testing.assert_close(actual, gradient)
+
+
+def test_implicit_assignment_gradient_matches_resolved_finite_difference():
+    z, q, assignment = problem()
+    material = make_material(z, q)
+    logits = initial_logits(assignment, 4, .3, dtype=torch.double).requires_grad_()
+    penalty = .2
+
+    def solve(value):
+        moments = AssignmentMoments.apply(value, material, 4)
+        centers, labels, mass = decode_moments(moments.detach(), z.shape[1])
+        fitted = model.solve_inner(centers, labels, mass, penalty, grad_tol=1e-11)
+        assert fitted['inner_converged']
+        loss, gradient = model.outer_value_gradient(z, q, fitted['theta'], 4)
+        return moments, fitted['theta'], loss, gradient
+
+    moments, theta, _, outer_gradient = solve(logits)
+    centers, labels, mass = decode_moments(moments.detach(), z.shape[1])
+    multiply, diagonal = model.hessian_operator(augmented(centers), labels, mass, theta, penalty)
+    vector, diagnostic = model.conjugate_gradient(multiply, outer_gradient, diagonal, rtol=1e-11, atol=1e-14)
+    assert diagnostic['cg_converged']
+    gradient = model.implicit_moment_gradient(moments, z.shape[1], theta, vector, penalty)
+    actual, = torch.autograd.grad(moments, logits, grad_outputs=gradient)
+    for seed in (17, 31):
+        direction = torch.randn(logits.shape, generator=torch.Generator().manual_seed(seed), dtype=logits.dtype)
+        direction /= direction.norm()
+        epsilon = 1e-3
+        plus = solve(logits.detach() + epsilon * direction)[2]
+        minus = solve(logits.detach() - epsilon * direction)[2]
+        expected = (plus - minus) / (2 * epsilon)
+        torch.testing.assert_close((actual * direction).sum(), z.new_tensor(expected), atol=1e-7, rtol=3e-3)
+
+
+def test_checkpoint_reproduces_best_converged_ce_solution(tmp_path):
+    z, q, assignment = problem()
+    result = model.optimize_ce_assignment(
+        z, q, assignment, penalty=.2, steps=3, lr=.02, chunk_size=4,
+        inner_tol=1e-9, cg_rtol=1e-9, folder=tmp_path,
+    )
+    logits = torch.load(tmp_path / 'best_assignment_logits.pt', weights_only=True)
+    moments = AssignmentMoments.apply(logits, make_material(z, q), 4)
+    torch.testing.assert_close(moments, result['best_moments'])
+    centers, labels, mass = decode_moments(moments, z.shape[1])
+    fitted = model.solve_inner(centers, labels, mass, .2, grad_tol=1e-10)
+    value, _ = model.outer_value_gradient(z, q, fitted['theta'], 4)
+    assert fitted['inner_converged']
+    assert abs(value - result['best_J']) < 1e-7
+    history = result['history']
+    assert all(row['inner_converged'] for row in history)
+    assert all(row['cg_converged'] for row in history[:-1])
+    assert all(b['best_J'] <= a['best_J'] for a, b in zip(history, history[1:]))
+
+
+def test_unconverged_inner_cannot_update_assignments(tmp_path, monkeypatch):
+    z, q, assignment = problem()
+    def failed(*args, **kwargs):
+        return dict(theta=z.new_zeros(q.shape[1], z.shape[1] + 1), inner_grad_max=1.,
+                    inner_converged=False, inner_iterations=1, inner_polish_steps=0)
+    monkeypatch.setattr(model, 'solve_inner', failed)
+    with pytest.raises(RuntimeError, match='Inner CE did not converge'):
+        model.optimize_ce_assignment(z, q, assignment, steps=1, folder=tmp_path)
+    assert (tmp_path / 'failure.json').exists()
+    assert not (tmp_path / 'best_assignment_logits.pt').exists()
+
+
+def test_unconverged_implicit_solve_cannot_update_assignments(tmp_path, monkeypatch):
+    z, q, assignment = problem()
+    def fitted(*args, **kwargs):
+        return dict(theta=z.new_zeros(q.shape[1], z.shape[1] + 1), inner_grad_max=0.,
+                    inner_converged=True, inner_iterations=1, inner_polish_steps=0)
+    def failed(multiply, rhs, diagonal, **kwargs):
+        return torch.zeros_like(rhs), dict(cg_converged=False, cg_iterations=1,
+                                          cg_residual=1., cg_relative_residual=1.)
+    monkeypatch.setattr(model, 'solve_inner', fitted)
+    monkeypatch.setattr(model, 'conjugate_gradient', failed)
+    with pytest.raises(RuntimeError, match='Implicit Hessian solve did not converge'):
+        model.optimize_ce_assignment(z, q, assignment, steps=1, folder=tmp_path)
+    assert (tmp_path / 'failure.json').exists()
+    assert not (tmp_path / 'best_assignment_logits.pt').exists()

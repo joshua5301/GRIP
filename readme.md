@@ -556,3 +556,9 @@ See [objective and memory protocol](docs/soft_ridge_partition.md).
 ridge solve but optimizes assignments by outer teacher CE. It reuses prior GCN
 controls, fixes a validation-calibrated score temperature before optimization,
 and evaluates new mass-CE GCN students only for the CE-optimized representatives.
+
+`src.soft_ce_partition.run_soft_ce(previous_run, ...)` replaces the inner ridge
+learner with a regularized CE linear student. It uses converged inner fits and
+implicit Hessian-vector solves to optimize soft assignments, reuses prior GCN
+controls, and evaluates the new representatives with CE linear and GCN students.
+See [implicit CE protocol](docs/soft_ce_partition.md).
