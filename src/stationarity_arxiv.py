@@ -1,5 +1,6 @@
 import json
 import subprocess
+import time
 from pathlib import Path
 
 import numpy as np
@@ -14,7 +15,7 @@ from src.node_distances import array_digest
 from src.ntk_transforms import fit_transform
 from src.risk_experiment import _accuracy, _fingerprint, _forward, _prepare_dataset
 from src.risk_partition import risk_partition
-from src.stationarity_risk import evaluate_study
+from src.stationarity_risk import augment, evaluate_study, fit_head, metrics
 from src.teacher import fit_logistic, get_kernel_features
 
 
@@ -116,3 +117,77 @@ def run_arxiv_stationarity(output_dir, nodes=909, params=None,
         records.append(record)
         pd.DataFrame(records).to_csv(root / 'full_students.csv', index=False)
     return result
+
+
+def sweep_reference_penalty(source, output_dir=None,
+                            penalties=(1e-7, 3e-7, 1e-6, 3e-6, 1e-5, 3e-5, 1e-4),
+                            max_iter=5000, grad_tol=1e-8, tolerance_change=1e-18,
+                            data_dir='/content/data/', device='cuda', evaluate_test=True):
+    source = Path(source)
+    source_config = json.loads((source / 'config.json').read_text())
+    penalties = sorted(set(float(p) for p in penalties), reverse=True)
+    if source_config.get('dataset') != 'arxiv' or not penalties or any(not np.isfinite(p) or p <= 0 for p in penalties):
+        raise ValueError('Require an Arxiv source and finite positive penalties')
+    torch.backends.cuda.matmul.allow_tf32 = False
+    torch.backends.cudnn.allow_tf32 = False
+    train, mask, validation, testing, h = _prepare_dataset('arxiv', data_dir, device)
+    adjacency = train['adj'].to_sparse_csr()
+    digest = array_digest(train['x'].cpu().numpy(), train['y'].cpu().numpy(),
+                          adjacency.crow_indices().cpu().numpy(), adjacency.col_indices().cpu().numpy(),
+                          adjacency.values().cpu().numpy(), mask.cpu().numpy(),
+                          validation[1].cpu().numpy(), testing[1].cpu().numpy())
+    if digest != source_config['data_digest']:
+        raise ValueError('Graph or splits differ from saved Arxiv experiment')
+    logits = torch.load(source / 'teacher_logits.pt', map_location=device, weights_only=True)
+    config = dict(source=str(source), source_config=source_config, penalties=penalties,
+                  logits_digest=array_digest(logits.cpu().numpy()), max_iter=max_iter, grad_tol=grad_tol,
+                  tolerance_change=tolerance_change, evaluate_test=evaluate_test,
+                  revision=subprocess.check_output(['git', 'rev-parse', 'HEAD'], text=True).strip())
+    root = Path(output_dir or source / 'reference_penalty') / _fingerprint(config)
+    root.mkdir(parents=True, exist_ok=True)
+    (root / 'config.json').write_text(json.dumps(config, indent=2), encoding='utf-8')
+    q = (logits / source_config['params']['T']).softmax(1).double()
+    z, transform = fit_transform(h.double(), kind='rms')
+    torch.save(transform.state_dict(), root / 'transform.pt')
+    mass = z.new_full((len(z),), 1 / len(z))
+    val_ids = validation[1].nonzero().flatten()
+    rows, initial = [], None
+    for penalty in tqdm(penalties, desc='Full-data linear penalty grid'):
+        path = root / f'head_{penalty:.12g}.pt'
+        if path.exists():
+            head = torch.load(path, map_location=device, weights_only=False)
+        else:
+            started = time.perf_counter()
+            head = fit_head(z, q, mass, penalty, max_iter, grad_tol,
+                            initial_theta=initial, tolerance_change=tolerance_change)
+            head['seconds'] = time.perf_counter() - started
+            torch.save({k: v.cpu() if torch.is_tensor(v) else v for k, v in head.items()}, path)
+        initial = head['theta']
+        values = metrics(z, q, train['y'], val_ids, initial, penalty)
+        with torch.no_grad():
+            prediction = augment(z) @ initial.T
+            logp = prediction.log_softmax(1)
+            teacher_ce = float(-(q * logp).sum(1).mean())
+            entropy = float(-(q * q.clamp_min(1e-300).log()).sum(1).mean())
+            agreement = 100 * float((prediction.argmax(1) == q.argmax(1)).float().mean())
+        rows.append(dict(penalty=penalty, **values, teacher_ce=teacher_ce,
+                         teacher_kl=teacher_ce - entropy, teacher_agreement=agreement,
+                         head_norm=float(initial.norm()), weight_norm=float(initial[:, :-1].norm()),
+                         bias_norm=float(initial[:, -1].norm()), grad_norm=head['grad_norm'],
+                         grad_max=head['grad_max'], parameter_error_bound=head['grad_norm'] / penalty,
+                         converged=head['converged'], iterations=head['iterations'], seconds=head['seconds']))
+        pd.DataFrame(rows).to_csv(root / 'grid.csv', index=False)
+    table = pd.DataFrame(rows)
+    eligible = table[table.converged]
+    if eligible.empty:
+        raise RuntimeError(f'No converged head; inspect {root / "grid.csv"} and increase max_iter')
+    selected = eligible.loc[eligible.val_ce.idxmin()].to_dict()
+    selected['at_lower_boundary'] = selected['penalty'] == min(penalties)
+    selected['all_converged'] = bool(table.converged.all())
+    selected['head_path'] = str(root / f'head_{selected["penalty"]:.12g}.pt')
+    if evaluate_test:
+        head = torch.load(selected['head_path'], map_location=device, weights_only=False)
+        selected.update(metrics(z, q, train['y'], val_ids, head['theta'], selected['penalty'],
+                                testing[1].nonzero().flatten()))
+    pd.DataFrame([selected]).to_csv(root / 'selected.csv', index=False)
+    return table.assign(output_dir=str(root))

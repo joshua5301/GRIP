@@ -94,6 +94,17 @@ def test_cached_move_scores_match_uncached_scores():
     torch.testing.assert_close(move_deltas(*arguments), move_deltas(*arguments, parts, residual))
 
 
+def test_warm_start_preserves_convex_optimum():
+    z, q, _, _ = problem()
+    mass = z.new_full((len(z),), 1 / len(z))
+    previous = fit_head(z, q, mass, .1)
+    warm = fit_head(z, q, mass, .03, initial_theta=previous['theta'])
+    cold = fit_head(z, q, mass, .03)
+    x = augment(z)
+    torch.testing.assert_close(head_objective(x, q, mass, warm['theta'], .03),
+                               head_objective(x, q, mass, cold['theta'], .03), atol=1e-10, rtol=1e-10)
+
+
 def test_candidate_refinement_exact_score_and_no_global_convergence_claim():
     z, q, assignment, theta = problem()
     result = refine_partition(z, q, assignment, theta, .03, max_sweeps=5, block_size=5,

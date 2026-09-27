@@ -538,3 +538,7 @@ and paired two-layer GCNs with mass CE. See [objective, bounds and protocol](doc
 `src.stationarity_arxiv.run_arxiv_stationarity` runs the same diagnostic at an
 explicit Arxiv budget (default 909), with restricted cell candidates, incremental
 gradient updates, and supervised/teacher-label full-graph GCN references.
+
+`src.stationarity_arxiv.sweep_reference_penalty` reuses that run to audit weaker
+linear-head regularization before refining another partition. It selects by
+validation CE, reports numerical precision, and evaluates test only after selection.

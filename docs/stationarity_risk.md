@@ -108,3 +108,29 @@ from the paired condensed comparison and is shown explicitly in the output.
 baselines. No ground-truth validation/test labels are used in teacher fitting,
 partition refinement or student training; they are used only for the stated
 validation selection and final test reporting.
+
+## Smaller-penalty reference audit
+
+`src.stationarity_arxiv.sweep_reference_penalty` reuses an Arxiv run's saved teacher
+logits and verifies the original graph/split digest. It reconstructs the same
+centered, RMS-normalized S²X without refitting the teacher, partition, or GCNs.
+The default grid is 1e-7, 3e-7, 1e-6, 3e-6, 1e-5, 3e-5, 1e-4. Both weights and bias
+remain regularized. Heads are fit strongest-to-weakest with warm starts; every
+positive-penalty problem has the same unique optimum irrespective of initialization.
+Finite optimization is audited with gradient diagnostics, not presumed exact.
+
+L-BFGS defaults to 5000 iterations, max-coordinate gradient tolerance 1e-8 and
+objective/parameter-change tolerance 1e-18. The norm-based parameter uncertainty
+certificate ||gradient F|| / lambda is also recorded, since a fixed gradient
+threshold alone is insufficient to certify parameter precision at small lambda.
+Each head is checkpointed for resumption under the same configuration.
+
+`grid.csv` contains validation CE/accuracy, unregularized full teacher CE, teacher
+KL and argmax agreement, weight/bias norms, regularized objective, gradient norms,
+convergence, iterations and runtime. Regularized objectives at different lambdas
+are different functions and should not be directly ranked as fit quality. Select
+the lowest validation CE among converged candidates; a missing converged candidate
+or lower-bound optimum is explicitly reported. `selected.csv` includes test
+accuracy only for this selected head. No partition refinement is triggered by this
+audit. Original full-graph GCN accuracy remains a contextual reference, not an
+architecture-matched linear control.
