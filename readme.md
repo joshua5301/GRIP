@@ -520,3 +520,7 @@ test seeds. See [cross-graph kernel and scope](docs/ntk_risk.md).
 pre-classifier representation using the same global risk solver and raw-input
 convex reconstruction. It defaults to mass CE and `raw_convex`, retaining the
 same kernel-teacher soft labels across representations and all densities.
+
+Pass `representations=('s2x',)` for the propagated-feature control. Use
+`modes=('raw_convex', 's2x_mean')` to compare matched raw convex reconstruction
+against the original risk method's propagated cell-mean representatives.

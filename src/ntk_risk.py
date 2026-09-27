@@ -89,7 +89,7 @@ def prepare_representation_teacher(train, mask, validation, directory, options):
 
 
 def fit_representatives(x, propagation, kernel, assignment, steps=1000, lr=.05,
-                        teacher=None, teacher_features=None):
+                        teacher=None, teacher_features=None, linear_features=None):
     x, propagation = x.double(), propagation.double().to_sparse_coo().coalesce()
     assignment = assignment.to(x.device)
     clusters = int(assignment.max()) + 1
@@ -98,7 +98,7 @@ def fit_representatives(x, propagation, kernel, assignment, steps=1000, lr=.05,
         raise ValueError('Every cell must have a member')
     membership = F.one_hot(assignment, clusters).to(x.dtype) / counts
     mass = counts / counts.sum()
-    if teacher is None:
+    if teacher is None and linear_features is None:
         target_norm = (membership * (kernel @ membership)).sum(0)
         support = torch.sparse.mm(propagation.transpose(0, 1), membership)
         propagated = torch.sparse.mm(propagation, x) / np.sqrt(x.shape[1])
@@ -109,12 +109,15 @@ def fit_representatives(x, propagation, kernel, assignment, steps=1000, lr=.05,
             cross = (tangent_kernel(inputs, propagated) * support.T).sum(1)
             return 2 * inputs.square().sum(1) - 2 * cross + target_norm
     else:
-        teacher.eval().requires_grad_(False)
-        targets = (membership.T @ teacher_features).detach()
-        scale = teacher_features.square().sum(1).mean().detach().clamp_min(1e-30)
+        reference = linear_features if teacher is None else teacher_features
+        if teacher is not None:
+            teacher.eval().requires_grad_(False)
+        targets = (membership.T @ reference).detach()
+        scale = reference.square().sum(1).mean().detach().clamp_min(1e-30)
 
         def errors(representatives):
-            return (readout_representation(teacher, representatives) - targets).square().sum(1)
+            represented = representatives if teacher is None else readout_representation(teacher, representatives)
+            return (represented - targets).square().sum(1)
     scores = torch.zeros(len(x), dtype=x.dtype, device=x.device, requires_grad=True)
     optimizer = torch.optim.Adam([scores], lr=lr)
     history, best_loss, best_weights = [], float('inf'), None
@@ -145,8 +148,8 @@ def run_ntk_risk(datasets, space, output_dir, modes=('raw_mean', 'raw_convex'),
                  loss_weighting='uniform', epochs=1000, eval_every=10, hidden=256,
                  max_sweeps=30, reconstruction_steps=1000, reconstruction_lr=.05,
                  representation='ntk', representation_teacher=None):
-    if representation not in ('ntk', 'gcn_teacher'):
-        raise ValueError('Require ntk or gcn_teacher representation')
+    if representation not in ('ntk', 'gcn_teacher', 's2x'):
+        raise ValueError('Require ntk, gcn_teacher or s2x representation')
     if set(datasets) - {'cora', 'citeseer'}:
         raise ValueError('Full NTK is implemented for Cora and CiteSeer only')
     if set(modes) - {'raw_mean', 'raw_convex', 's2x_mean'}:
@@ -178,7 +181,9 @@ def run_ntk_risk(datasets, space, output_dir, modes=('raw_mean', 'raw_convex'),
         directory.mkdir(exist_ok=True)
         kernel_path = directory / 'kernel.pt'
         model, teacher_details = None, {}
-        if representation == 'gcn_teacher':
+        if representation == 's2x':
+            features, kernel = h.double(), None
+        elif representation == 'gcn_teacher':
             model, features, teacher_details = prepare_representation_teacher(
                 train, mask, validation, directory, teacher_options)
             kernel = None
@@ -226,7 +231,8 @@ def run_ntk_risk(datasets, space, output_dir, modes=('raw_mean', 'raw_convex'),
                 if mode == 'raw_convex' and 'raw_convex' not in result:
                     fitted = fit_representatives(x, propagation, kernel, result['assignment'],
                                                 reconstruction_steps, reconstruction_lr,
-                                                teacher=model, teacher_features=features if model is not None else None)
+                                                teacher=model, teacher_features=features if model is not None else None,
+                                                linear_features=features if representation == 's2x' else None)
                     result['raw_convex'] = fitted.pop('x')
                     result.update(fitted)
                     torch.save(result, path)

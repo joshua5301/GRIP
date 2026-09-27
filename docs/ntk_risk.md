@@ -92,3 +92,18 @@ not a claim of identical representation-training cost or supervision usage.
 All final students retain the same two-layer GCN architecture, identity
 synthetic graph, mass CE, original-graph evaluation, and validation checkpoint
 selection. Comparison summaries are saved beside the two protocol directories.
+
+## Propagated-feature control
+
+`representations=('s2x',)` uses the original pipeline's H=S²X directly, without
+forming any NTK or training a representation GCN. The label teacher, partition
+solver and student protocol are unchanged. Under A=I the corresponding synthetic
+representation is simply X̃, so `raw_convex` minimizes
+Σj πj||X̃j−mean(i in Cj)Hi||² / mean(i)||Hi||², with X̃j restricted to raw X
+members of the same cell. It does not propagate the raw synthetic features a
+second time. The optional `s2x_mean` mode directly uses the H cell averages as
+synthetic input, reproducing the original global risk representative rule.
+Both modes share partitions at identical settings but select their best settings
+independently on validation. The raw convex mode is the matched reconstruction
+control for the NTK and GCN-representation experiments; `s2x_mean` is the original
+method control and has no convex reconstruction step.

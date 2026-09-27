@@ -107,3 +107,23 @@ def test_teacher_convex_reconstruction_uses_identity_and_freezes_teacher():
     assert result['reconstruction_final'] <= result['reconstruction_initial'] + 1e-12
     for name, value in model.state_dict().items():
         torch.testing.assert_close(value, before[name])
+
+
+def test_s2x_reconstruction_targets_propagated_means_with_raw_inputs():
+    x = torch.tensor([[1., .2], [.1, 2.], [-2., 1.]], dtype=torch.float64)
+    s = propagation(torch.tensor([[0, 1, 1, 2], [1, 0, 2, 1]]), len(x))
+    features = torch.sparse.mm(s, torch.sparse.mm(s, x))
+    assignment = torch.tensor([0, 0, 1])
+    result = fit_representatives(x, s, None, assignment, steps=8, linear_features=features)
+    means = torch.stack([x[:2].mean(0), x[2]])
+    targets = torch.stack([features[:2].mean(0), features[2]])
+    expected = ((means - targets).square().sum(1) * x.new_tensor([2 / 3, 1 / 3])).sum()
+    expected = expected / features.square().sum(1).mean()
+    np.testing.assert_allclose(result['reconstruction_initial'], expected, atol=1e-12)
+    weights = result['weights']
+    torch.testing.assert_close(torch.zeros(2, dtype=x.dtype).index_add_(0, assignment, weights),
+                               torch.ones(2, dtype=x.dtype))
+    reconstructed = torch.zeros(2, 2, dtype=x.dtype).index_add_(0, assignment, weights[:, None] * x)
+    torch.testing.assert_close(result['x'].double(), reconstructed, atol=1e-6, rtol=1e-6)
+    torch.testing.assert_close(result['x'][1], x[2].float())
+    assert result['reconstruction_final'] <= result['reconstruction_initial'] + 1e-12
