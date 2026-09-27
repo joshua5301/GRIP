@@ -134,3 +134,28 @@ or lower-bound optimum is explicitly reported. `selected.csv` includes test
 accuracy only for this selected head. No partition refinement is triggered by this
 audit. Original full-graph GCN accuracy remains a contextual reference, not an
 architecture-matched linear control.
+
+## Matched three-reference partition comparison
+
+`src.stationarity_arxiv.compare_reference_partitions` loads the saved penalty-grid
+heads at 1e-4, 3e-5 and 3e-6 (previous, CE-selected, accuracy-selected among converged
+grid candidates). Every condition begins with the same saved 909-cell baseline;
+none starts from another condition's refined partition. The cached head gradient
+is recomputed on the verified graph, probabilities and normalized features before
+use. Heads failing the sweep's convergence tolerance cannot drive refinement.
+
+The teacher probabilities, original partition, student hyperparameters, seed list,
+move RNG seed, candidate limits and sweep budget stay fixed. Shared baseline GCNs
+are trained once within this run. Refined GCNs are trained with paired seeds per
+condition. Original full-graph controls need not be retrained. Fresh linear heads
+are fitted for both partitions at each condition's own penalty, using the tighter
+optimization tolerances of the reference sweep. Compare excess objective and
+parameter distance before/after within a penalty; different penalties define
+different objectives.
+
+The root stores combined `summary.csv`, `students.csv`, `partition_history.csv`,
+and `references.csv`, with per-condition artifacts in fingerprinted subdirectories.
+`selected.json` selects among refined conditions by mean GCN validation accuracy
+only. Test results for the three predeclared comparisons are reports, not selection
+criteria. This selection is exploratory, using the same validation split as earlier
+experiments; it is not an independent confirmation of a tuned winner.

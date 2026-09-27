@@ -23,6 +23,16 @@ def head_objective(x, q, mass, theta, penalty):
     return -(mass[:, None] * q * (x @ theta.T).log_softmax(1)).sum() + penalty * theta.square().sum() / 2
 
 
+@torch.no_grad()
+def check_head(z, q, mass, theta, penalty, grad_tol=1e-8):
+    x = augment(z.double())
+    theta = theta.to(x)
+    error = q.sum(1, keepdim=True) * (x @ theta.T).softmax(1) - q
+    gradient = (mass[:, None] * error).T @ x + penalty * theta
+    return dict(theta=theta, grad_norm=float(gradient.norm()), grad_max=float(gradient.abs().max()),
+                converged=bool(torch.isfinite(gradient).all()) and float(gradient.abs().max()) <= grad_tol)
+
+
 def fit_head(z, q, mass, penalty, max_iter=2000, grad_tol=1e-7,
              initial_theta=None, tolerance_change=1e-15):
     if penalty <= 0:
@@ -244,15 +254,21 @@ def run_stationarity_study(learning_root, output_dir=None, ratio=.026,
 
 def evaluate_study(root, train, validation, testing, h, q, z, transform, baseline, params,
                    settings, penalties, max_iter, max_sweeps, block_size, pair_batch, seed,
-                   final_seeds, evaluate_test=True, candidate_k=None, random_candidates=0):
+                   final_seeds, evaluate_test=True, candidate_k=None, random_candidates=0,
+                   reference_override=None, head_fit_options=None):
     initial = baseline['assignment'].to(z.device)
     y = train['y']
     val_ids = validation[1].nonzero().flatten()
     test_ids = testing[1].nonzero().flatten() if evaluate_test else None
     full_mass = z.new_full((len(z),), 1 / len(z))
     fits, candidates = [], []
+    head_fit_options = dict(head_fit_options or {})
+    if reference_override is not None and len(penalties) != 1:
+        raise ValueError('A fixed reference requires exactly one penalty')
     for penalty in penalties:
-        head = fit_head(z, q, full_mass, penalty, max_iter)
+        head = (fit_head(z, q, full_mass, penalty, max_iter, **head_fit_options)
+                if reference_override is None else check_head(z, q, full_mass, reference_override['theta'],
+                                                              penalty, head_fit_options.get('grad_tol', 1e-7)))
         fits.append(head)
         candidates.append(dict(penalty=penalty, grad_norm=head['grad_norm'], converged=head['converged'],
                                **metrics(z, q, y, val_ids, head['theta'], penalty)))
@@ -282,7 +298,7 @@ def evaluate_study(root, train, validation, testing, h, q, z, transform, baselin
         x = augment(centers)
         errors = labels.sum(1, keepdim=True) * (x @ theta.T).softmax(1) - labels
         residual = ((mass[:, None] * errors).T @ x + penalty * theta).norm()
-        fitted = fit_head(centers, labels, mass, penalty, max_iter)
+        fitted = fit_head(centers, labels, mass, penalty, max_iter, **head_fit_options)
         values = metrics(z, q, y, val_ids, fitted['theta'], penalty, test_ids)
         gap = float((fitted['theta'] - theta).norm())
         bound = float(residual) / penalty

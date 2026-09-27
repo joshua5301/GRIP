@@ -191,3 +191,77 @@ def sweep_reference_penalty(source, output_dir=None,
                                 testing[1].nonzero().flatten()))
     pd.DataFrame([selected]).to_csv(root / 'selected.csv', index=False)
     return table.assign(output_dir=str(root))
+
+
+def compare_reference_partitions(reference_root, output_dir=None, conditions=None,
+                                 max_sweeps=20, candidate_k=16, random_candidates=4,
+                                 block_size=128, pair_batch=1024, max_iter=5000,
+                                 final_seeds=tuple(range(100, 110)), seed=0,
+                                 data_dir='/content/data/', device='cuda', evaluate_test=True):
+    reference_root = Path(reference_root)
+    reference_config = json.loads((reference_root / 'config.json').read_text())
+    source = Path(reference_config['source'])
+    original = json.loads((source / 'config.json').read_text())
+    conditions = dict(conditions or dict(previous=1e-4, ce_selected=3e-5, accuracy_selected=3e-6))
+    if original != reference_config['source_config'] or original.get('dataset') != 'arxiv':
+        raise ValueError('Reference sweep and source experiment differ')
+    if not final_seeds or not conditions or any(not np.isfinite(p) or p <= 0 for p in conditions.values()):
+        raise ValueError('Require seeds and finite positive penalties')
+    torch.backends.cuda.matmul.allow_tf32 = False
+    torch.backends.cudnn.allow_tf32 = False
+    train, mask, validation, testing, h = _prepare_dataset('arxiv', data_dir, device)
+    adjacency = train['adj'].to_sparse_csr()
+    digest = array_digest(train['x'].cpu().numpy(), train['y'].cpu().numpy(),
+                          adjacency.crow_indices().cpu().numpy(), adjacency.col_indices().cpu().numpy(),
+                          adjacency.values().cpu().numpy(), mask.cpu().numpy(),
+                          validation[1].cpu().numpy(), testing[1].cpu().numpy())
+    if digest != original['data_digest']:
+        raise ValueError('Graph or split differs from the saved experiment')
+    logits = torch.load(source / 'teacher_logits.pt', map_location=device, weights_only=True)
+    if array_digest(logits.cpu().numpy()) != reference_config['logits_digest']:
+        raise ValueError('Saved teacher logits changed after the reference sweep')
+    params = original['params']
+    q = (logits / params['T']).softmax(1).double()
+    z, transform = fit_transform(h.double(), kind='rms')
+    baseline = torch.load(source / 'baseline_partition.pt', map_location='cpu', weights_only=False)
+    references = {name: torch.load(reference_root / f'head_{penalty:.12g}.pt', map_location=device, weights_only=False)
+                  for name, penalty in conditions.items()}
+    options = dict(reference_root=str(reference_root), reference_config=reference_config,
+                   conditions=conditions, max_sweeps=max_sweeps, candidate_k=candidate_k,
+                   random_candidates=random_candidates, block_size=block_size, pair_batch=pair_batch,
+                   max_iter=max_iter, final_seeds=list(final_seeds), seed=seed, evaluate_test=evaluate_test,
+                   assignment_digest=array_digest(baseline['assignment'].numpy()),
+                   head_digests={name: array_digest(head['theta'].cpu().numpy()) for name, head in references.items()},
+                   revision=subprocess.check_output(['git', 'rev-parse', 'HEAD'], text=True).strip())
+    root = Path(output_dir or reference_root / 'partition_comparison') / _fingerprint(options)
+    root.mkdir(parents=True, exist_ok=True)
+    (root / 'config.json').write_text(json.dumps(options, indent=2), encoding='utf-8')
+    settings = {k: original[k] for k in ('epochs', 'eval_every', 'hidden')}
+    fit_options = {k: reference_config[k] for k in ('grad_tol', 'tolerance_change')}
+    shared_baseline = root / 'baseline_students.csv'
+    summaries, students, histories, full_references = [], [], [], []
+    for name, penalty in tqdm(conditions.items(), desc='Reference-head conditions'):
+        folder = root / _fingerprint(dict(name=name, penalty=penalty))
+        folder.mkdir(exist_ok=True)
+        if shared_baseline.exists():
+            pd.read_csv(shared_baseline).to_csv(folder / 'baseline_students.csv', index=False)
+        table = evaluate_study(folder, train, validation, testing, h, q, z, transform, baseline,
+                               params, settings, [penalty], max_iter, max_sweeps, block_size,
+                               pair_batch, seed, final_seeds, evaluate_test, candidate_k, random_candidates,
+                               reference_override=references[name], head_fit_options=fit_options)
+        if not shared_baseline.exists():
+            pd.read_csv(folder / 'baseline_students.csv').to_csv(shared_baseline, index=False)
+        summaries.append(table.assign(condition=name, case_dir=str(folder), output_dir=str(root)))
+        students.append(pd.read_csv(folder / 'students.csv').assign(condition=name, penalty=penalty))
+        histories.append(pd.read_csv(folder / 'partition_history.csv').assign(condition=name, penalty=penalty))
+        full_references.append(pd.read_csv(folder / 'reference.csv').assign(condition=name))
+        pd.concat(summaries).to_csv(root / 'summary.csv', index=False)
+        pd.concat(students).to_csv(root / 'students.csv', index=False)
+        pd.concat(histories).to_csv(root / 'partition_history.csv', index=False)
+        pd.concat(full_references).to_csv(root / 'references.csv', index=False)
+    results = pd.concat(summaries, ignore_index=True)
+    best = results[results.method == 'stationarity'].sort_values(['val', 'condition'], ascending=[False, True]).iloc[0]
+    (root / 'selected.json').write_text(json.dumps(dict(condition=best['condition'], penalty=float(best.penalty),
+                                                      criterion='mean_gcn_validation', val=float(best.val)), indent=2),
+                                       encoding='utf-8')
+    return results

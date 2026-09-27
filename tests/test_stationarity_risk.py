@@ -1,7 +1,7 @@
 import torch
 
 from src.representation_learning_audit import cell_means
-from src.stationarity_risk import (augment, contributions, fit_head, head_objective,
+from src.stationarity_risk import (augment, check_head, contributions, fit_head, head_objective,
                                    move_deltas, refine_partition, statistics)
 
 
@@ -103,6 +103,17 @@ def test_warm_start_preserves_convex_optimum():
     x = augment(z)
     torch.testing.assert_close(head_objective(x, q, mass, warm['theta'], .03),
                                head_objective(x, q, mass, cold['theta'], .03), atol=1e-10, rtol=1e-10)
+
+
+def test_saved_head_validation_recomputes_gradient():
+    z, q, _, theta = problem()
+    mass = z.new_full((len(z),), 1 / len(z))
+    theta.requires_grad_()
+    gradient, = torch.autograd.grad(head_objective(augment(z), q, mass, theta, .03), theta)
+    checked = check_head(z, q, mass, theta.detach(), .03, grad_tol=1e-12)
+    assert abs(checked['grad_norm'] - float(gradient.norm())) < 1e-12
+    assert abs(checked['grad_max'] - float(gradient.abs().max())) < 1e-12
+    assert not checked['converged']
 
 
 def test_candidate_refinement_exact_score_and_no_global_convergence_claim():

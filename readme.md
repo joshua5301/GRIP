@@ -542,3 +542,7 @@ gradient updates, and supervised/teacher-label full-graph GCN references.
 `src.stationarity_arxiv.sweep_reference_penalty` reuses that run to audit weaker
 linear-head regularization before refining another partition. It selects by
 validation CE, reports numerical precision, and evaluates test only after selection.
+
+`src.stationarity_arxiv.compare_reference_partitions` compares saved reference heads
+at different penalties, starting from one shared Arxiv partition and reusing a
+common baseline GCN evaluation.
