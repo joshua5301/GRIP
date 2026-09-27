@@ -329,7 +329,8 @@ def plot_graph_moments(report):
             axes[0].plot(curve.step, curve['second'], label='Feature second moment')
             axes[1].plot(curve.step, curve.probe_ce_gap, label='Matching probes')
             axes[1].scatter([row.best_step], [row.probe_ce_gap], color='black', label='Saved step')
-    axes[0].set(title='Moment errors', xlabel='Adam step', ylabel='Normalized squared error', yscale='symlog', linthresh=1e-6)
+    axes[0].set(title='Moment errors', xlabel='Adam step', ylabel='Normalized squared error')
+    axes[0].set_yscale('symlog', linthresh=1e-6)
     axes[1].set(title='Mean absolute CE risk gap', xlabel='Adam step', ylabel='Original vs condensed CE')
     for axis in axes[:2]:
         if axis.lines:
