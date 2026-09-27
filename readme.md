@@ -546,3 +546,8 @@ validation CE, reports numerical precision, and evaluates test only after select
 `src.stationarity_arxiv.compare_reference_partitions` compares saved reference heads
 at different penalties, starting from one shared Arxiv partition and reusing a
 common baseline GCN evaluation.
+
+`src.soft_ridge_partition.run_soft_ridge` directly optimizes dense soft assignments
+through an exact ridge solve, coupling representative features, labels and masses.
+It compares the hard baseline, soft initialization and optimized soft condensation.
+See [objective and memory protocol](docs/soft_ridge_partition.md).
