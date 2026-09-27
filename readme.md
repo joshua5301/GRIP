@@ -534,3 +534,7 @@ avoiding the full quadratic kernel. See [large dataset protocol](docs/ntk_risk.m
 audit baseline and refines its partition to minimize the synthetic gradient norm
 at a frozen full-data soft-label linear optimum. It compares fresh linear heads
 and paired two-layer GCNs with mass CE. See [objective, bounds and protocol](docs/stationarity_risk.md).
+
+`src.stationarity_arxiv.run_arxiv_stationarity` runs the same diagnostic at an
+explicit Arxiv budget (default 909), with restricted cell candidates, incremental
+gradient updates, and supervised/teacher-label full-graph GCN references.

@@ -75,3 +75,36 @@ Run `tests/test_stationarity_risk.py` in Colab; no local numerical execution is
 required. The tests compare analytic gradients with autograd, finite-move scores
 with full recomputation, accepted-objective monotonicity, nonempty cells, the
 strong-convexity bound with numerical fit allowance, and singleton handling.
+
+## Arxiv experiment
+
+`src.stationarity_arxiv.run_arxiv_stationarity` builds its own teacher and baseline
+without Cora artifacts. The default explicit budget is 909 nodes (the repository's
+conventional `arxiv, ratio=0.005` setting). The measured 909 / original-node-count
+ratio is saved separately; it is not assumed to equal the rounded benchmark label.
+
+The fixed default teacher gamma, temperature, B and student dropout come from the
+earlier Arxiv risk setting at ratio 0.0025, not a newly selected optimum at 909
+nodes. Users can supply the full parameter dictionary. Both partitions share it.
+The experiment is a mechanism comparison, not a full sweep. Positive linear
+penalties are selected by reference validation CE as in the Cora experiment.
+
+For scale, Arxiv defaults to 16 closest other cells in standardized S²X plus
+4 random cells per node. Random candidates can repeat. Distances are computed in
+node blocks, with no N x N storage. Finite-move gradient changes are still exact.
+Gradient contributions are cached, and an accepted block updates only affected
+cell statistics. Statistics are rebuilt each sweep to remove accumulation drift.
+The unrestricted Cora path remains available with `candidate_k=None`.
+Restricted search stopping without a move is `candidate_stalled`, not a certificate
+of full single-node local optimality; `partition_converged` remains false there.
+
+Additional full-graph, two-layer GCN controls use (1) true labels on train nodes
+only and (2) teacher probabilities on all nodes. They keep the same architecture,
+dropout, optimizer and schedule as condensed students, but train on the original
+graph. They are not independently tuned best full-graph results. Both select epochs
+by validation and use test only for reporting. Full-graph seed count can differ
+from the paired condensed comparison and is shown explicitly in the output.
+`label_teacher.csv`, `full_students.csv`, and per-reference JSONs record these
+baselines. No ground-truth validation/test labels are used in teacher fitting,
+partition refinement or student training; they are used only for the stated
+validation selection and final test reporting.

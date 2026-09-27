@@ -60,10 +60,12 @@ def contributions(n, sums, labels, theta, total):
     return errors[:, :, None] * centers[:, None, :] / total
 
 
-def move_deltas(x, q, theta, penalty, n, sums, labels, nodes, sources, targets):
+def move_deltas(x, q, theta, penalty, n, sums, labels, nodes, sources, targets, parts=None, residual=None):
     total = n.sum()
-    parts = contributions(n, sums, labels, theta, total)
-    residual = parts.sum(0) + penalty * theta
+    if parts is None:
+        parts = contributions(n, sums, labels, theta, total)
+    if residual is None:
+        residual = parts.sum(0) + penalty * theta
     old = parts[sources] + parts[targets]
     removed = contributions(n[sources] - 1, sums[sources] - x[nodes],
                             labels[sources] - q[nodes], theta, total)
@@ -75,33 +77,47 @@ def move_deltas(x, q, theta, penalty, n, sums, labels, nodes, sources, targets):
 
 @torch.no_grad()
 def refine_partition(z, q, initial_assignment, theta, penalty, max_sweeps=20,
-                     block_size=16, pair_batch=256, seed=0, rtol=1e-10, atol=1e-18):
+                     block_size=16, pair_batch=256, seed=0, rtol=1e-10, atol=1e-18,
+                     candidate_k=None, random_candidates=0):
     x, q, theta = augment(z.double()), q.double(), theta.double()
     assignment = initial_assignment.to(z.device).clone()
     clusters = int(assignment.max()) + 1
     n, sums, labels = statistics(x, q, assignment, clusters)
     if bool((n <= 0).any()) or penalty <= 0 or min(block_size, pair_batch) < 1 or max_sweeps < 0:
         raise ValueError('Require nonempty cells, positive penalty and valid solver settings')
+    if (candidate_k is not None and candidate_k < 1) or random_candidates < 0:
+        raise ValueError('Invalid candidate settings')
 
     def score(nn, ss, ll):
         residual = contributions(nn, ss, ll, theta, len(x)).sum(0) + penalty * theta
         return residual.square().sum()
 
-    value = score(n, sums, labels)
+    parts = contributions(n, sums, labels, theta, len(x))
+    residual = parts.sum(0) + penalty * theta
+    value = residual.square().sum()
     history = [dict(sweep=0, J=float(value), gradient_norm=float(value.sqrt()), moves=0, seconds=0.)]
     generator = torch.Generator(device=z.device).manual_seed(seed)
     started = time.perf_counter()
 
     def accept(ids, destinations):
-        nonlocal n, sums, labels, value
-        candidate = assignment.clone()
-        candidate[ids] = destinations
-        nn, ss, ll = statistics(x, q, candidate, clusters)
+        nonlocal residual, value
+        sources = assignment[ids]
+        affected, inverse = torch.unique(torch.cat((sources, destinations)), return_inverse=True)
+        src, dst = inverse[:len(ids)], inverse[len(ids):]
+        nn, ss, ll = n[affected].clone(), sums[affected].clone(), labels[affected].clone()
+        ones = nn.new_ones(len(ids))
+        nn.index_add_(0, src, -ones).index_add_(0, dst, ones)
+        ss.index_add_(0, src, -x[ids]).index_add_(0, dst, x[ids])
+        ll.index_add_(0, src, -q[ids]).index_add_(0, dst, q[ids])
         if bool((nn > 0).all()):
-            proposed = score(nn, ss, ll)
+            new_parts = contributions(nn, ss, ll, theta, len(x))
+            next_residual = residual + (new_parts - parts[affected]).sum(0)
+            proposed = next_residual.square().sum()
             if proposed < value - (atol + rtol * value):
-                assignment.copy_(candidate)
-                n, sums, labels, value = nn, ss, ll, proposed
+                assignment[ids] = destinations
+                n[affected], sums[affected], labels[affected] = nn, ss, ll
+                parts[affected] = new_parts
+                residual, value = next_residual, proposed
                 return len(ids)
         if len(ids) <= 1:
             return 0
@@ -115,26 +131,45 @@ def refine_partition(z, q, initial_assignment, theta, penalty, max_sweeps=20,
             ids = block[n[assignment[block]] > 1]
             if not len(ids):
                 continue
-            nodes = ids.repeat_interleave(clusters)
+            if candidate_k is None or candidate_k >= clusters:
+                choices = torch.arange(clusters, device=z.device).expand(len(ids), -1)
+            else:
+                centers = sums[:, :-1] / n[:, None]
+                distances = z[ids].double().square().sum(1)[:, None] + centers.square().sum(1)[None] - 2 * z[ids].double() @ centers.T
+                distances.scatter_(1, assignment[ids, None], torch.inf)
+                choices = distances.topk(min(candidate_k, clusters - 1), largest=False).indices
+                if random_candidates:
+                    random = torch.randint(clusters, (len(ids), random_candidates), generator=generator, device=z.device)
+                    choices = torch.cat((choices, random), dim=1)
+            width = choices.shape[1]
+            nodes = ids.repeat_interleave(width)
             sources = assignment[nodes]
-            targets = torch.arange(clusters, device=z.device).repeat(len(ids))
+            targets = choices.flatten()
             delta = z.new_full((len(nodes),), torch.inf, dtype=torch.double)
             valid = (sources != targets).nonzero().flatten()
             for pair in valid.split(pair_batch):
                 delta[pair] = move_deltas(x, q, theta, penalty, n, sums, labels,
-                                          nodes[pair], sources[pair], targets[pair])
-            best, destinations = delta.reshape(len(ids), clusters).min(1)
+                                          nodes[pair], sources[pair], targets[pair], parts, residual)
+            best, indices = delta.reshape(len(ids), width).min(1)
+            destinations = choices.gather(1, indices[:, None]).flatten()
             take = best < -(atol + rtol * value)
             if bool(take.any()):
                 moved += accept(ids[take], destinations[take])
+        n, sums, labels = statistics(x, q, assignment, clusters)
+        parts = contributions(n, sums, labels, theta, len(x))
+        residual = parts.sum(0) + penalty * theta
+        value = score(n, sums, labels)
         history.append(dict(sweep=sweep, J=float(value), gradient_norm=float(value.sqrt()),
                             moves=moved, seconds=time.perf_counter() - started))
         if not moved:
             converged = True
             break
+    exhaustive = candidate_k is None or candidate_k >= clusters
     return dict(assignment=assignment.cpu(), counts=n.long().cpu(), y=(labels / n[:, None]).float().cpu(),
-                history=history, J=float(value), converged=converged,
-                status='no_accepted_move' if converged else 'iteration_limit')
+                history=history, J=float(value), converged=converged and exhaustive,
+                status=('no_accepted_move' if candidate_k is None or candidate_k >= clusters
+                        else 'candidate_stalled') if converged else 'iteration_limit',
+                candidate_k=candidate_k, random_candidates=random_candidates)
 
 
 @torch.no_grad()
@@ -197,6 +232,15 @@ def run_stationarity_study(learning_root, output_dir=None, ratio=.026,
     root = Path(output_dir or learning_root / 'stationarity') / _fingerprint(options)
     root.mkdir(parents=True, exist_ok=True)
     (root / 'config.json').write_text(json.dumps(options, indent=2), encoding='utf-8')
+    return evaluate_study(root, train, validation, testing, h, q, z, transform, baseline, params,
+                          original_config['settings'], penalties, max_iter, max_sweeps,
+                          block_size, pair_batch, seed, final_seeds, evaluate_test)
+
+
+def evaluate_study(root, train, validation, testing, h, q, z, transform, baseline, params,
+                   settings, penalties, max_iter, max_sweeps, block_size, pair_batch, seed,
+                   final_seeds, evaluate_test=True, candidate_k=None, random_candidates=0):
+    initial = baseline['assignment'].to(z.device)
     y = train['y']
     val_ids = validation[1].nonzero().flatten()
     test_ids = testing[1].nonzero().flatten() if evaluate_test else None
@@ -219,7 +263,8 @@ def run_stationarity_study(learning_root, output_dir=None, ratio=.026,
     if refined_path.exists():
         refined = torch.load(refined_path, map_location='cpu', weights_only=False)
     else:
-        refined = refine_partition(z, q, initial, theta, penalty, max_sweeps, block_size, pair_batch, seed)
+        refined = refine_partition(z, q, initial, theta, penalty, max_sweeps, block_size, pair_batch, seed,
+                                   candidate_k=candidate_k, random_candidates=random_candidates)
         torch.save(refined, refined_path)
     pd.DataFrame(refined['history']).to_csv(root / 'partition_history.csv', index=False)
     full_metrics = metrics(z, q, y, val_ids, theta, penalty, test_ids)
@@ -227,7 +272,7 @@ def run_stationarity_study(learning_root, output_dir=None, ratio=.026,
         root / 'reference.csv', index=False)
     summaries, students = [], []
     for method, partition in (('baseline', baseline), ('stationarity', refined)):
-        assignment = partition['assignment'].to(device)
+        assignment = partition['assignment'].to(z.device)
         centers, labels, mass = cell_means(z, q, assignment)
         x = augment(centers)
         errors = labels.sum(1, keepdim=True) * (x @ theta.T).softmax(1) - labels
@@ -247,7 +292,7 @@ def run_stationarity_study(learning_root, output_dir=None, ratio=.026,
             records = []
             for student_seed in final_seeds:
                 val, test, epoch = _train_student(cx, labels.float(), validation, params, student_seed,
-                                                  {**original_config['settings'], 'loss_weighting': 'mass'},
+                                                  {**settings, 'loss_weighting': 'mass'},
                                                   testing=testing if evaluate_test else None,
                                                   counts=partition['counts'])
                 records.append(dict(seed=student_seed, val=100 * val, test=100 * test if test is not None else np.nan,
@@ -267,7 +312,9 @@ def run_stationarity_study(learning_root, output_dir=None, ratio=.026,
                               test=final.test.mean(), test_std=final.test.std(ddof=0),
                               realization_error=error,
                               changed_fraction=float((assignment != initial).double().mean()),
-                              partition_converged=partition['converged'], output_dir=str(root)))
+                              partition_converged=partition['converged'],
+                              partition_status=partition.get('status', 'converged' if partition['converged'] else 'iteration_limit'),
+                              candidate_k=partition.get('candidate_k'), output_dir=str(root)))
         pd.DataFrame(summaries).to_csv(root / 'summary.csv', index=False)
         pd.concat(students).to_csv(root / 'students.csv', index=False)
     return pd.DataFrame(summaries)

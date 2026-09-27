@@ -81,3 +81,27 @@ def test_singletons_cannot_be_emptied_and_zero_sweeps_preserves_assignment():
     result = refine_partition(z, q, initial, theta, .03, max_sweeps=0)
     torch.testing.assert_close(result['assignment'], initial)
     assert result['status'] == 'iteration_limit'
+
+
+def test_cached_move_scores_match_uncached_scores():
+    z, q, assignment, theta = problem()
+    x = augment(z)
+    n, sums, labels = statistics(x, q, assignment, 3)
+    nodes, targets = torch.tensor([0, 2]), torch.tensor([1, 0])
+    parts = contributions(n, sums, labels, theta, len(z))
+    residual = parts.sum(0) + .03 * theta
+    arguments = (x, q, theta, .03, n, sums, labels, nodes, assignment[nodes], targets)
+    torch.testing.assert_close(move_deltas(*arguments), move_deltas(*arguments, parts, residual))
+
+
+def test_candidate_refinement_exact_score_and_no_global_convergence_claim():
+    z, q, assignment, theta = problem()
+    result = refine_partition(z, q, assignment, theta, .03, max_sweeps=5, block_size=5,
+                              pair_batch=7, candidate_k=1, random_candidates=1)
+    n, sums, labels = statistics(augment(z), q, result['assignment'], 3)
+    score = (contributions(n, sums, labels, theta, len(z)).sum(0) + .03 * theta).square().sum()
+    torch.testing.assert_close(score, torch.tensor(result['J'], dtype=z.dtype))
+    assert not result['converged']
+    assert result['status'] in ('candidate_stalled', 'iteration_limit')
+    history = [r['J'] for r in result['history']]
+    assert all(b <= a + 1e-14 for a, b in zip(history, history[1:]))
