@@ -576,3 +576,10 @@ caching and matrix-free implicit balancing replace repeated softmax passes and
 the dense assignment Gram matrix. Use `balance_backend='chunked'` for the original
 backend. `outer_chunk_size` and `log_every` control evaluation batching and Drive
 logging; optimization.csv includes synchronized phase timings.
+# Low-rank CE assignments
+
+`src.soft_ce_partition.run_soft_ce(..., assignment_rank=32, factor_seed=0)` learns
+a low-rank correction to the original assignment logits with the same CE inner
+and outer objectives. Free mass streams node-cell blocks; uniform mass retains
+the existing balancing cache. `assignment_rank=None` uses the dense baseline.
+See `docs/soft_ce_partition.md` for initialization, memory limits and saved factors.

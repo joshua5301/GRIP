@@ -194,3 +194,39 @@ directory with evaluation_only and recovered_steps in its config. It does not
 fabricate a final checkpoint or mark the failed optimization complete. In
 particular, saved moments cannot resume Adam: no intermediate assignment logits
 or optimizer state were stored by the previous implementation.
+
+## Low-rank residual assignments
+
+Set `assignment_rank=32` in `run_soft_ce`; `None` retains dense optimization.
+The logits are L=L0+UV^T/sqrt(r), where L0 encodes the same smoothed hard
+assignment as before. Only U (N x r) and V (m x r) are optimized. U starts at
+zero and V at standard normal using a local generator controlled by `factor_seed`.
+Thus initial logits and representatives are preserved relative to the same mass
+mode. Both factors cannot start at zero because that would make both gradients
+zero. Uniform mode still balances L0 and changes the free-mode initialization.
+
+This limits the rank of the learned logit correction, not of P or total L.
+Softmax and balancing can produce full-rank P. The factorization is a restriction
+and implicit optimization bias, not a guarantee of better GCN accuracy. The inner
+CE, outer CE, teacher, feature normalization, reconstruction and GCN evaluation
+remain unchanged. Factor Adam steps are not equivalent to dense-logit Adam steps;
+the same learning rate is only an initial controlled comparison.
+
+Free mode evaluates moments and their exact first-order factor derivatives in
+blocks, recomputing probabilities in backward. It never stores full N x m logits,
+probabilities, logit gradients or Adam states. Assignment working memory scales
+with (N+m)r plus chunk_size*m and the material/moments. Arithmetic still includes
+all node-cell pairs and additional factor products; speedup is not guaranteed.
+Uniform mode composes block-generated dense logits with the existing balancing
+backends. Factor parameters and Adam states shrink, but dense temporary logits,
+their gradients, and (for cached balancing) float64 P remain O(Nm).
+
+The best outer-CE assignment is saved as `best_assignment_factors.pt` containing
+u, v, assignment, mixing and rank. Reconstruct blocks with `logit_block`, then
+row-softmax in float64. Uniform runs additionally require the saved column dual.
+Checkpoint moments, validation-based selection and interrupted-run evaluation
+work as before; factor files represent the best outer CE, not necessarily the
+validation-selected checkpoint. These files do not contain resumable Adam state.
+Rank and factor seed enter the experiment fingerprint. Tests cover preservation
+of initial moments, factor gradients against dense autograd and finite differences,
+balanced marginals, and saved best-factor reconstruction for both mass modes.
