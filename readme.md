@@ -529,3 +529,8 @@ against the original risk method's propagated cell-mean representatives.
 representatives with mass CE on Cora, CiteSeer, arxiv, Flickr or Reddit. Its NTK
 uses a shared Nyström feature map for original and identity synthetic graphs,
 avoiding the full quadratic kernel. See [large dataset protocol](docs/ntk_risk.md).
+
+`src.stationarity_risk.run_stationarity_study` reuses the saved Cora S²X learning
+audit baseline and refines its partition to minimize the synthetic gradient norm
+at a frozen full-data soft-label linear optimum. It compares fresh linear heads
+and paired two-layer GCNs with mass CE. See [objective, bounds and protocol](docs/stationarity_risk.md).
