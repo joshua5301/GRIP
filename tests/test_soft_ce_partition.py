@@ -1,5 +1,6 @@
 import pytest
 import torch
+import pandas as pd
 
 import src.soft_ce_partition as model
 from src.soft_ridge_partition import AssignmentMoments, augmented, decode_moments, initial_logits, make_material
@@ -125,3 +126,29 @@ def test_unconverged_implicit_solve_cannot_update_assignments(tmp_path, monkeypa
         model.optimize_ce_assignment(z, q, assignment, steps=1, folder=tmp_path)
     assert (tmp_path / 'failure.json').exists()
     assert not (tmp_path / 'best_assignment_logits.pt').exists()
+
+
+def test_checkpoints_store_current_iterates_without_changing_trajectory(tmp_path):
+    z, q, assignment = problem()
+    settings = dict(penalty=.2, steps=3, lr=.02, chunk_size=4, inner_tol=1e-9, cg_rtol=1e-9)
+    plain = model.optimize_ce_assignment(z, q, assignment, **settings)
+    traced = model.optimize_ce_assignment(z, q, assignment, folder=tmp_path, checkpoint_steps=[1, 2], **settings)
+    assert set(traced['checkpoints']) == {0, 1, 2, 3}
+    torch.testing.assert_close(plain['best_moments'], traced['best_moments'], atol=0, rtol=0)
+    for step, snapshot in traced['checkpoints'].items():
+        saved = torch.load(tmp_path / 'checkpoints' / f'step_{step:06d}.pt', weights_only=False)
+        torch.testing.assert_close(saved['moments'], snapshot['moments'])
+        value, _ = model.outer_value_gradient(z, q, saved['theta'], 4)
+        assert abs(value - traced['history'][step]['J']) < 1e-12
+        assert abs(value - snapshot['teacher_ce']) < 1e-12
+    torch.testing.assert_close(traced['checkpoints'][0]['moments'], traced['initial_moments'])
+
+
+def test_checkpoint_selection_uses_validation_and_earlier_step_tiebreak():
+    table = pd.DataFrame([
+        dict(method='hard', checkpoint_step=float('nan'), gcn_val=99., gcn_test=99.),
+        dict(method='late', checkpoint_step=300, gcn_val=71., gcn_test=99.),
+        dict(method='early', checkpoint_step=100, gcn_val=71., gcn_test=50.),
+        dict(method='test_best', checkpoint_step=200, gcn_val=70., gcn_test=100.),
+    ])
+    assert model.select_checkpoint(table).method.iloc[0] == 'early'

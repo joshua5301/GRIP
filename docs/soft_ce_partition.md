@@ -86,3 +86,27 @@ Tests check the analytic Hessian/diagonal and CG against a dense autograd Hessia
 the outer gradient against autograd, assignment hypergradients against finite
 differences with re-solved CE heads, saved checkpoint fidelity, and rejection of
 unconverged inner solutions. Run numerical tests on Colab, not locally.
+
+## Checkpoint trajectory
+
+Pass `checkpoint_steps=[0,100,200,300,500,750,1000]` with `steps=1000` to
+`run_soft_ce` to evaluate one optimization trajectory at several iterations.
+Step zero and the last step are automatically included for a nonempty schedule.
+Snapshots contain the current moments and converged head at the requested step,
+not the lowest-loss iterate seen so far. They are saved immediately under
+`checkpoints/step_XXXXXX.pt` and in optimized.pt. Dense assignment matrices are
+not saved per checkpoint. Snapshotting does not alter updates or learning rates.
+
+All checkpoint evaluations occur after optimization, using the same GCN seeds
+and settings. Fresh linear CE heads are fitted from zero as in the base protocol.
+The four historical controls retain their saved GCN results. New rows are named
+ce_step_XXXXXX and expose checkpoint_step. The checkpoint with largest mean GCN
+validation accuracy is written to selected_checkpoint.csv; ties prefer the earlier
+step. Neither linear validation nor any test statistic selects the checkpoint.
+Test curves are retrospective diagnostics, not stopping criteria. Seed standard
+deviations reflect student initialization on a fixed condensed set, not independent
+condensation runs. Selecting on these validation results is validation tuning.
+
+Older runs do not contain intermediate moments and cannot supply these snapshots;
+rerun optimization once with a checkpoint schedule. After completion, cached
+optimization and student tables can be reused with the same configuration/revision.

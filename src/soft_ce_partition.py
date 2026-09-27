@@ -130,10 +130,16 @@ def implicit_moment_gradient(moments, dimension, theta, vector, penalty):
 def optimize_ce_assignment(z, q, assignment, penalty=3e-5, steps=300, lr=.01,
                            mixing=.05, chunk_size=4096, inner_max_iter=2000,
                            inner_tol=1e-7, cg_max_iter=512, cg_rtol=1e-6,
-                           save_assignment=True, folder=None):
+                           save_assignment=True, folder=None, checkpoint_steps=()):
     if steps < 0 or any(not np.isfinite(v) or v <= 0 for v in
                         (penalty, lr, chunk_size, inner_max_iter, inner_tol, cg_max_iter, cg_rtol)):
         raise ValueError('Require positive finite solver settings and nonnegative steps')
+    checkpoints = set(checkpoint_steps)
+    if any(not isinstance(step, (int, np.integer)) or not 0 <= step <= steps for step in checkpoints):
+        raise ValueError('Checkpoint steps must be integers within the optimization budget')
+    if checkpoints:
+        checkpoints.update((0, steps))
+    snapshots = {}
     material = make_material(z, q)
     logits = initial_logits(assignment, int(assignment.max()) + 1, mixing).requires_grad_()
     optimizer = torch.optim.Adam([logits], lr=lr, eps=1e-12, foreach=False)
@@ -184,6 +190,14 @@ def optimize_ce_assignment(z, q, assignment, penalty=3e-5, steps=300, lr=.01,
             if folder is not None:
                 (folder / 'failure.json').write_text(json.dumps(dict(step=step, reason=failure), indent=2))
             raise RuntimeError(f'Step {step}: {failure}')
+        if step in checkpoints:
+            snapshot = dict(step=step, moments=moments.detach().cpu().clone(),
+                            theta=theta.cpu().clone(), teacher_ce=value, inner_grad_max=fitted['inner_grad_max'])
+            snapshots[step] = snapshot
+            if folder is not None:
+                checkpoint_dir = folder / 'checkpoints'
+                checkpoint_dir.mkdir(exist_ok=True)
+                torch.save(snapshot, checkpoint_dir / f'step_{step:06d}.pt')
         if step == steps:
             break
         direction = implicit_moment_gradient(moments, z.shape[1], theta, vector, penalty)
@@ -193,7 +207,7 @@ def optimize_ce_assignment(z, q, assignment, penalty=3e-5, steps=300, lr=.01,
         optimizer.step()
     result = dict(initial_moments=initial_moments, best_moments=best_moments,
                   theta=best_theta, best_J=best, best_step=best_step, history=history,
-                  penalty=penalty, steps=steps)
+                  penalty=penalty, steps=steps, checkpoints=snapshots)
     if folder is not None and save_assignment:
         torch.save(best_logits.cpu(), folder / 'best_assignment_logits.pt')
     return result
@@ -205,10 +219,15 @@ def classification(z, y, mask, theta):
     return 100 * float((logits.argmax(1) == y[mask]).double().mean()), float(F.cross_entropy(logits, y[mask]))
 
 
+def select_checkpoint(table):
+    candidates = table[table.checkpoint_step.notna()]
+    return candidates.sort_values(['gcn_val', 'checkpoint_step'], ascending=[False, True]).iloc[[0]]
+
+
 def run_soft_ce(previous_run, output_dir=None, penalty=3e-5, steps=300, lr=.01,
                  chunk_size=4096, inner_max_iter=2000, inner_tol=1e-7,
                  cg_max_iter=512, cg_rtol=1e-6, save_assignment=True,
-                 data_dir='/content/data/', device='cuda'):
+                 data_dir='/content/data/', device='cuda', checkpoint_steps=()):
     previous_run = Path(previous_run)
     prior = json.loads((previous_run / 'config.json').read_text())
     original, source = prior['original'], Path(prior['source'])
@@ -235,7 +254,8 @@ def run_soft_ce(previous_run, output_dir=None, penalty=3e-5, steps=300, lr=.01,
     z = transform(h.double())
     options = dict(penalty=penalty, steps=steps, lr=lr, mixing=prior['mixing'], chunk_size=chunk_size,
                    inner_max_iter=inner_max_iter, inner_tol=inner_tol, cg_max_iter=cg_max_iter,
-                   cg_rtol=cg_rtol, save_assignment=save_assignment)
+                   cg_rtol=cg_rtol, save_assignment=save_assignment,
+                   checkpoint_steps=sorted(set(checkpoint_steps)))
     methods = ['hard_baseline', 'soft_initial', 'ridge_optimized', 'ce_optimized']
     controls = {name: torch.load(previous_run / f'{name}.pt', map_location='cpu', weights_only=False)
                 for name in methods}
@@ -256,10 +276,20 @@ def run_soft_ce(previous_run, output_dir=None, penalty=3e-5, steps=300, lr=.01,
     old_initial = torch.load(previous_run / 'optimized.pt', map_location='cpu', weights_only=False)['initial_moments']
     if not torch.allclose(optimized['initial_moments'], old_initial, atol=1e-10, rtol=1e-8):
         raise ValueError('Initialization differs from the previous experiment')
-    centers, labels, mass = decode_moments(optimized['best_moments'], z.shape[1])
     state = {key: value.cpu() if torch.is_tensor(value) else value for key, value in reference['transform'].items()}
-    cx = (centers * state['scale'] + state['output_center'] + state['center']).float()
-    controls['ce_bilevel'] = dict(x=cx, y=labels.float(), mass=mass)
+    checkpoint_numbers = {}
+    if checkpoint_steps:
+        representatives = {}
+        for step, snapshot in sorted(optimized['checkpoints'].items()):
+            method = f'ce_step_{step:06d}'
+            representatives[method] = snapshot['moments']
+            checkpoint_numbers[method] = step
+    else:
+        representatives = {'ce_bilevel': optimized['best_moments']}
+    for method, moments in representatives.items():
+        centers, labels, mass = decode_moments(moments, z.shape[1])
+        cx = (centers * state['scale'] + state['output_center'] + state['center']).float()
+        controls[method] = dict(x=cx, y=labels.float(), mass=mass)
     summaries, student_tables = [], []
     settings = {key: original[key] for key in ('epochs', 'eval_every', 'hidden')}
     for method, saved in controls.items():
@@ -276,7 +306,7 @@ def run_soft_ce(previous_run, output_dir=None, penalty=3e-5, steps=300, lr=.01,
         student_path = root / f'{method}_students.csv'
         if student_path.exists():
             students = pd.read_csv(student_path)
-        elif method != 'ce_bilevel':
+        elif method in methods:
             students = pd.read_csv(previous_run / f'{method}_students.csv')
         else:
             records = []
@@ -298,8 +328,15 @@ def run_soft_ce(previous_run, output_dir=None, penalty=3e-5, steps=300, lr=.01,
                               **fitted, head_norm=float(theta.norm()), effective_cells=float(1 / mass.square().sum()),
                               gcn_val=students.val.mean(), gcn_val_std=students.val.std(ddof=0),
                               gcn_test=students.test.mean(), gcn_test_std=students.test.std(ddof=0),
+                              checkpoint_step=checkpoint_numbers.get(method, np.nan),
                               best_step=optimized['best_step'] if method == 'ce_bilevel' else np.nan,
                               output_dir=str(root)))
         pd.DataFrame(summaries).to_csv(root / 'summary.csv', index=False)
         pd.concat(student_tables).to_csv(root / 'students.csv', index=False)
-    return pd.DataFrame(summaries)
+    result = pd.DataFrame(summaries)
+    if checkpoint_steps:
+        selected = select_checkpoint(result)
+        selected.to_csv(root / 'selected_checkpoint.csv', index=False)
+        result['selected_by_gcn_val'] = result.method.eq(selected.method.iloc[0])
+        result.to_csv(root / 'summary.csv', index=False)
+    return result

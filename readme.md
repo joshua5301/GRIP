@@ -562,3 +562,7 @@ learner with a regularized CE linear student. It uses converged inner fits and
 implicit Hessian-vector solves to optimize soft assignments, reuses prior GCN
 controls, and evaluates the new representatives with CE linear and GCN students.
 See [implicit CE protocol](docs/soft_ce_partition.md).
+
+Use `checkpoint_steps=[0,100,200,300,500,750,1000]` with `steps=1000` to save and
+evaluate current representatives along one CE bilevel trajectory. Checkpoints
+share evaluation seeds and are selected by mean GCN validation accuracy only.
