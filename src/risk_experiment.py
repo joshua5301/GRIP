@@ -152,7 +152,7 @@ def run_experiments(datasets, output_dir, n_trials=20, space=None,
         raise ValueError('Invalid GRIP initialization settings')
     if loss_weighting not in ('uniform', 'mass'):
         raise ValueError('Require uniform or mass loss weighting')
-    if method not in ('risk', 'grip', 'transport', 'corrected', 'gcn_aware', 'risk_fro', 'grip_distance', 'fsw_grip') or grip_steps < 1:
+    if method not in ('risk', 'risk_local', 'grip', 'transport', 'corrected', 'gcn_aware', 'risk_fro', 'grip_distance', 'fsw_grip') or grip_steps < 1:
         raise ValueError('Unknown method or invalid grip_steps')
     if method == 'fsw_grip' and loss_weighting != 'mass':
         raise ValueError('FSW-GRIP requires mass-weighted CE')
@@ -193,6 +193,8 @@ def run_experiments(datasets, output_dir, n_trials=20, space=None,
         solver['objective_mode'] = 'uniform'
     if method == 'risk_fro':
         solver['objective_mode'] = 'frobenius'
+    if method == 'risk_local':
+        solver['objective_mode'] = 'local'
     settings = dict(epochs=epochs, eval_every=eval_every, hidden=hidden, loss_weighting=loss_weighting)
     output_dir, device = Path(output_dir), torch.device(device)
     output_dir.mkdir(parents=True, exist_ok=True)
@@ -402,6 +404,7 @@ def run_experiments(datasets, output_dir, n_trials=20, space=None,
                             'mass_correction', 'variance_term', 'correction_term', 'moment_term',
                             'objective_name', 'label_gap', 'label_converged', 'head_stationarity_max',
                             'covariance_fro', 'covariance_trace', 'trace_bound', 'feature_term', 'trace_to_fro',
+                            'global_moment_error', 'local_moment_error', 'cancellation_ratio',
                             'realization_initial', 'realization_final', 'embedding_fit', 'embedding_direct', 'embedding_upper'):
                     if key in condensed:
                         trial.set_user_attr(key, condensed[key])
@@ -474,6 +477,10 @@ def run_experiments(datasets, output_dir, n_trials=20, space=None,
                 summaries[-1].update({k: best.user_attrs[k] for k in
                     ('objective_name', 'covariance_fro', 'covariance_trace', 'trace_bound',
                      'feature_term', 'moment_term', 'trace_to_fro')})
+            if method == 'risk_local':
+                summaries[-1].update({k: best.user_attrs[k] for k in
+                    ('objective_name', 'global_moment_error', 'local_moment_error', 'cancellation_ratio',
+                     'variance_term', 'moment_term')})
             pd.DataFrame(summaries).to_csv(output_dir / 'summary.csv', index=False)
         teacher_cache.clear()
         feature_cache.clear()

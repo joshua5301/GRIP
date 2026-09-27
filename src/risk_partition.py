@@ -5,6 +5,29 @@ import torch
 from src.risk_split import split_partition
 
 
+def _local_deltas(X, Q, ids, sources, counts, c, y, error, alpha, beta):
+    N = len(X)
+    xb, qb = X[ids], Q[ids]
+    ua, va = xb - c[sources], qb - y[sources]
+    ka = counts[sources] / (N * (counts[sources] - 1).clamp_min(1))
+    kb = counts / (N * (counts + 1))
+    ua2, va2 = ua.square().sum(1), va.square().sum(1)
+    ub2 = (xb.square().sum(1)[:, None] + c.square().sum(1)[None, :] - 2 * xb @ c.T).clamp_min(0)
+    vb2 = (qb.square().sum(1)[:, None] + y.square().sum(1)[None, :] - 2 * qb @ y.T).clamp_min(0)
+    norms2 = error.square().sum((1, 2))
+    ta = torch.einsum('bd,bdk,bk->b', ua, error[sources], va)
+    xe = torch.einsum('bd,mdk->bmk', xb, error)
+    ce = torch.einsum('md,mdk->mk', c, error)
+    tb = (torch.einsum('bmk,bk->bm', xe, qb) - torch.einsum('bmk,mk->bm', xe, y)
+          - qb @ ce.T + (ce * y).sum(1)[None, :])
+    removed = (norms2[sources] - 2 * ka * ta + ka.square() * ua2 * va2).clamp_min(0).sqrt()
+    added = (norms2[None, :] + 2 * kb[None, :] * tb
+             + kb.square()[None, :] * ub2 * vb2).clamp_min(0).sqrt()
+    delta_m = (removed - norms2[sources].sqrt())[:, None] + added - norms2.sqrt()[None, :]
+    delta_v = -ka[:, None] * ua2[:, None] + kb[None, :] * ub2
+    return alpha * delta_v + beta * delta_m
+
+
 def _uniform_deltas(X, Q, ids, sources, counts, c, y, error, alpha, beta):
     N, m = len(X), len(c)
     xb, qb = X[ids], Q[ids] - 1 / Q.shape[1]
@@ -101,8 +124,8 @@ def risk_partition(H, Q, m, B, seed=0, max_sweeps=30, block_size=1024,
         raise ValueError('Require 1 <= m <= N and finite B > 0')
     if max_sweeps < 0 or block_size < 1 or min(atol, rtol) < 0:
         raise ValueError('Invalid partition solver settings')
-    if objective_mode not in ('combined', 'variance', 'uniform', 'frobenius'):
-        raise ValueError('Require combined, variance, uniform or frobenius objective')
+    if objective_mode not in ('combined', 'variance', 'uniform', 'frobenius', 'local'):
+        raise ValueError('Require combined, variance, uniform, frobenius or local objective')
 
     if H.is_cuda:
         torch.cuda.synchronize(H.device)
@@ -156,25 +179,36 @@ def risk_partition(H, Q, m, B, seed=0, max_sweeps=30, block_size=1024,
         n = torch.bincount(assignment, minlength=m).double()
         s = X.new_zeros(m, d).index_add_(0, assignment, X)
         r = Q.new_zeros(m, K).index_add_(0, assignment, Q)
-        return n, s, r
+        cross = None
+        if objective_mode == 'local':
+            cross = X.new_zeros(m, d, K)
+            for start in range(0, N, block_size):
+                end = min(start + block_size, N)
+                cross.index_add_(0, assignment[start:end], X[start:end, :, None] * Q[start:end, None, :])
+        return n, s, r, cross
 
-    def score(n, s, r):
+    def moment_norm(value):
+        return value.flatten(1).norm(dim=1).sum() if objective_mode == 'local' else value.norm()
+
+    def score(n, s, r, cross=None):
         c = s / n[:, None]
         error = moment - c.T @ r / N
+        if objective_mode == 'local':
+            error = (cross - c[:, :, None] * r[:, None, :]) / N
         variance = (energy - (s * c).sum() / N).clamp_min(0)
         correction = X.new_tensor(0.0)
         if objective_mode == 'uniform':
             error = moment - c.T @ (r / n[:, None] - 1 / K) / m
             correction = ((n / N - 1 / m).abs() * c.square().sum(1)).sum()
         feature_error = covariance(n, s).norm() if objective_mode == 'frobenius' else variance + correction
-        value = float(alpha * feature_error + beta * error.norm())
+        value = float(alpha * feature_error + beta * moment_norm(error))
         if not math.isfinite(value):
             raise FloatingPointError('Nonfinite partition objective')
         return error, variance, value
 
-    counts, sums, label_sums = aggregate()
-    error, variance, objective = score(counts, sums, label_sums)
-    initial_variance, initial_moment = float(variance), float(error.norm())
+    counts, sums, label_sums, cross_sums = aggregate()
+    error, variance, objective = score(counts, sums, label_sums, cross_sums)
+    initial_variance, initial_moment = float(variance), float(moment_norm(error))
     history, moves_history = [objective], []
     snapshots = {}
 
@@ -182,7 +216,7 @@ def risk_partition(H, Q, m, B, seed=0, max_sweeps=30, block_size=1024,
         return dict(x=((sums[:, :original_d] / counts[:, None]) * scale + offset).float().cpu(),
                     y=(label_sums / counts[:, None]).float().cpu(),
                     counts=counts.long().cpu(), J=objective, V=float(variance),
-                    moment_error=float(error.norm()), sweeps=sweep,
+                    moment_error=float(moment_norm(error)), sweeps=sweep,
                     seconds=time.perf_counter() - started)
 
     if 0 in checkpoints:
@@ -201,13 +235,19 @@ def risk_partition(H, Q, m, B, seed=0, max_sweeps=30, block_size=1024,
             next_sums[target] += X[node]
             next_labels[source] -= Q[node]
             next_labels[target] += Q[node]
-            direct = score(next_counts, next_sums, next_labels)[2] - objective
+            next_cross = cross_sums
+            if objective_mode == 'local':
+                next_cross = cross_sums.clone()
+                product = X[node, :, None] * Q[node, None, :]
+                next_cross[source] -= product
+                next_cross[target] += product
+            direct = score(next_counts, next_sums, next_labels, next_cross)[2] - objective
             if abs(float(delta[local, target]) - direct) > 1e-8 * max(1.0, abs(objective)):
                 raise FloatingPointError('Move delta disagrees with full objective recomputation')
         return len(eligible) > 0
 
     def apply_moves(ids, destinations):
-        nonlocal counts, sums, label_sums, error, variance, objective
+        nonlocal counts, sums, label_sums, cross_sums, error, variance, objective
         sources = assignment[ids]
         next_counts = (counts + torch.bincount(destinations, minlength=m)
                        - torch.bincount(sources, minlength=m))
@@ -218,11 +258,18 @@ def risk_partition(H, Q, m, B, seed=0, max_sweeps=30, block_size=1024,
             next_sums.index_add_(0, destinations, xb)
             next_labels.index_add_(0, sources, -qb)
             next_labels.index_add_(0, destinations, qb)
+            next_cross = cross_sums
+            if objective_mode == 'local':
+                next_cross = cross_sums.clone()
+                products = xb[:, :, None] * qb[:, None, :]
+                next_cross.index_add_(0, sources, -products)
+                next_cross.index_add_(0, destinations, products)
             next_error, next_variance, next_objective = score(
-                next_counts, next_sums, next_labels)
+                next_counts, next_sums, next_labels, next_cross)
             tolerance = atol + rtol * max(1.0, abs(objective))
             if next_objective < objective - tolerance:
                 counts, sums, label_sums = next_counts, next_sums, next_labels
+                cross_sums = next_cross
                 error, variance, objective = next_error, next_variance, next_objective
                 assignment[ids] = destinations
                 return len(ids)
@@ -240,9 +287,10 @@ def risk_partition(H, Q, m, B, seed=0, max_sweeps=30, block_size=1024,
         order = torch.randperm(N, generator=generator, device=X.device)
         for ids in order.split(block_size):
             c, y = sums / counts[:, None], label_sums / counts[:, None]
-            if objective_mode == 'uniform':
+            if objective_mode in ('uniform', 'local'):
                 sources = assignment[ids]
-                delta = _uniform_deltas(X, Q, ids, sources, counts, c, y, error, alpha, beta)
+                deltas = _local_deltas if objective_mode == 'local' else _uniform_deltas
+                delta = deltas(X, Q, ids, sources, counts, c, y, error, alpha, beta)
                 if verify_deltas and not checked:
                     checked = check_deltas(ids, sources, delta)
                 delta.scatter_(1, sources[:, None], torch.inf)
@@ -299,8 +347,8 @@ def risk_partition(H, Q, m, B, seed=0, max_sweeps=30, block_size=1024,
             if bool(take.any()):
                 moved += apply_moves(ids[take], destinations[take])
 
-        counts, sums, label_sums = aggregate()
-        error, variance, objective = score(counts, sums, label_sums)
+        counts, sums, label_sums, cross_sums = aggregate()
+        error, variance, objective = score(counts, sums, label_sums, cross_sums)
         if objective > history[-1] + 1e-8 * max(1.0, abs(history[-1])):
             raise FloatingPointError('Partition objective increased')
         history.append(objective)
@@ -314,13 +362,19 @@ def risk_partition(H, Q, m, B, seed=0, max_sweeps=30, block_size=1024,
     result = dict(x=((sums[:, :original_d] / counts[:, None]) * scale + offset).float().cpu(),
                   y=(label_sums / counts[:, None]).float().cpu(),
                   counts=counts.long().cpu(), J=objective, V=float(variance),
-                  moment_error=float(error.norm()), history=history,
+                  moment_error=float(moment_norm(error)), history=history,
                   moves=moves_history, sweeps=len(moves_history),
                   converged=converged, B=float(B), seed=int(seed))
     result['objective_mode'] = objective_mode
     result.update(initialization=init, initialization_seconds=initialization_seconds,
                   initial_V=initial_variance, initial_moment_error=initial_moment, **initialization_info)
     result['bound_J'] = B * B / 4 * result['V'] + 2 * B * result['moment_error']
+    if objective_mode == 'local':
+        global_error = float(error.sum(0).norm())
+        result.update(objective_name='local_moment_surrogate', global_moment_error=global_error,
+                      local_moment_error=result['moment_error'], variance_term=alpha * result['V'],
+                      moment_term=beta * result['moment_error'],
+                      cancellation_ratio=global_error / result['moment_error'] if result['moment_error'] > 0 else 1.)
     if objective_mode == 'frobenius':
         frobenius = float(covariance(counts, sums).norm())
         if frobenius > float(variance) + 1e-8 * max(1.0, float(variance)):

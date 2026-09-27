@@ -503,3 +503,9 @@ and moment/CE/accuracy plots. See [protocol and limitations](docs/graph_moment_c
 `src.graph_moment_diagnostics.run_graph_moment_diagnostics` reuses a completed run
 to compare initial/optimized graphs at identical selected settings and measure CE
 preservation on independent probe seeds. See [paired diagnostic protocol](docs/graph_moment_diagnostics.md).
+
+`src.risk_experiment.run_experiments(method='risk_local')` provides a minimal
+variant of original risk clustering: sum the cellwise cross-moment Frobenius norms
+instead of taking the norm after summing cells. The teacher, propagated features,
+initialization, representatives and student pipeline remain the original risk
+ones. See [paired-grid protocol and scope](docs/risk_local.md).
