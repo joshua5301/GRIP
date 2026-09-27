@@ -71,6 +71,44 @@ def conjugate_gradient(multiply, rhs, diagonal, rtol=1e-6, atol=1e-12, max_iter=
                           cg_converged=np.isfinite(residual_norm) and residual_norm <= target)
 
 
+@torch.no_grad()
+def solve_head_system(x, labels, mass, theta, penalty, rhs, rtol=1e-6, atol=1e-12,
+                      max_iter=512, reduced_limit=2048):
+    multiply, diagonal = hessian_operator(x, labels, mass, theta, penalty)
+    classes = theta.shape[0]
+    dimension = min(x.shape) * classes
+    diagnostic = dict(cg_iterations=0)
+    if not (x.shape[1] > 2 * x.shape[0] and dimension <= reduced_limit):
+        solution, diagnostic = conjugate_gradient(multiply, rhs, diagonal, rtol=rtol,
+                                                   atol=atol, max_iter=max_iter)
+        diagnostic.update(hessian_solver='pcg', hessian_reduced_dimension=0)
+        if diagnostic['cg_converged']:
+            return solution, diagnostic
+    if dimension > reduced_limit:
+        solution, retry = conjugate_gradient(multiply, rhs, diagonal, rtol=rtol,
+                                              atol=atol, max_iter=4 * max_iter)
+        retry.update(hessian_solver='pcg_extended', hessian_reduced_dimension=0,
+                     cg_iterations=diagnostic['cg_iterations'] + retry['cg_iterations'])
+        return solution, retry
+    _, singular, basis = torch.linalg.svd(x, full_matrices=False)
+    projected_x = x @ basis.T
+    projected_rhs = rhs @ basis.T
+    probability = (x @ theta.T).softmax(1)
+    covariance = torch.diag_embed(probability) - probability[:, :, None] * probability[:, None, :]
+    covariance *= (mass * labels.sum(1))[:, None, None]
+    system = torch.einsum('icd,ia,ib->cadb', covariance, projected_x, projected_x).reshape(dimension, dimension)
+    system = (system + system.T) / 2 + penalty * torch.eye(dimension, dtype=x.dtype, device=x.device)
+    projected_solution = torch.linalg.solve(system, projected_rhs.flatten()).reshape(classes, len(singular))
+    solution = projected_solution @ basis + (rhs - projected_rhs @ basis) / penalty
+    norm = float(rhs.norm())
+    residual = float((multiply(solution) - rhs).norm())
+    diagnostic.update(hessian_solver='reduced_direct', hessian_reduced_dimension=dimension,
+                      cg_residual=residual, cg_relative_residual=residual / max(norm, 1e-30),
+                      cg_converged=bool(torch.isfinite(solution).all()) and np.isfinite(residual)
+                                   and residual <= max(atol, rtol * norm))
+    return solution, diagnostic
+
+
 def solve_inner(centers, labels, mass, penalty, initial=None, max_iter=2000, grad_tol=1e-7,
                 polish_steps=8, cg_max_iter=512):
     fitted = fit_head(centers.detach(), labels.detach(), mass.detach(), penalty,
@@ -84,9 +122,8 @@ def solve_inner(centers, labels, mass, penalty, initial=None, max_iter=2000, gra
             gradient = head_gradient(x, labels, mass, theta, penalty)
             if float(gradient.abs().max()) <= grad_tol:
                 break
-            multiply, diagonal = hessian_operator(x, labels, mass, theta, penalty)
-            direction, diagnostic = conjugate_gradient(multiply, gradient, diagonal,
-                                                        rtol=1e-8, atol=1e-14, max_iter=cg_max_iter)
+            direction, diagnostic = solve_head_system(x, labels, mass, theta, penalty, gradient,
+                                                       rtol=1e-8, atol=1e-14, max_iter=cg_max_iter)
             if not diagnostic['cg_converged']:
                 break
             objective = head_objective(x, labels, mass, theta, penalty)
@@ -273,13 +310,13 @@ def optimize_ce_assignment(z, q, assignment, penalty=3e-5, steps=300, lr=.01,
                     best_dual = dual.clone() if dual is not None else None
             if step < steps:
                 implicit_start = timestamp()
-                multiply, diagonal = hessian_operator(augmented(centers), labels, mass, theta, penalty)
-                vector, diagnostic = conjugate_gradient(multiply, outer_gradient, diagonal,
-                                                         rtol=cg_rtol, max_iter=cg_max_iter)
+                vector, diagnostic = solve_head_system(augmented(centers), labels, mass, theta, penalty,
+                                                        outer_gradient, rtol=cg_rtol, max_iter=cg_max_iter)
                 row.update(diagnostic)
                 row['implicit_seconds'] = timestamp() - implicit_start
                 if not diagnostic['cg_converged']:
-                    failure = 'Implicit Hessian solve did not converge; increase cg_max_iter'
+                    failure = (f'Implicit Hessian solve did not converge: solver={diagnostic["hessian_solver"]}, '
+                               f'relative residual={diagnostic["cg_relative_residual"]:.3g}, target={cg_rtol:.3g}')
         row.update(best_J=best, seconds=elapsed + time.perf_counter() - started,
                    status='failed' if failure else 'evaluated' if step == steps else 'update')
         history.append(row)

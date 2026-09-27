@@ -117,11 +117,11 @@ def test_unconverged_implicit_solve_cannot_update_assignments(tmp_path, monkeypa
     def fitted(*args, **kwargs):
         return dict(theta=z.new_zeros(q.shape[1], z.shape[1] + 1), inner_grad_max=0.,
                     inner_converged=True, inner_iterations=1, inner_polish_steps=0)
-    def failed(multiply, rhs, diagonal, **kwargs):
+    def failed(x, labels, mass, theta, penalty, rhs, **kwargs):
         return torch.zeros_like(rhs), dict(cg_converged=False, cg_iterations=1,
-                                          cg_residual=1., cg_relative_residual=1.)
+                                          cg_residual=1., cg_relative_residual=1., hessian_solver='failed')
     monkeypatch.setattr(model, 'solve_inner', fitted)
-    monkeypatch.setattr(model, 'conjugate_gradient', failed)
+    monkeypatch.setattr(model, 'solve_head_system', failed)
     with pytest.raises(RuntimeError, match='Implicit Hessian solve did not converge'):
         model.optimize_ce_assignment(z, q, assignment, steps=1, folder=tmp_path)
     assert (tmp_path / 'failure.json').exists()
@@ -184,3 +184,38 @@ def test_recovery_loads_only_existing_steps(tmp_path):
 def test_recovery_requires_initial_checkpoint(tmp_path):
     with pytest.raises(ValueError, match='checkpoint zero'):
         model.load_ce_snapshots(tmp_path)
+
+
+@pytest.mark.parametrize('rank_deficient', [False, True])
+def test_reduced_hessian_fallback_matches_full_solve(rank_deficient):
+    generator = torch.Generator().manual_seed(78)
+    x = torch.randn(4, 11, generator=generator, dtype=torch.double)
+    if rank_deficient:
+        x[3] = x[0]
+    labels = torch.randn(4, 3, generator=generator, dtype=torch.double).softmax(1)
+    mass = torch.tensor([.1, .2, .3, .4], dtype=torch.double)
+    theta = .2 * torch.randn(3, 11, generator=generator, dtype=torch.double)
+    rhs = torch.randn(3, 11, generator=generator, dtype=torch.double)
+    penalty = 1e-5
+    hessian = torch.autograd.functional.hessian(
+        lambda value: head_objective(x, labels, mass, value, penalty), theta,
+    ).reshape(theta.numel(), theta.numel())
+    expected = torch.linalg.solve(hessian, rhs.flatten()).reshape_as(rhs)
+    actual, diagnostic = model.solve_head_system(x, labels, mass, theta, penalty, rhs,
+                                                rtol=1e-8, max_iter=1)
+    assert diagnostic['hessian_solver'] == 'reduced_direct'
+    assert diagnostic['cg_converged']
+    torch.testing.assert_close(actual, expected, atol=1e-5, rtol=1e-8)
+    assert diagnostic['cg_relative_residual'] <= 1e-8
+
+
+def test_failed_fallback_is_not_accepted(monkeypatch):
+    z, q, _ = problem()
+    x = augmented(z)
+    theta = z.new_zeros(3, 4)
+    mass = z.new_full((len(z),), 1 / len(z))
+    rhs = torch.arange(12, dtype=z.dtype).reshape_as(theta)
+    monkeypatch.setattr(torch.linalg, 'solve', lambda matrix, vector: torch.zeros_like(vector))
+    _, diagnostic = model.solve_head_system(x, q, mass, theta, 1e-5, rhs, max_iter=1)
+    assert diagnostic['hessian_solver'] == 'reduced_direct'
+    assert not diagnostic['cg_converged']

@@ -50,3 +50,18 @@ The staged search reduces assignment updates from 18*3000=54000 to
 18*300+3*700=7500 for the example grid, or 8200 if a fourth candidate is retained.
 This is not a wall-clock guarantee: head solves and repeated student evaluation
 can dominate, particularly with high-dimensional Cora/Citeseer features.
+
+## High-dimensional CE Hessian solves
+
+When augmented feature width exceeds twice the number of cells and the reduced
+system has at most 2048 coordinates, the CE solver uses an exact row-space solve
+instead of PCG. Otherwise it first tries PCG, then uses the reduced solve as a
+fallback when small enough (or retries PCG with four times the iteration budget).
+For X=U S V^T, the data Hessian acts only along V in feature coordinates. Its
+orthogonal complement is exactly lambda*I, so that component of the right-hand
+side is solved by division by lambda. The projected class-by-feature Hessian is
+solved directly. No singular directions are truncated and no extra damping or
+tolerance relaxation is introduced. The original full-coordinate residual must
+still satisfy the requested tolerance or optimization stops. The same solver
+supports inner-head Newton polishing. Logs include hessian_solver and the reduced
+dimension; cg_residual denotes the verified residual for either solver.
