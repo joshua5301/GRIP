@@ -170,3 +170,17 @@ def test_uniform_mass_bilevel_checkpoints_and_saved_assignment(tmp_path):
     moments = probability.T @ make_material(z, q) / len(z)
     torch.testing.assert_close(moments, result['best_moments'])
     assert all(row['column_residual'] <= 1e-11 for row in result['history'])
+
+
+def test_recovery_loads_only_existing_steps(tmp_path):
+    folder = tmp_path / 'checkpoints'
+    folder.mkdir()
+    for step in (0, 100, 750):
+        torch.save(dict(step=step, moments=torch.ones(2, 4, dtype=torch.double)), folder / f'step_{step:06d}.pt')
+    snapshots = model.load_ce_snapshots(tmp_path)
+    assert sorted(snapshots) == [0, 100, 750]
+
+
+def test_recovery_requires_initial_checkpoint(tmp_path):
+    with pytest.raises(ValueError, match='checkpoint zero'):
+        model.load_ce_snapshots(tmp_path)

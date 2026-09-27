@@ -273,13 +273,26 @@ def select_checkpoint(table):
     return candidates.sort_values(['gcn_val', 'checkpoint_step'], ascending=[False, True]).iloc[[0]]
 
 
+def load_ce_snapshots(directory):
+    snapshots = {}
+    for path in sorted((Path(directory) / 'checkpoints').glob('step_*.pt')):
+        snapshot = torch.load(path, map_location='cpu', weights_only=False)
+        step = int(path.stem.split('_')[-1])
+        if snapshot['step'] != step or not bool(torch.isfinite(snapshot['moments']).all()):
+            raise ValueError(f'Invalid saved checkpoint: {path}')
+        snapshots[step] = snapshot
+    if 0 not in snapshots:
+        raise ValueError('Recovery requires saved checkpoint zero')
+    return snapshots
+
+
 def run_soft_ce(previous_run, output_dir=None, penalty=3e-5, steps=300, lr=.01,
                  chunk_size=4096, inner_max_iter=2000, inner_tol=1e-7,
                  cg_max_iter=512, cg_rtol=1e-6, save_assignment=True,
                  data_dir='/content/data/', device='cuda', checkpoint_steps=(),
                  mass_mode='free', balance_steps=300, balance_tol=1e-8,
                  balance_backend='cached', balance_cg_steps=512, balance_cg_rtol=1e-7,
-                 outer_chunk_size=65536, log_every=10):
+                 outer_chunk_size=65536, log_every=10, checkpoint_source=None):
     previous_run = Path(previous_run)
     prior = json.loads((previous_run / 'config.json').read_text())
     original, source = prior['original'], Path(prior['source'])
@@ -319,11 +332,22 @@ def run_soft_ce(previous_run, output_dir=None, penalty=3e-5, steps=300, lr=.01,
     config = dict(previous_run=str(previous_run), prior=prior, options=options, control_digests=control_digests,
                   transform_digest=array_digest(z.cpu().numpy()),
                   revision=subprocess.check_output(['git', 'rev-parse', 'HEAD'], text=True).strip())
+    recovered = None
+    if checkpoint_source is not None:
+        saved_config = json.loads((Path(checkpoint_source) / 'config.json').read_text())
+        if saved_config['prior'] != prior or saved_config['options'] != options or not checkpoint_steps:
+            raise ValueError('Recovery settings differ from the saved experiment')
+        recovered = load_ce_snapshots(checkpoint_source)
+        config.update(checkpoint_source=str(checkpoint_source), evaluation_only=True,
+                      recovered_steps=sorted(recovered),
+                      recovered_digest=array_digest(*(entry['moments'].numpy() for entry in recovered.values())))
     root = Path(output_dir or previous_run / 'ce_bilevel') / _fingerprint(config)
     root.mkdir(parents=True, exist_ok=True)
     (root / 'config.json').write_text(json.dumps(config, indent=2), encoding='utf-8')
     optimized_path = root / 'optimized.pt'
-    if optimized_path.exists():
+    if recovered is not None:
+        optimized = dict(initial_moments=recovered[0]['moments'], checkpoints=recovered)
+    elif optimized_path.exists():
         optimized = torch.load(optimized_path, map_location='cpu', weights_only=False)
     else:
         optimized = optimize_ce_assignment(z, q, assignment, folder=root, **options)
@@ -398,3 +422,12 @@ def run_soft_ce(previous_run, output_dir=None, penalty=3e-5, steps=300, lr=.01,
         result['selected_by_gcn_val'] = result.method.eq(selected.method.iloc[0])
         result.to_csv(root / 'summary.csv', index=False)
     return result
+
+
+def evaluate_saved_ce_checkpoints(failed_run, output_dir=None, data_dir='/content/data/', device='cuda'):
+    failed_run = Path(failed_run)
+    config = json.loads((failed_run / 'config.json').read_text())
+    options = dict(config['options'])
+    options.pop('mixing')
+    return run_soft_ce(config['previous_run'], output_dir=output_dir or failed_run / 'recovered_evaluation',
+                        data_dir=data_dir, device=device, checkpoint_source=failed_run, **options)

@@ -50,18 +50,18 @@ class CachedBalancedMoments(torch.autograd.Function):
             probability[start:start + chunk_size] = (block - block.max(1, keepdim=True).values).exp()
         dual = material.new_zeros(m) if initial_dual is None else initial_dual.to(material)
         column_scale = (dual - dual.max()).exp()
-        for iteration in range(max_iter):
+        for iteration in range(4 * max_iter):
             row_scale = (probability @ column_scale).reciprocal()
             columns = column_scale * (probability.T @ row_scale) / n
             error = float((m * columns - 1).abs().max())
-            if error <= tolerance:
+            if error <= .95 * tolerance:
                 break
             if not bool(torch.isfinite(columns).all()) or bool((columns <= 0).any()):
                 raise FloatingPointError('Cached balancing underflow/overflow; use balance_backend="chunked"')
             column_scale /= m * columns
             column_scale /= column_scale.max()
         else:
-            raise RuntimeError(f'Uniform assignment did not converge: column residual={error:.3g}')
+            raise RuntimeError(f'Uniform assignment did not converge after {4 * max_iter} iterations: column residual={error:.3g}')
         for start in range(0, n, chunk_size):
             probability[start:start + chunk_size] *= row_scale[start:start + chunk_size, None] * column_scale
         row_error = float((probability.sum(1) - 1).abs().max())

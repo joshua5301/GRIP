@@ -74,3 +74,12 @@ def test_matrix_free_correction_matches_dense_solve():
     expected = torch.linalg.solve(matrix, rhs)
     actual = matrix_free_correction(probability, columns, rhs, 4, 512, 1e-11)
     torch.testing.assert_close(actual, expected, atol=1e-10, rtol=1e-9)
+
+
+def test_cached_balancing_extends_budget_without_relaxing_marginals():
+    logits = torch.tensor([[5., 0., 0.]] * 7, dtype=torch.double)
+    moments, _, diagnostic = CachedBalancedMoments.apply(
+        logits, torch.ones(7, 1, dtype=torch.double), 3, 1, 1e-12, None, 512, 1e-7)
+    assert 1 < diagnostic[0] <= 4
+    assert diagnostic[2] <= 1e-12
+    torch.testing.assert_close(moments[:, 0], torch.full((3,), 1 / 3, dtype=torch.double), atol=1e-12, rtol=0)

@@ -120,7 +120,7 @@ relative column residual is at most balance_tol (default 1e-8). Row sums follow
 from softmax. This is the KL projection of the row-softmax assignment onto the
 balanced transport constraints; it does not add a tunable entropy penalty to J.
 Warm-started potentials accelerate subsequent evaluations. Failure to meet the
-marginal tolerance within balance_steps stops the run. Equality is numerical,
+marginal tolerance within the balancing budget stops the run. Equality is numerical,
 not exact arithmetic. No stop-gradient approximation is used for balancing.
 
 For an upstream moment gradient, let G be the unnormalized gradient for P,
@@ -179,3 +179,18 @@ Failures and the last step always write diagnostics. GPU-synchronized phase time
 record assignment_seconds, inner_seconds, outer_seconds, implicit_seconds and
 backward_seconds (including the assignment optimizer update). Snapshot/host IO
 overhead remains in total elapsed seconds and is not assigned to these five phases.
+
+The cached backend now continues its existing scaling iterations up to
+4*balance_steps when needed, rather than failing at the initial budget. It seeks
+0.95*balance_tol before materializing P to leave room for summation roundoff and
+still checks the actual marginals against balance_tol. It does not accept a failed
+constraint or restart the scaling sequence. Logged balance_iterations includes
+the extension; the limit remains bounded.
+
+`evaluate_saved_ce_checkpoints(failed_run, ...)` evaluates snapshots already saved
+by an interrupted run without optimizing assignments again. It checks experiment
+provenance, includes only files actually present, and writes a separate evaluation
+directory with evaluation_only and recovered_steps in its config. It does not
+fabricate a final checkpoint or mark the failed optimization complete. In
+particular, saved moments cannot resume Adam: no intermediate assignment logits
+or optimizer state were stored by the previous implementation.
