@@ -491,3 +491,11 @@ See [scope of student alignment](docs/student_matched_kernel.md).
 `src.trained_teacher_kernel.run_teacher_kernel_study` compares the original
 GCN teacher's initial and trained hidden/NTK distances, verifying the checkpoint
 against saved teacher probabilities. See [checkpoint recovery and interpretation](docs/trained_teacher_kernel.md).
+
+## Joint graph and feature moment condensation
+
+`src.graph_moment_condensation.run_graph_moment_sweep` learns raw synthetic features
+and symmetric edge weights by matching readout feature-label first moments and
+feature second moments across multiple two-layer GCN checkpoints. It supports
+cached grid search, mass CE, independent final test seeds, an initial-graph control,
+and moment/CE/accuracy plots. See [protocol and limitations](docs/graph_moment_condensation.md).
