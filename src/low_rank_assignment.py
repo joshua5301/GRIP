@@ -31,6 +31,30 @@ def initialize_factors(assignment, clusters, rank, seed=0):
     return u.requires_grad_(), v.requires_grad_()
 
 
+def initialize_mlp(inputs, clusters, rank, hidden=64, seed=0):
+    if not isinstance(hidden, int) or hidden < 1:
+        raise ValueError('encoder_hidden must be a positive integer')
+    _, v = initialize_encoder(inputs, clusters, rank, seed)
+    generator = torch.Generator(device=inputs.device).manual_seed(seed + 1)
+    first = inputs.new_empty(inputs.shape[1], hidden)
+    first.uniform_(-math.sqrt(6 / inputs.shape[1]), math.sqrt(6 / inputs.shape[1]), generator=generator)
+    parameters = [first, inputs.new_zeros(hidden), inputs.new_zeros(hidden, rank), inputs.new_zeros(rank)]
+    return [p.requires_grad_() for p in parameters], v
+
+
+def encode_nodes(inputs, parameters):
+    if len(parameters) == 1:
+        return inputs @ parameters[0]
+    first, bias, last, output_bias = parameters
+    return (inputs @ first + bias).relu() @ last + output_bias
+
+
+def saved_encoder_nodes(z, q, saved):
+    inputs = assignment_inputs(z, q, saved['assignment_input'])
+    parameters = saved['encoder_parameters'] if 'encoder_parameters' in saved else [saved['weight']]
+    return encode_nodes(inputs, [p.to(inputs) for p in parameters])
+
+
 def logit_block(u, v, assignment, mixing):
     return initial_logits(assignment, len(v), mixing, u.dtype) + u @ v.T / math.sqrt(u.shape[1])
 

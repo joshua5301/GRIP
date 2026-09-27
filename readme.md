@@ -578,6 +578,10 @@ backend. `outer_chunk_size` and `log_every` control evaluation batching and Driv
 logging; optimization.csv includes synchronized phase timings.
 # Low-rank CE assignments
 
+For a nonlinear assignment map, add `assignment_encoder='mlp', encoder_hidden=64`
+to a feature-conditioned run. Its zero-initialized output layer preserves the
+same starting partition as the linear encoder.
+
 Use `assignment_input='features'` or `'features_labels'` together with
 `assignment_rank=16` to generate node embeddings with a learned linear map
 from fixed features or features plus teacher probabilities. The default `'node'`

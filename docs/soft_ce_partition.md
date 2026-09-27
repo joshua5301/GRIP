@@ -264,3 +264,25 @@ using `assignment_inputs`, then use `logit_block(H @ weight, v, assignment,
 mixing)` and float64 row softmax (plus the saved dual in uniform mode).
 The run config retains source digests and transform provenance. Input mode is
 part of the fingerprint, and old dense/independent-node options remain valid.
+
+### MLP assignment encoder
+
+Set `assignment_encoder='mlp', encoder_hidden=64` with a feature input mode.
+The map is ReLU(H W1+b1) W2+b2, with output width assignment_rank. W1 uses
+a seeded uniform initialization with bound sqrt(6/input_dim), b1 is zero,
+and W2,b2 are zero. Cluster embeddings V match the linear encoder's seeded
+draw exactly; initialization uses local generators and does not advance the
+global RNG. Both maps start at identical assignment logits. At the first step
+only the output layer can move; the hidden layer and V can learn subsequently.
+
+The MLP uses no dropout, extra normalization or weight decay. Original-node
+hidden activations are retained for backward; assignment moments remain streamed
+in free mode. Inner/outer CE and representative construction are unchanged.
+Hidden width and encoder type enter MLP experiment fingerprints. Saved encoder
+files contain `encoder_parameters` in W1,b1,W2,b2 order. `saved_encoder_nodes`
+reconstructs U from z,q for both legacy linear and MLP files; uniform assignments
+still need the separate column dual. Arxiv features+labels with hidden=64,
+rank=16 has 26,400 trainable parameters including V. This increases assignment
+expressivity but does not make the inner student nonlinear or guarantee better
+GCN transfer. Tests check zero-output initialization, gradient flow to earlier
+layers after an update, dense-autograd agreement and saved-state reconstruction.
