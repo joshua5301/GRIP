@@ -89,16 +89,17 @@ def prepare_representation_teacher(train, mask, validation, directory, options):
 
 
 def fit_representatives(x, propagation, kernel, assignment, steps=1000, lr=.05,
-                        teacher=None, teacher_features=None, linear_features=None):
+                        teacher=None, teacher_features=None, linear_features=None,
+                        feature_map=None, mapped_features=None):
     x, propagation = x.double(), propagation.double().to_sparse_coo().coalesce()
     assignment = assignment.to(x.device)
     clusters = int(assignment.max()) + 1
     counts = torch.bincount(assignment, minlength=clusters).to(x.dtype)
     if bool((counts == 0).any()):
         raise ValueError('Every cell must have a member')
-    membership = F.one_hot(assignment, clusters).to(x.dtype) / counts
     mass = counts / counts.sum()
-    if teacher is None and linear_features is None:
+    if teacher is None and linear_features is None and feature_map is None:
+        membership = F.one_hot(assignment, clusters).to(x.dtype) / counts
         target_norm = (membership * (kernel @ membership)).sum(0)
         support = torch.sparse.mm(propagation.transpose(0, 1), membership)
         propagated = torch.sparse.mm(propagation, x) / np.sqrt(x.shape[1])
@@ -109,14 +110,15 @@ def fit_representatives(x, propagation, kernel, assignment, steps=1000, lr=.05,
             cross = (tangent_kernel(inputs, propagated) * support.T).sum(1)
             return 2 * inputs.square().sum(1) - 2 * cross + target_norm
     else:
-        reference = linear_features if teacher is None else teacher_features
+        reference = mapped_features if feature_map is not None else (linear_features if teacher is None else teacher_features)
         if teacher is not None:
             teacher.eval().requires_grad_(False)
-        targets = (membership.T @ reference).detach()
+        targets = convex_features(reference, assignment, 1 / counts[assignment], clusters).detach()
         scale = reference.square().sum(1).mean().detach().clamp_min(1e-30)
 
         def errors(representatives):
-            represented = representatives if teacher is None else readout_representation(teacher, representatives)
+            represented = feature_map(representatives) if feature_map is not None else (
+                representatives if teacher is None else readout_representation(teacher, representatives))
             return (represented - targets).square().sum(1)
     scores = torch.zeros(len(x), dtype=x.dtype, device=x.device, requires_grad=True)
     optimizer = torch.optim.Adam([scores], lr=lr)
@@ -147,11 +149,13 @@ def run_ntk_risk(datasets, space, output_dir, modes=('raw_mean', 'raw_convex'),
                  search_seeds=(0, 1, 2), final_seeds=tuple(range(100, 110)),
                  loss_weighting='uniform', epochs=1000, eval_every=10, hidden=256,
                  max_sweeps=30, reconstruction_steps=1000, reconstruction_lr=.05,
-                 representation='ntk', representation_teacher=None):
+                 representation='ntk', representation_teacher=None, nystrom=None, partition_block_size=1024):
     if representation not in ('ntk', 'gcn_teacher', 's2x'):
         raise ValueError('Require ntk, gcn_teacher or s2x representation')
-    if set(datasets) - {'cora', 'citeseer'}:
-        raise ValueError('Full NTK is implemented for Cora and CiteSeer only')
+    if set(datasets) - {'cora', 'citeseer', 'arxiv', 'flickr', 'reddit'}:
+        raise ValueError('Unsupported dataset')
+    if representation == 'ntk' and nystrom is None and set(datasets) - {'cora', 'citeseer'}:
+        raise ValueError('Large datasets require Nyström NTK features')
     if set(modes) - {'raw_mean', 'raw_convex', 's2x_mean'}:
         raise ValueError('Unknown representative mode')
     if not modes or not search_seeds or not final_seeds:
@@ -161,10 +165,15 @@ def run_ntk_risk(datasets, space, output_dir, modes=('raw_mean', 'raw_convex'),
     teacher_options = dict(hidden=256, dropout=.5, lr=.01, weight_decay=5e-4,
                            epochs=1000, eval_every=10, seed=0)
     teacher_options.update(representation_teacher or {})
+    nystrom_options = None
+    if nystrom is not None:
+        nystrom_options = dict(landmarks=512, block_size=2048, seed=0, eigen_rtol=1e-10)
+        nystrom_options.update(nystrom)
     config = dict(datasets=datasets, space=space, modes=modes, seed=seed,
                   search_seeds=list(search_seeds), final_seeds=list(final_seeds), settings=settings,
                   max_sweeps=max_sweeps, reconstruction_steps=reconstruction_steps,
-                  reconstruction_lr=reconstruction_lr, revision=revision, schema=2,
+                  reconstruction_lr=reconstruction_lr, revision=revision, schema=3,
+                  nystrom=nystrom_options, partition_block_size=partition_block_size,
                   representation=representation, representation_teacher=teacher_options)
     root = Path(output_dir) / _fingerprint(config)
     root.mkdir(parents=True, exist_ok=True)
@@ -174,13 +183,18 @@ def run_ntk_risk(datasets, space, output_dir, modes=('raw_mean', 'raw_convex'),
         train, mask, validation, testing, h = _prepare_dataset(name, data_dir, device)
         x = train['x'].double()
         propagation = train['adj'].double().to_sparse_coo().coalesce()
-        digest = array_digest(x.cpu().numpy(), propagation.indices().cpu().numpy(),
-                              propagation.values().cpu().numpy(), train['y'].cpu().numpy(),
-                              mask.cpu().numpy(), validation[1].cpu().numpy(), testing[1].cpu().numpy())
+        signatures = []
+        for graph, split in ((train, mask), validation, testing):
+            adjacency = graph['adj'].to_sparse_csr()
+            signatures.append(array_digest(graph['x'].cpu().numpy(), graph['y'].cpu().numpy(),
+                                            adjacency.crow_indices().cpu().numpy(), adjacency.col_indices().cpu().numpy(),
+                                            adjacency.values().cpu().numpy(),
+                                            np.array([], dtype=bool) if split is None else split.cpu().numpy()))
+        digest = _fingerprint(signatures)
         directory = root / f'{name}_{digest[:12]}'
         directory.mkdir(exist_ok=True)
         kernel_path = directory / 'kernel.pt'
-        model, teacher_details = None, {}
+        model, teacher_details, mapping, kernel_details = None, {}, None, {}
         if representation == 's2x':
             features, kernel = h.double(), None
         elif representation == 'gcn_teacher':
@@ -188,6 +202,20 @@ def run_ntk_risk(datasets, space, output_dir, modes=('raw_mean', 'raw_convex'),
                 train, mask, validation, directory, teacher_options)
             kernel = None
             (directory / 'teacher_summary.json').write_text(json.dumps(teacher_details, indent=2), encoding='utf-8')
+        elif nystrom_options is not None:
+            from src.ntk_nystrom import NystromGCN, nystrom_graph_features
+            nystrom_path = directory / 'nystrom.pt'
+            if nystrom_path.exists():
+                cached = torch.load(nystrom_path, map_location='cpu', weights_only=False)
+                features = cached['features'].to(device)
+                mapping = NystromGCN.from_state(cached['mapping'], device)
+                kernel_details = cached['details']
+                del cached
+            else:
+                features, mapping, kernel_details = nystrom_graph_features(x, propagation, **nystrom_options)
+                torch.save(dict(features=features.cpu(), mapping=mapping.state_dict(), details=kernel_details), nystrom_path)
+            kernel = None
+            (directory / 'nystrom_summary.json').write_text(json.dumps(kernel_details, indent=2), encoding='utf-8')
         elif kernel_path.exists():
             cached = torch.load(kernel_path, map_location=device, weights_only=False)
             kernel, features = cached['kernel'], cached['features']
@@ -196,18 +224,29 @@ def run_ntk_risk(datasets, space, output_dir, modes=('raw_mean', 'raw_convex'),
             features = spectral_features(kernel)
             torch.save(dict(kernel=kernel.cpu(), features=features.cpu()), kernel_path)
         feature_cache, logit_cache = {}, {}
+        label_directory = Path(output_dir) / ('labels_' + _fingerprint(
+            dict(dataset=name, data=signatures, seed=seed, revision=revision)))
+        label_directory.mkdir(exist_ok=True)
 
         def labels(params):
             feature_key = (params['teacher_kernel'], params['basis'])
             logit_key = (*feature_key, params['gamma'])
             if logit_key not in logit_cache:
+                logit_path = label_directory / f'{_fingerprint(logit_key)}.pt'
+                if logit_path.exists():
+                    logit_cache[logit_key] = torch.load(logit_path, map_location=device, weights_only=True)
+                    return (logit_cache[logit_key] / params['T']).softmax(1)
                 if feature_key not in feature_cache:
+                    feature_cache.clear()
                     seed_everything(seed)
                     feature_cache[feature_key] = get_kernel_features(h, *feature_key)
                 teacher_features = feature_cache[feature_key]
                 target = F.one_hot(train['y'][mask], int(train['y'].max()) + 1).double()
                 weight = fit_logistic(teacher_features[mask], target, params['gamma'])
                 logit_cache[logit_key] = (teacher_features @ weight).detach()
+                temporary = logit_path.with_suffix('.tmp')
+                torch.save(logit_cache[logit_key].cpu(), temporary)
+                temporary.replace(logit_path)
             return (logit_cache[logit_key] / params['T']).softmax(1)
 
         for ratio in ratios:
@@ -222,7 +261,8 @@ def run_ntk_risk(datasets, space, output_dir, modes=('raw_mean', 'raw_convex'),
                     result = torch.load(path, weights_only=False)
                 else:
                     result = risk_partition(features, labels(params), clusters, params['B'],
-                                            seed=seed, max_sweeps=max_sweeps, return_assignment=True)
+                                            seed=seed, max_sweeps=max_sweeps, block_size=partition_block_size,
+                                            return_assignment=True)
                     assignment = result['assignment'].to(device)
                     weights = 1 / result['counts'].to(device)[assignment].double()
                     result['raw_mean'] = convex_features(x, assignment, weights, clusters).float().cpu()
@@ -232,7 +272,8 @@ def run_ntk_risk(datasets, space, output_dir, modes=('raw_mean', 'raw_convex'),
                     fitted = fit_representatives(x, propagation, kernel, result['assignment'],
                                                 reconstruction_steps, reconstruction_lr,
                                                 teacher=model, teacher_features=features if model is not None else None,
-                                                linear_features=features if representation == 's2x' else None)
+                                                linear_features=features if representation == 's2x' else None,
+                                                feature_map=mapping, mapped_features=features if mapping is not None else None)
                     result['raw_convex'] = fitted.pop('x')
                     result.update(fitted)
                     torch.save(result, path)
@@ -269,6 +310,7 @@ def run_ntk_risk(datasets, space, output_dir, modes=('raw_mean', 'raw_convex'),
                 (mode_dir / 'best.json').write_text(json.dumps(dict(params=best.params, value=best.value,
                                                    partition_path=str(path)), indent=2), encoding='utf-8')
                 row = dict(dataset=name, ratio=ratio, mode=mode, representation=representation,
+                           ntk_backend=('nystrom' if mapping is not None else 'exact') if representation == 'ntk' else None,
                            nodes=clusters, loss_weighting=loss_weighting,
                            **best.params, search_val=100 * best.value, final_val=final.val.mean(),
                            final_val_std=final.val.std(ddof=0), test_mean=final.test.mean(), test_std=final.test.std(ddof=0),
@@ -280,6 +322,8 @@ def run_ntk_risk(datasets, space, output_dir, modes=('raw_mean', 'raw_convex'),
                 if teacher_details:
                     row.update(representation_teacher_val=100 * teacher_details['validation'],
                                representation_teacher_epoch=teacher_details['best_epoch'])
+                if kernel_details:
+                    row.update({f'ntk_{key}': value for key, value in kernel_details.items()})
                 rows.append(row)
                 pd.DataFrame(rows).to_csv(root / 'summary.csv', index=False)
     return pd.DataFrame(rows)
@@ -294,4 +338,16 @@ def run_representation_risk(datasets, space, output_dir, representations=('ntk',
     combined = pd.concat(results, ignore_index=True)
     comparison = Path(output_dir) / f"comparison_{_fingerprint(combined.output_dir.unique().tolist())}.csv"
     combined.to_csv(comparison, index=False)
+    return combined
+
+
+def run_main_risk(datasets, space, output_dir, nystrom=None, **settings):
+    results = []
+    for representation, mode in (('s2x', 's2x_mean'), ('ntk', 'raw_convex')):
+        result = run_ntk_risk(datasets, space, output_dir, representation=representation, modes=(mode,),
+                              loss_weighting='mass', nystrom={} if nystrom is None else nystrom, **settings)
+        results.append(result)
+        combined = pd.concat(results, ignore_index=True)
+        comparison = Path(output_dir) / f"main_{_fingerprint(combined.output_dir.unique().tolist())}.csv"
+        combined.to_csv(comparison, index=False)
     return combined

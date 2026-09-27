@@ -107,3 +107,41 @@ Both modes share partitions at identical settings but select their best settings
 independently on validation. The raw convex mode is the matched reconstruction
 control for the NTK and GCN-representation experiments; `s2x_mean` is the original
 method control and has no convex reconstruction step.
+
+## Large datasets: two main methods
+
+`run_main_risk` runs exactly `(s2x, s2x_mean)` and `(ntk, raw_convex)`, both with
+mass CE, identical label-teacher grids and student evaluation settings. It
+defaults to Nyström for the NTK branch; `nystrom` configures landmarks (512),
+feature block size (2048), seed (0), and eigenvalue cutoff (1e-10 relative).
+The landmark count is independent of the label teacher's `basis` parameter.
+`partition_block_size` controls the original risk solver's assignment blocks.
+
+For U=SX/√d and the original base tangent kernel ψ, select landmark rows L of U.
+With ψ(L,L)=VΛVᵀ, retain positive eigenvalues above the relative cutoff and set
+R=VΛ^(-1/2). Construct Z=ψ(U,L)R in blocks and Φ=S Z. The graph kernel is
+approximated by ΦΦᵀ. An identity-graph raw input has feature
+φ(I,x)=ψ(x/√d,L)R. Both sides use the same landmarks and basis; reconstruction
+minimizes mass-weighted squared distance to the means of Φ. This approximates
+the base tangent kernel before the final graph propagation, not a separately
+fitted embedding of each graph. No N×N kernel or dense N×M membership is built
+in this path. Dense feature storage scales as O(Nr), while building the landmark
+factor uses O(r²) memory. Dataset loading and sparse graph storage remain separate
+costs; increasing rank still increases feature construction and partition cost.
+
+The result is explicitly marked `ntk_backend=nystrom`. Saved diagnostics include
+rank and relative Frobenius/trace errors on a small base-kernel probe set. These
+diagnose the approximation before final propagation; they are not certificates
+of the full graph-kernel error or student accuracy. The risk objective now acts
+in the approximate feature space, so approximation error is an additional gap
+relative to the exact analytic NTK used in the small-graph experiments.
+
+The existing data protocol is preserved: arxiv is transductive; Flickr and Reddit
+use separate train/validation/test induced subgraphs. Only the training graph is
+used for inductive label-teacher fitting, landmarks, partitioning and reconstruction.
+Validation and test evaluation run on their respective original subgraphs.
+The cache fingerprints include graph contents and permit absent evaluation masks
+for these inductive datasets. Exact full NTK on a large dataset is rejected.
+Label-teacher logits are cached across the two branches by data, teacher seed,
+kernel/basis/gamma settings and code revision, so changing only the representation
+does not refit that same teacher. Temperature is applied to these shared logits.

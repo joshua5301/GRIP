@@ -524,3 +524,8 @@ same kernel-teacher soft labels across representations and all densities.
 Pass `representations=('s2x',)` for the propagated-feature control. Use
 `modes=('raw_convex', 's2x_mean')` to compare matched raw convex reconstruction
 against the original risk method's propagated cell-mean representatives.
+
+`src.ntk_risk.run_main_risk` compares only S²X means and NTK raw convex
+representatives with mass CE on Cora, CiteSeer, arxiv, Flickr or Reddit. Its NTK
+uses a shared Nyström feature map for original and identity synthetic graphs,
+avoiding the full quadratic kernel. See [large dataset protocol](docs/ntk_risk.md).
