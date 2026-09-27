@@ -5,6 +5,23 @@ import torch
 from src.soft_ridge_partition import initial_logits
 
 
+def assignment_inputs(z, q, mode):
+    if mode == 'features':
+        return z.detach().float()
+    if mode == 'features_labels':
+        return torch.cat((z.detach(), q.detach()), dim=1).float()
+    raise ValueError('Encoder input must be features or features_labels')
+
+
+def initialize_encoder(inputs, clusters, rank, seed=0):
+    if not isinstance(rank, int) or not 1 <= rank <= min(len(inputs), clusters):
+        raise ValueError('rank must be a positive integer no larger than min(nodes, cells)')
+    generator = torch.Generator(device=inputs.device).manual_seed(seed)
+    weight = inputs.new_zeros(inputs.shape[1], rank)
+    v = torch.randn(clusters, rank, generator=generator, device=inputs.device, dtype=inputs.dtype)
+    return weight.requires_grad_(), v.requires_grad_()
+
+
 def initialize_factors(assignment, clusters, rank, seed=0):
     if not isinstance(rank, int) or not 1 <= rank <= min(len(assignment), clusters):
         raise ValueError('rank must be a positive integer no larger than min(nodes, cells)')

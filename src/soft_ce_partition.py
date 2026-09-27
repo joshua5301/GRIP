@@ -10,7 +10,8 @@ import torch.nn.functional as F
 from tqdm.auto import trange
 
 from src.balanced_assignment import BalancedMoments, CachedBalancedMoments
-from src.low_rank_assignment import LowRankLogits, LowRankMoments, initialize_factors
+from src.low_rank_assignment import (LowRankLogits, LowRankMoments, assignment_inputs,
+                                     initialize_encoder, initialize_factors)
 from src.node_distances import array_digest
 from src.ntk_transforms import FeatureTransform
 from src.risk_experiment import _fingerprint, _prepare_dataset, _train_student
@@ -135,7 +136,8 @@ def optimize_ce_assignment(z, q, assignment, penalty=3e-5, steps=300, lr=.01,
                            save_assignment=True, folder=None, checkpoint_steps=(),
                            mass_mode='free', balance_steps=300, balance_tol=1e-8,
                            balance_backend='cached', balance_cg_steps=512, balance_cg_rtol=1e-7,
-                           outer_chunk_size=65536, log_every=10, assignment_rank=None, factor_seed=0):
+                           outer_chunk_size=65536, log_every=10, assignment_rank=None, factor_seed=0,
+                           assignment_input='node'):
     if steps < 0 or any(not np.isfinite(v) or v <= 0 for v in
                         (penalty, lr, chunk_size, inner_max_iter, inner_tol, cg_max_iter, cg_rtol)):
         raise ValueError('Require positive finite solver settings and nonnegative steps')
@@ -144,6 +146,8 @@ def optimize_ce_assignment(z, q, assignment, penalty=3e-5, steps=300, lr=.01,
     if (balance_backend not in ('cached', 'chunked') or min(balance_cg_steps, outer_chunk_size, log_every) < 1
             or not 0 < balance_cg_rtol < 1):
         raise ValueError('Invalid performance settings')
+    if assignment_input not in ('node', 'features', 'features_labels') or (assignment_input != 'node' and assignment_rank is None):
+        raise ValueError('Feature assignment requires assignment_rank and a supported input mode')
     checkpoints = set(checkpoint_steps)
     if any(not isinstance(step, (int, np.integer)) or not 0 <= step <= steps for step in checkpoints):
         raise ValueError('Checkpoint steps must be integers within the optimization budget')
@@ -156,6 +160,10 @@ def optimize_ce_assignment(z, q, assignment, penalty=3e-5, steps=300, lr=.01,
     if assignment_rank is None:
         logits = initial_logits(assignment, clusters, mixing).requires_grad_()
         parameters = [logits]
+    elif assignment_input != 'node':
+        inputs = assignment_inputs(z, q, assignment_input)
+        weight, v = initialize_encoder(inputs, clusters, assignment_rank, factor_seed)
+        parameters = [weight, v]
     else:
         u, v = initialize_factors(assignment, clusters, assignment_rank, factor_seed)
         parameters = [u, v]
@@ -172,6 +180,8 @@ def optimize_ce_assignment(z, q, assignment, penalty=3e-5, steps=300, lr=.01,
     for step in trange(steps + 1, desc='CE inner + CE outer'):
         tick = timestamp()
         optimizer.zero_grad(set_to_none=True)
+        if assignment_input != 'node':
+            u = inputs @ weight
         balance = dict(balance_iterations=0, row_residual=np.nan, column_residual=np.nan)
         if mass_mode == 'uniform':
             if assignment_rank is not None:
@@ -267,10 +277,16 @@ def optimize_ce_assignment(z, q, assignment, penalty=3e-5, steps=300, lr=.01,
                   theta=best_theta, best_J=best, best_step=best_step, history=history,
                   penalty=penalty, steps=steps, checkpoints=snapshots, mass_mode=mass_mode,
                   assignment_rank=assignment_rank, factor_seed=factor_seed,
+                  assignment_input=assignment_input,
                   assignment_parameters=sum(parameter.numel() for parameter in parameters))
     if folder is not None and save_assignment:
         if assignment_rank is None:
             torch.save(best_parameters[0].cpu(), folder / 'best_assignment_logits.pt')
+        elif assignment_input != 'node':
+            torch.save(dict(weight=best_parameters[0].cpu(), v=best_parameters[1].cpu(),
+                            assignment=assignment.cpu(), mixing=mixing, rank=assignment_rank,
+                            assignment_input=assignment_input, factor_seed=factor_seed,
+                            step=best_step), folder / 'best_assignment_encoder.pt')
         else:
             torch.save(dict(u=best_parameters[0].cpu(), v=best_parameters[1].cpu(),
                             assignment=assignment.cpu(), mixing=mixing, rank=assignment_rank,
@@ -311,7 +327,7 @@ def run_soft_ce(previous_run, output_dir=None, penalty=3e-5, steps=300, lr=.01,
                  mass_mode='free', balance_steps=300, balance_tol=1e-8,
                  balance_backend='cached', balance_cg_steps=512, balance_cg_rtol=1e-7,
                  outer_chunk_size=65536, log_every=10, checkpoint_source=None,
-                 assignment_rank=None, factor_seed=0):
+                 assignment_rank=None, factor_seed=0, assignment_input='node'):
     previous_run = Path(previous_run)
     prior = json.loads((previous_run / 'config.json').read_text())
     original, source = prior['original'], Path(prior['source'])
@@ -345,6 +361,8 @@ def run_soft_ce(previous_run, output_dir=None, penalty=3e-5, steps=300, lr=.01,
                    outer_chunk_size=outer_chunk_size, log_every=log_every)
     if assignment_rank is not None:
         options.update(assignment_rank=assignment_rank, factor_seed=factor_seed)
+    if assignment_input != 'node':
+        options.update(assignment_input=assignment_input)
     methods = ['hard_baseline', 'soft_initial', 'ridge_optimized', 'ce_optimized']
     controls = {name: torch.load(previous_run / f'{name}.pt', map_location='cpu', weights_only=False)
                 for name in methods}
@@ -426,6 +444,7 @@ def run_soft_ce(previous_run, output_dir=None, penalty=3e-5, steps=300, lr=.01,
         summaries.append(dict(method=method, nodes=len(cx), penalty=penalty, teacher_ce=ce,
                               mass_mode=mass_mode if method in representatives else 'free',
                               assignment_rank=assignment_rank if method in representatives else np.nan,
+                              assignment_input=assignment_input if method in representatives else 'control',
                               mass_tv=float((mass - 1 / len(mass)).abs().sum() / 2),
                               mass_relative_residual=float((mass * len(mass) - 1).abs().max()),
                               linear_val=val, linear_test=test, linear_val_ce=val_ce, linear_test_ce=test_ce,

@@ -230,3 +230,37 @@ validation-selected checkpoint. These files do not contain resumable Adam state.
 Rank and factor seed enter the experiment fingerprint. Tests cover preservation
 of initial moments, factor gradients against dense autograd and finite differences,
 balanced marginals, and saved best-factor reconstruction for both mass modes.
+
+## Feature-conditioned assignment
+
+With `assignment_rank=16`, set `assignment_input='features'` or
+`'features_labels'` to replace independent node embeddings with U=HW.
+H is the fixed RMS-normalized propagated feature z, or the concatenation [z,q].
+q is the same fixed teacher probability used in the existing representative
+labels and outer CE, at the unchanged teacher temperature T. No ground-truth
+validation/test labels enter H. There is no additional label scaling, input
+normalization, bias, activation, or encoder regularizer.
+
+W starts at zero; cluster embeddings V use the same seeded standard normal
+draw for both input modes. All input modes therefore start from the same L0
+(or its balanced projection in uniform mode). W and V alone are optimized.
+The first update moves W; V initially has zero gradient. The low-rank moments
+backward supplies dU, and ordinary autograd computes dW=H^T dU. Free mode still
+streams node-cell pairs; H and the derived N x r embeddings occupy memory,
+but there are no trainable N x r parameters or their Adam states.
+
+The learned correction is H W V^T/sqrt(r), a low-rank linear score in H.
+It is not a nonlinear encoder, nor does it change the feature space used by
+the CE student or the representative moments. Features and labels remain
+weighted means in the original z,q spaces and are reconstructed as before.
+At Arxiv d=128, C=40, m=909 and r=16, the two input modes have 16,592 and
+17,232 trainable assignment parameters. This is a stronger restriction than
+independent node embeddings; equal Adam learning rates do not imply equal
+changes to assignment probabilities.
+
+`best_assignment_encoder.pt` saves W under `weight`, V, input mode, assignment,
+mixing, rank, seed and best outer-CE step. Reconstruct H from the original z,q
+using `assignment_inputs`, then use `logit_block(H @ weight, v, assignment,
+mixing)` and float64 row softmax (plus the saved dual in uniform mode).
+The run config retains source digests and transform provenance. Input mode is
+part of the fingerprint, and old dense/independent-node options remain valid.

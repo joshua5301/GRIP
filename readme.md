@@ -578,6 +578,12 @@ backend. `outer_chunk_size` and `log_every` control evaluation batching and Driv
 logging; optimization.csv includes synchronized phase timings.
 # Low-rank CE assignments
 
+Use `assignment_input='features'` or `'features_labels'` together with
+`assignment_rank=16` to generate node embeddings with a learned linear map
+from fixed features or features plus teacher probabilities. The default `'node'`
+keeps independent node embeddings. Both encoders preserve the initial logits;
+their weights are saved in `best_assignment_encoder.pt`.
+
 `src.soft_ce_partition.run_soft_ce(..., assignment_rank=32, factor_seed=0)` learns
 a low-rank correction to the original assignment logits with the same CE inner
 and outer objectives. Free mass streams node-cell blocks; uniform mass retains
