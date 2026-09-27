@@ -9,7 +9,7 @@ import torch
 import torch.nn.functional as F
 from tqdm.auto import trange
 
-from src.balanced_assignment import BalancedMoments
+from src.balanced_assignment import BalancedMoments, CachedBalancedMoments
 from src.node_distances import array_digest
 from src.ntk_transforms import FeatureTransform
 from src.risk_experiment import _fingerprint, _prepare_dataset, _train_student
@@ -108,10 +108,10 @@ def solve_inner(centers, labels, mass, penalty, initial=None, max_iter=2000, gra
 
 
 @torch.no_grad()
-def outer_value_gradient(z, q, theta, chunk_size=4096):
+def outer_value_gradient(z, q, theta, chunk_size=4096, features=None):
     value, gradient = z.new_zeros(()), torch.zeros_like(theta)
     for start in range(0, len(z), chunk_size):
-        x = augmented(z[start:start + chunk_size])
+        x = augmented(z[start:start + chunk_size]) if features is None else features[start:start + chunk_size]
         labels = q[start:start + chunk_size]
         log_probability = (x @ theta.T).log_softmax(1)
         value -= (labels * log_probability).sum() / len(z)
@@ -132,12 +132,17 @@ def optimize_ce_assignment(z, q, assignment, penalty=3e-5, steps=300, lr=.01,
                            mixing=.05, chunk_size=4096, inner_max_iter=2000,
                            inner_tol=1e-7, cg_max_iter=512, cg_rtol=1e-6,
                            save_assignment=True, folder=None, checkpoint_steps=(),
-                           mass_mode='free', balance_steps=300, balance_tol=1e-8):
+                           mass_mode='free', balance_steps=300, balance_tol=1e-8,
+                           balance_backend='cached', balance_cg_steps=512, balance_cg_rtol=1e-7,
+                           outer_chunk_size=65536, log_every=10):
     if steps < 0 or any(not np.isfinite(v) or v <= 0 for v in
                         (penalty, lr, chunk_size, inner_max_iter, inner_tol, cg_max_iter, cg_rtol)):
         raise ValueError('Require positive finite solver settings and nonnegative steps')
     if mass_mode not in ('free', 'uniform') or balance_steps < 1 or not 0 < balance_tol < 1:
         raise ValueError('Invalid mass constraint settings')
+    if (balance_backend not in ('cached', 'chunked') or min(balance_cg_steps, outer_chunk_size, log_every) < 1
+            or not 0 < balance_cg_rtol < 1):
+        raise ValueError('Invalid performance settings')
     checkpoints = set(checkpoint_steps)
     if any(not isinstance(step, (int, np.integer)) or not 0 <= step <= steps for step in checkpoints):
         raise ValueError('Checkpoint steps must be integers within the optimization budget')
@@ -145,6 +150,7 @@ def optimize_ce_assignment(z, q, assignment, penalty=3e-5, steps=300, lr=.01,
         checkpoints.update((0, steps))
     snapshots = {}
     material = make_material(z, q)
+    full_features = augmented(z)
     logits = initial_logits(assignment, int(assignment.max()) + 1, mixing).requires_grad_()
     optimizer = torch.optim.Adam([logits], lr=lr, eps=1e-12, foreach=False)
     folder = Path(folder) if folder is not None else None
@@ -152,12 +158,22 @@ def optimize_ce_assignment(z, q, assignment, penalty=3e-5, steps=300, lr=.01,
         folder.mkdir(parents=True, exist_ok=True)
     history, theta, best, dual = [], None, float('inf'), None
     started = time.perf_counter()
+    def timestamp():
+        if z.is_cuda:
+            torch.cuda.synchronize(z.device)
+        return time.perf_counter()
     for step in trange(steps + 1, desc='CE inner + CE outer'):
+        tick = timestamp()
         optimizer.zero_grad(set_to_none=True)
         balance = dict(balance_iterations=0, row_residual=np.nan, column_residual=np.nan)
         if mass_mode == 'uniform':
-            moments, dual, diagnostic = BalancedMoments.apply(
-                logits, material, chunk_size, balance_steps, balance_tol, dual)
+            if balance_backend == 'cached':
+                moments, dual, diagnostic = CachedBalancedMoments.apply(
+                    logits, material, chunk_size, balance_steps, balance_tol, dual,
+                    balance_cg_steps, balance_cg_rtol)
+            else:
+                moments, dual, diagnostic = BalancedMoments.apply(
+                    logits, material, chunk_size, balance_steps, balance_tol, dual)
             balance = dict(balance_iterations=int(diagnostic[0]), row_residual=float(diagnostic[1]),
                            column_residual=float(diagnostic[2]))
         else:
@@ -165,14 +181,19 @@ def optimize_ce_assignment(z, q, assignment, penalty=3e-5, steps=300, lr=.01,
         if not bool(torch.isfinite(moments).all()) or bool((moments[:, 0] <= 0).any()):
             raise FloatingPointError('Nonfinite moments or empty soft cell')
         centers, labels, mass = decode_moments(moments.detach(), z.shape[1])
+        after_assignment = timestamp()
         fitted = solve_inner(centers, labels, mass, penalty, theta, inner_max_iter,
                              inner_tol, cg_max_iter=cg_max_iter)
         theta = fitted.pop('theta')
-        value, outer_gradient = outer_value_gradient(z, q, theta, chunk_size)
+        after_inner = timestamp()
+        value, outer_gradient = outer_value_gradient(z, q, theta, outer_chunk_size, full_features)
+        after_outer = timestamp()
         row = dict(step=step, J=value, **fitted, **balance, cg_iterations=0, cg_residual=np.nan,
                    cg_relative_residual=np.nan, cg_converged=False,
                    min_mass=float(mass.min()), max_mass=float(mass.max()),
                    effective_cells=float(1 / mass.square().sum()))
+        row.update(assignment_seconds=after_assignment - tick, inner_seconds=after_inner - after_assignment,
+                   outer_seconds=after_outer - after_inner, implicit_seconds=0., backward_seconds=0.)
         failure = None
         if not fitted['inner_converged'] or not np.isfinite(value):
             failure = 'Inner CE did not converge; increase inner_max_iter or inspect inner_tol'
@@ -187,16 +208,18 @@ def optimize_ce_assignment(z, q, assignment, penalty=3e-5, steps=300, lr=.01,
                     best_logits = logits.detach().clone()
                     best_dual = dual.clone() if dual is not None else None
             if step < steps:
+                implicit_start = timestamp()
                 multiply, diagonal = hessian_operator(augmented(centers), labels, mass, theta, penalty)
                 vector, diagnostic = conjugate_gradient(multiply, outer_gradient, diagonal,
                                                          rtol=cg_rtol, max_iter=cg_max_iter)
                 row.update(diagnostic)
+                row['implicit_seconds'] = timestamp() - implicit_start
                 if not diagnostic['cg_converged']:
                     failure = 'Implicit Hessian solve did not converge; increase cg_max_iter'
         row.update(best_J=best, seconds=time.perf_counter() - started,
                    status='failed' if failure else 'evaluated' if step == steps else 'update')
         history.append(row)
-        if folder is not None:
+        if folder is not None and (step == steps or failure):
             pd.DataFrame(history).to_csv(folder / 'optimization.csv', index=False)
         if failure:
             if folder is not None:
@@ -212,11 +235,23 @@ def optimize_ce_assignment(z, q, assignment, penalty=3e-5, steps=300, lr=.01,
                 torch.save(snapshot, checkpoint_dir / f'step_{step:06d}.pt')
         if step == steps:
             break
+        backward_start = timestamp()
         direction = implicit_moment_gradient(moments, z.shape[1], theta, vector, penalty)
         if not bool(torch.isfinite(direction).all()):
             raise FloatingPointError('Nonfinite implicit gradient')
-        moments.backward(direction / scale)
+        try:
+            moments.backward(direction / scale)
+        except RuntimeError as error:
+            row.update(status='failed', backward_seconds=timestamp() - backward_start)
+            if folder is not None:
+                pd.DataFrame(history).to_csv(folder / 'optimization.csv', index=False)
+                (folder / 'failure.json').write_text(json.dumps(dict(step=step, reason=str(error)), indent=2))
+            raise
         optimizer.step()
+        row['backward_seconds'] = timestamp() - backward_start
+        row['seconds'] = time.perf_counter() - started
+        if folder is not None and step % log_every == 0:
+            pd.DataFrame(history).to_csv(folder / 'optimization.csv', index=False)
     result = dict(initial_moments=initial_moments, best_moments=best_moments,
                   theta=best_theta, best_J=best, best_step=best_step, history=history,
                   penalty=penalty, steps=steps, checkpoints=snapshots, mass_mode=mass_mode)
@@ -242,7 +277,9 @@ def run_soft_ce(previous_run, output_dir=None, penalty=3e-5, steps=300, lr=.01,
                  chunk_size=4096, inner_max_iter=2000, inner_tol=1e-7,
                  cg_max_iter=512, cg_rtol=1e-6, save_assignment=True,
                  data_dir='/content/data/', device='cuda', checkpoint_steps=(),
-                 mass_mode='free', balance_steps=300, balance_tol=1e-8):
+                 mass_mode='free', balance_steps=300, balance_tol=1e-8,
+                 balance_backend='cached', balance_cg_steps=512, balance_cg_rtol=1e-7,
+                 outer_chunk_size=65536, log_every=10):
     previous_run = Path(previous_run)
     prior = json.loads((previous_run / 'config.json').read_text())
     original, source = prior['original'], Path(prior['source'])
@@ -271,7 +308,9 @@ def run_soft_ce(previous_run, output_dir=None, penalty=3e-5, steps=300, lr=.01,
                    inner_max_iter=inner_max_iter, inner_tol=inner_tol, cg_max_iter=cg_max_iter,
                    cg_rtol=cg_rtol, save_assignment=save_assignment,
                    checkpoint_steps=sorted(set(checkpoint_steps)), mass_mode=mass_mode,
-                   balance_steps=balance_steps, balance_tol=balance_tol)
+                   balance_steps=balance_steps, balance_tol=balance_tol, balance_backend=balance_backend,
+                   balance_cg_steps=balance_cg_steps, balance_cg_rtol=balance_cg_rtol,
+                   outer_chunk_size=outer_chunk_size, log_every=log_every)
     methods = ['hard_baseline', 'soft_initial', 'ridge_optimized', 'ce_optimized']
     controls = {name: torch.load(previous_run / f'{name}.pt', map_location='cpu', weights_only=False)
                 for name in methods}
@@ -315,7 +354,7 @@ def run_soft_ce(previous_run, output_dir=None, penalty=3e-5, steps=300, lr=.01,
         theta = fitted.pop('theta')
         if not fitted['inner_converged']:
             raise RuntimeError(f'{method}: evaluation CE head did not converge')
-        ce, _ = outer_value_gradient(z, q, theta, chunk_size)
+        ce, _ = outer_value_gradient(z, q, theta, outer_chunk_size)
         val, val_ce = classification(z, train['y'], validation[1], theta)
         test, test_ce = classification(z, train['y'], testing[1], theta) if prior['evaluate_test'] else (np.nan, np.nan)
         torch.save(dict(x=cx.cpu(), y=labels.cpu(), mass=mass.cpu(), theta=theta.cpu()), root / f'{method}.pt')

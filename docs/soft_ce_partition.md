@@ -130,9 +130,10 @@ a_i=sum_j P_ij G_ij and pi=P^T 1/N. The column derivative solves
 
 The all-ones null direction is removed by a gauge term 11^T/m, not damping.
 The logit gradient is P_ij (G_ij-a_i-b_j+sum_k P_ik b_k)/N.
-Material aggregation and backward are chunked. The additional dense m x m
-Gram matrix costs O(N m²) work; balancing also adds repeated O(Nm) passes.
-This can be slower than free-mass optimization even at the same step budget.
+The original `balance_backend='chunked'` aggregates in chunks and builds a dense
+m x m Gram matrix, costing O(N m²) work. Balancing also adds repeated O(Nm)
+passes. This backend remains available as a numerical reference and lower-memory
+fallback.
 
 Uniform runs start from the same assignment logits as free runs, then balance
 them. Their step-zero representatives therefore differ; retain step zero to
@@ -147,3 +148,34 @@ best_assignment_column_dual.pt, then take row_softmax(logits.double()+dual).
 The logits alone do not describe the balanced assignment. Numerical tests cover
 marginals, global moments, finite-difference derivatives, gauge invariance,
 nonconvergence rejection, and uniform bilevel checkpoint reconstruction.
+
+## Cached balancing and phase timings
+
+The default `balance_backend='cached'` builds exp(L-row_max(L)) once, performs
+Sinkhorn scaling with matrix-vector products, and retains the resulting float64
+P through backward. It replaces repeated chunk softmax/exponential evaluations.
+Warm-started column potentials and the marginal tolerance remain unchanged.
+Underflow or marginal failure raises an error; the chunked backend is available
+for extreme logits requiring log-domain evaluation.
+
+Backward solves the same gauge-fixed balancing derivative with preconditioned CG.
+Products use pi*b - P^T(P*b)/N + mean(b), without constructing P^T P. This costs
+O(k N m) for k CG iterations rather than O(N m²), plus moment-gradient products.
+`balance_cg_steps=512` and `balance_cg_rtol=1e-7` control this solve independently
+of the CE-head Hessian solve. Actual residuals must meet the same default relative
+threshold used by the original dense solve (and absolute floor 1e-12). There is
+no new penalty, relaxed mass constraint, or precision reduction. Tolerance-based
+iterative solves can still produce small numerical trajectory differences.
+
+The P cache takes 8Nm bytes, about 1.3 GB for this Arxiv/909 experiment. Logits,
+Adam states and temporary arrays are additional. Overall peak memory must be
+measured on Colab; no runtime speedup has been measured locally. Tests compare
+both backends and their gradients, and check finite differences and the CG solve.
+
+`outer_chunk_size=65536` batches original-node CE evaluation separately from the
+assignment chunk size, reusing an augmented feature matrix. `log_every=10` reduces
+Drive writes while retaining every history row in memory and the completed log.
+Failures and the last step always write diagnostics. GPU-synchronized phase timers
+record assignment_seconds, inner_seconds, outer_seconds, implicit_seconds and
+backward_seconds (including the assignment optimizer update). Snapshot/host IO
+overhead remains in total elapsed seconds and is not assigned to these five phases.

@@ -570,3 +570,9 @@ share evaluation seeds and are selected by mean GCN validation accuracy only.
 Set `mass_mode='uniform'` for equal-mass soft cells. Balanced assignments use
 converged column potentials and an implicit derivative, with marginal residuals
 recorded alongside the existing CE solver diagnostics and checkpoint evaluation.
+
+Uniform CE runs now default to `balance_backend='cached'`: float64 probability
+caching and matrix-free implicit balancing replace repeated softmax passes and
+the dense assignment Gram matrix. Use `balance_backend='chunked'` for the original
+backend. `outer_chunk_size` and `log_every` control evaluation batching and Drive
+logging; optimization.csv includes synchronized phase timings.
