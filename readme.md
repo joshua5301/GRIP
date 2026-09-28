@@ -623,3 +623,8 @@ See [trajectory clustering](docs/trajectory_clustering.md).
 `src.metric_clustering.run_metric_sweep` learns one normalized global linear
 distance through unrolled soft Lloyd clustering and an implicit CE student.
 See [linear metric condensation](docs/metric_clustering.md).
+
+`src.assignment_family_sweep.run_family_sweep` selects teacher gamma by validation
+accuracy, then compares dense, low-rank, one-layer and two-layer feature-based
+assignments with rank/width grids and shared initial moments. See
+[assignment family sweep](docs/assignment_family_sweep.md).
