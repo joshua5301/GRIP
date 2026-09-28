@@ -2,7 +2,8 @@
 
 `src.condensation_diagnostics.run_condensation_diagnostics` compares three methods
 under the same teacher grid and CE inner/outer objective. The first experiment is
-Cora, ratio 0.052, 140 representatives. Cora and Citeseer are supported.
+Cora, ratio 0.052, 140 representatives. Cora, Citeseer and Arxiv are supported.
+Arxiv ratio 0.005 uses the repository's configured budget of 909 representatives.
 
 | Method | Initialization | Optimized quantities | Condensed CE |
 | --- | --- | --- | --- |
@@ -44,6 +45,23 @@ features transformed back from RMS coordinates, the same labels and the same
 mass. Its condensed adjacency is I, and evaluation uses the original graph.
 GCN dropout/lr/weight decay are fixed in the protocol; GCN validation chooses
 only its training epoch, never the condensation setting or checkpoint.
+
+For Arxiv, set `trajectory_seeds=[100, 101, 102]` and
+`final_seeds=list(range(100, 110))` to reduce intermediate GCN evaluation cost.
+Both step zero and the SGC-selected checkpoint always use all final seeds,
+preserving paired before/after evaluation. Other checkpoints use trajectory
+seeds; their curve means therefore use fewer runs. By default every checkpoint
+uses final seeds, preserving the Cora evaluation procedure. Full-data references
+also use final seeds. All candidates still receive the complete condensation
+budget and all saved SGC evaluations; no GCN-driven candidate pruning is used.
+
+The Arxiv loader retains its original train/validation/test masks on one
+transductive graph and standardizes raw features using train nodes only. The
+same CPU-prepared S²X and k-means++ procedure is used in all three sessions.
+Assignment moments are already chunked; no dense node-by-cell matrix is saved.
+The kernel teacher's N-by-basis feature matrix is still materialized, so use
+the intended A100 runtime. Data loading, CPU k-means++ and teacher fitting may
+take time before condensation progress bars appear.
 
 SGC and GCN test values are recorded after source selection. Do not select a
 new checkpoint or grid from these diagnostic test curves. The primary comparison

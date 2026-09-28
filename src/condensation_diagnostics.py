@@ -132,6 +132,10 @@ def select_source(table):
     return table.sort_values(['val_acc', 'candidate', 'step'], ascending=[False, True, True]).iloc[0].to_dict()
 
 
+def checkpoint_seeds(step, selected_step, final_seeds, trajectory_seeds):
+    return final_seeds if step in (0, selected_step) else trajectory_seeds
+
+
 def full_data_reference(z, graph, q, masks, penalties, final_seeds, epochs, eval_every,
                         hidden, dropout, lr, weight_decay, root, solver):
     path = root / 'full_reference.csv'
@@ -173,17 +177,20 @@ def run_condensation_diagnostics(method, output_dir, space, dataset='cora', rati
                                  rank=16, encoder_hidden=64, outer_scope='all', final_seeds=tuple(range(100, 110)),
                                  epochs=1000, eval_every=10, hidden=256, dropout=.9,
                                  student_lr=.01, weight_decay=.0005, data_dir='/content/data/',
-                                 device='cuda', solver=None, full_baseline=True):
-    if method not in ('A', 'C-mean', 'C-prior') or dataset not in ('cora', 'citeseer'):
-        raise ValueError('Use A, C-mean or C-prior on Cora/Citeseer')
+                                 device='cuda', solver=None, full_baseline=True, trajectory_seeds=None):
+    if method not in ('A', 'C-mean', 'C-prior') or dataset not in ('cora', 'citeseer', 'arxiv'):
+        raise ValueError('Use A, C-mean or C-prior on Cora/Citeseer/Arxiv')
+    if (dataset, ratio) not in BUDGET:
+        raise ValueError('Unsupported dataset ratio; use a configured representative budget')
     if set(space) != {'gamma', 'T', 'penalty', 'assignment_lr'} or outer_scope not in ('all', 'train'):
         raise ValueError('Specify gamma/T/penalty/assignment_lr and all or train outer nodes')
     candidates = grid_rows(space)
     if any(not np.isfinite(value) or value <= 0 for row in candidates for value in row.values()):
         raise ValueError('Grid values must be positive and finite')
     checkpoints = sorted({0, steps, *checkpoint_steps})
+    trajectory_seeds = list(final_seeds) if trajectory_seeds is None else list(trajectory_seeds)
     if (steps < 1 or any(step < 0 or step > steps for step in checkpoints)
-            or epochs < 1 or eval_every < 1 or not final_seeds):
+            or epochs < 1 or eval_every < 1 or not final_seeds or not trajectory_seeds):
         raise ValueError('Invalid optimization or evaluation budget')
     solver = dict(solver or {})
     allowed = {'inner_max_iter', 'inner_tol', 'cg_max_iter', 'cg_rtol', 'chunk_size', 'outer_chunk_size',
@@ -202,6 +209,7 @@ def run_condensation_diagnostics(method, output_dir, space, dataset='cora', rati
                   teacher_kernel=teacher_kernel, basis=basis, seed=seed, mixing=mixing,
                   rank=rank, encoder_hidden=encoder_hidden, outer_scope=outer_scope,
                   final_seeds=list(final_seeds), epochs=epochs, eval_every=eval_every, hidden=hidden,
+                  trajectory_seeds=trajectory_seeds,
                   dropout=dropout, student_lr=student_lr, weight_decay=weight_decay, solver=solver,
                   full_baseline=full_baseline,
                   data_digest=digest, selection='sgc_validation_only',
@@ -269,7 +277,7 @@ def run_condensation_diagnostics(method, output_dir, space, dataset='cora', rati
         records.append(dict(**common, architecture='SGC', seed=-1,
                             **sgc_metrics(snapshot, z, q, graph['y'], masks)))
         cx, cy, mass = representative(snapshot['moments'], transform, z.shape[1], device)
-        for student_seed in final_seeds:
+        for student_seed in checkpoint_seeds(step, int(choice['step']), final_seeds, trajectory_seeds):
             row = fit_gcn_diagnostic(cx, cy, mass, graph, q, masks, student_seed, epochs, eval_every,
                                      hidden, dropout, student_lr, weight_decay,
                                      folder / 'gcn_diagnostics' / f'step_{step:06d}')

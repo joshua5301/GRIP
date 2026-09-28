@@ -83,6 +83,27 @@ def test_source_selection_ignores_test_and_target_architecture():
         dict(train=torch.tensor([True, False]), val=torch.tensor([False, True])))
 
 
+def test_trajectory_budget_keeps_initial_and_selected_seed_pairs():
+    final, trajectory = list(range(100, 110)), [100, 101, 102]
+    for selected in (0, 50, 200):
+        assert experiment.checkpoint_seeds(0, selected, final, trajectory) == final
+        assert experiment.checkpoint_seeds(selected, selected, final, trajectory) == final
+        assert experiment.checkpoint_seeds(25, selected, final, trajectory) == trajectory
+
+
+def test_arxiv_budget_accepted_before_data_loading(tmp_path, monkeypatch):
+    def prepare(dataset, *args):
+        assert dataset == 'arxiv'
+        raise FileNotFoundError('Arxiv data loading reached')
+    monkeypatch.setattr(experiment, '_prepare_dataset', prepare)
+    grid = dict(gamma=[.01], T=[.5], penalty=[3e-5], assignment_lr=[.003])
+    assert experiment.BUDGET[('arxiv', .005)] == 909
+    with pytest.raises(FileNotFoundError, match='Arxiv data loading reached'):
+        experiment.run_condensation_diagnostics('A', tmp_path, grid, dataset='arxiv', ratio=.005)
+    with pytest.raises(ValueError, match='Unsupported dataset ratio'):
+        experiment.run_condensation_diagnostics('A', tmp_path, grid, dataset='arxiv', ratio=.05)
+
+
 def test_gcn_retains_selected_and_fixed_epoch_metrics(tmp_path, monkeypatch):
     x = torch.randn(6, 3, generator=torch.Generator().manual_seed(3))
     y = torch.arange(6) % 2
