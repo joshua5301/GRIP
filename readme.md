@@ -619,3 +619,7 @@ saved checkpoints. See [transfer and overfitting diagnostics](docs/condensation_
 with CE-preserving hard assignments and freely optimized representatives. It uses
 cell-average labels, mass CE, GCN validation selection, and round-boundary resume.
 See [trajectory clustering](docs/trajectory_clustering.md).
+
+`src.metric_clustering.run_metric_sweep` learns one normalized global linear
+distance through unrolled soft Lloyd clustering and an implicit CE student.
+See [linear metric condensation](docs/metric_clustering.md).
