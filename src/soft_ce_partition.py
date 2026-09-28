@@ -39,7 +39,8 @@ def hessian_operator(x, labels, mass, theta, penalty):
 
 
 @torch.no_grad()
-def conjugate_gradient(multiply, rhs, diagonal, rtol=1e-6, atol=1e-12, max_iter=512, initial=None):
+def conjugate_gradient(multiply, rhs, diagonal, rtol=1e-6, atol=1e-12, max_iter=512, initial=None,
+                       restart_interval=50):
     solution = torch.zeros_like(rhs) if initial is None else initial.detach().clone()
     residual = rhs.clone() if initial is None else rhs - multiply(solution)
     norm = float(rhs.norm())
@@ -58,7 +59,7 @@ def conjugate_gradient(multiply, rhs, diagonal, rtol=1e-6, atol=1e-12, max_iter=
         solution.add_(direction, alpha=float(alpha))
         residual.sub_(image, alpha=float(alpha))
         iterations = iteration + 1
-        restart = iterations % 50 == 0 or float(residual.norm()) <= target
+        restart = iterations % restart_interval == 0 or float(residual.norm()) <= target
         if restart:
             residual = rhs - multiply(solution)
         preconditioned = residual / diagonal
@@ -73,7 +74,7 @@ def conjugate_gradient(multiply, rhs, diagonal, rtol=1e-6, atol=1e-12, max_iter=
 
 @torch.no_grad()
 def solve_head_system(x, labels, mass, theta, penalty, rhs, rtol=1e-6, atol=1e-12,
-                      max_iter=512, reduced_limit=2048):
+                      max_iter=512, reduced_limit=2048, direct_limit=8192):
     multiply, diagonal = hessian_operator(x, labels, mass, theta, penalty)
     classes = theta.shape[0]
     dimension = min(x.shape) * classes
@@ -86,23 +87,32 @@ def solve_head_system(x, labels, mass, theta, penalty, rhs, rtol=1e-6, atol=1e-1
             return solution, diagnostic
     if dimension > reduced_limit:
         solution, retry = conjugate_gradient(multiply, rhs, diagonal, rtol=rtol,
-                                              atol=atol, max_iter=4 * max_iter)
+                                              atol=atol, max_iter=4 * max_iter,
+                                              initial=solution if bool(torch.isfinite(solution).all()) else None,
+                                              restart_interval=512)
         retry.update(hessian_solver='pcg_extended', hessian_reduced_dimension=0,
                      cg_iterations=diagnostic['cg_iterations'] + retry['cg_iterations'])
-        return solution, retry
+        if retry['cg_converged'] or dimension > direct_limit:
+            return solution, retry
+        diagnostic = retry
     _, singular, basis = torch.linalg.svd(x, full_matrices=False)
     projected_x = x @ basis.T
     projected_rhs = rhs @ basis.T
     probability = (x @ theta.T).softmax(1)
-    covariance = torch.diag_embed(probability) - probability[:, :, None] * probability[:, None, :]
-    covariance *= (mass * labels.sum(1))[:, None, None]
-    system = torch.einsum('icd,ia,ib->cadb', covariance, projected_x, projected_x).reshape(dimension, dimension)
+    system = x.new_zeros(dimension, dimension)
+    for start in range(0, len(x), 128):
+        p = probability[start:start + 128]
+        block = projected_x[start:start + 128]
+        covariance = torch.diag_embed(p) - p[:, :, None] * p[:, None, :]
+        covariance *= (mass[start:start + 128] * labels[start:start + 128].sum(1))[:, None, None]
+        system.add_(torch.einsum('icd,ia,ib->cadb', covariance, block, block).reshape(dimension, dimension))
     system = (system + system.T) / 2 + penalty * torch.eye(dimension, dtype=x.dtype, device=x.device)
     projected_solution = torch.linalg.solve(system, projected_rhs.flatten()).reshape(classes, len(singular))
     solution = projected_solution @ basis + (rhs - projected_rhs @ basis) / penalty
     norm = float(rhs.norm())
     residual = float((multiply(solution) - rhs).norm())
-    diagnostic.update(hessian_solver='reduced_direct', hessian_reduced_dimension=dimension,
+    diagnostic.update(hessian_solver='reduced_direct_fallback' if dimension > reduced_limit else 'reduced_direct',
+                      hessian_reduced_dimension=dimension,
                       cg_residual=residual, cg_relative_residual=residual / max(norm, 1e-30),
                       cg_converged=bool(torch.isfinite(solution).all()) and np.isfinite(residual)
                                    and residual <= max(atol, rtol * norm))

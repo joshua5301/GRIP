@@ -63,6 +63,15 @@ The kernel teacher's N-by-basis feature matrix is still materialized, so use
 the intended A100 runtime. Data loading, CPU k-means++ and teacher fitting may
 take time before condensation progress bars appear.
 
+If diagonal-preconditioned CG fails, its extended retry warm-starts from the
+previous iterate and restarts less often. A failed retry can use a feature-span
+direct solve when its dimension is at most 8192. The Arxiv 128-feature, 40-class
+affine head has dimension 5160 and fits this cap. The dense system is assembled
+in node chunks; this fallback costs quadratic memory in head dimension, not
+node count. Acceptance still checks the original Hessian residual at the same
+tolerance and penalty. Larger systems still report nonconvergence rather than
+silently weakening the criterion.
+
 SGC and GCN test values are recorded after source selection. Do not select a
 new checkpoint or grid from these diagnostic test curves. The primary comparison
 uses SGC-selected checkpoints; the GCN result has not been tuned for GCN.

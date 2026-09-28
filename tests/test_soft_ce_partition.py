@@ -39,6 +39,27 @@ def test_hessian_and_pcg_match_dense_autograd():
     torch.testing.assert_close(zero, rhs * 0)
 
 
+def test_extended_pcg_failure_uses_direct_fallback_without_relaxing_tolerance():
+    z, q, _ = problem()
+    x = augmented(z)
+    mass = z.new_full((len(z),), 1 / len(z))
+    theta = z.new_zeros(3, 4)
+    rhs = torch.arange(12, dtype=z.dtype).reshape_as(theta).sin()
+    penalty = 3e-6
+    solution, diagnostic = model.solve_head_system(
+        x, q, mass, theta, penalty, rhs, max_iter=0, reduced_limit=1, rtol=1e-8)
+    hessian = torch.autograd.functional.hessian(
+        lambda value: head_objective(x, q, mass, value, penalty), theta,
+    ).reshape(theta.numel(), theta.numel())
+    expected = torch.linalg.solve(hessian, rhs.flatten()).reshape_as(rhs)
+    assert diagnostic['hessian_solver'] == 'reduced_direct_fallback'
+    assert diagnostic['cg_converged'] and diagnostic['cg_relative_residual'] <= 1e-8
+    torch.testing.assert_close(solution, expected, atol=1e-6, rtol=1e-8)
+    _, limited = model.solve_head_system(
+        x, q, mass, theta, penalty, rhs, max_iter=0, reduced_limit=1, direct_limit=1)
+    assert not limited['cg_converged'] and limited['hessian_solver'] == 'pcg_extended'
+
+
 def test_chunked_outer_gradient_matches_autograd():
     z, q, _ = problem()
     theta = torch.linspace(-.3, .5, 12, dtype=z.dtype).reshape(3, 4).requires_grad_()
