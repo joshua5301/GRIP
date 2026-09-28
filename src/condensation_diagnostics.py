@@ -1,5 +1,6 @@
 import json
 import subprocess
+import shutil
 from pathlib import Path
 
 import faiss
@@ -177,11 +178,16 @@ def run_condensation_diagnostics(method, output_dir, space, dataset='cora', rati
                                  rank=16, encoder_hidden=64, outer_scope='all', final_seeds=tuple(range(100, 110)),
                                  epochs=1000, eval_every=10, hidden=256, dropout=.9,
                                  student_lr=.01, weight_decay=.0005, data_dir='/content/data/',
-                                 device='cuda', solver=None, full_baseline=True, trajectory_seeds=None):
+                                 device='cuda', solver=None, full_baseline=True, trajectory_seeds=None,
+                                 selection_architecture='SGC', search_seeds=(0, 1, 2), checkpoint_source=None):
     if method not in ('A', 'C-mean', 'C-prior') or dataset not in ('cora', 'citeseer', 'arxiv'):
         raise ValueError('Use A, C-mean or C-prior on Cora/Citeseer/Arxiv')
     if (dataset, ratio) not in BUDGET:
         raise ValueError('Unsupported dataset ratio; use a configured representative budget')
+    if selection_architecture not in ('SGC', 'GCN') or not search_seeds:
+        raise ValueError('Choose SGC or GCN selection and nonempty search seeds')
+    if selection_architecture == 'GCN' and set(search_seeds) & set(final_seeds):
+        raise ValueError('GCN search and final seeds must be disjoint')
     if set(space) != {'gamma', 'T', 'penalty', 'assignment_lr'} or outer_scope not in ('all', 'train'):
         raise ValueError('Specify gamma/T/penalty/assignment_lr and all or train outer nodes')
     candidates = grid_rows(space)
@@ -212,12 +218,30 @@ def run_condensation_diagnostics(method, output_dir, space, dataset='cora', rati
                   trajectory_seeds=trajectory_seeds,
                   dropout=dropout, student_lr=student_lr, weight_decay=weight_decay, solver=solver,
                   full_baseline=full_baseline,
-                  data_digest=digest, selection='sgc_validation_only',
+                  data_digest=digest, selection=f'{selection_architecture.lower()}_validation_only',
+                  search_seeds=list(search_seeds),
                   revision=subprocess.check_output(['git', 'rev-parse', 'HEAD'], text=True).strip())
+    source = Path(checkpoint_source) if checkpoint_source is not None else None
+    if source is not None:
+        saved = json.loads((source / 'config.json').read_text())
+        keys = ('dataset', 'ratio', 'space', 'steps', 'checkpoint_steps', 'teacher_kernel', 'basis',
+                'seed', 'mixing', 'rank', 'encoder_hidden', 'outer_scope', 'solver', 'data_digest')
+        if saved['method'] != method or any(saved[key] != config[key] for key in keys):
+            raise ValueError('Checkpoint source does not match the optimization protocol')
+        for index in range(len(candidates)):
+            for step in checkpoints:
+                if not (source / f'candidate_{index:04d}' / 'checkpoints' / f'step_{step:06d}.pt').exists():
+                    raise ValueError('Checkpoint source is incomplete')
+        config['source_revision'] = saved['revision']
     protocol = Path(output_dir) / _fingerprint(config)
     root = protocol / method
     root.mkdir(parents=True, exist_ok=True)
     save_json(dict(**config, method=method), root / 'config.json')
+    if source is not None:
+        save_json(dict(path=str(source.resolve())), root / 'checkpoint_source.json')
+        for name in ('initialization.pt', 'teachers.pt'):
+            if not (root / name).exists():
+                shutil.copy2(source / name, root / name)
     graph = {key: value.to(device) for key, value in graph.items()}
     masks = {key: value.to(device) for key, value in masks_cpu.items()}
     search_masks = {key: masks[key] for key in ('train', 'val')}
@@ -239,15 +263,22 @@ def run_condensation_diagnostics(method, output_dir, space, dataset='cora', rati
     teachers = teacher_logits(h, graph, masks['train'], (graph, masks['val']), teacher_kernel,
                               space['gamma'], basis, seed, root, return_all=True)
     outer_indices = masks['train'].nonzero().flatten() if outer_scope == 'train' else None
-    rows = []
-    for index, params in enumerate(tqdm(candidates, desc=f'{method}: SGC validation grid')):
+    rows, sgc_rows = [], []
+    for index, params in enumerate(tqdm(candidates, desc=f'{method}: {selection_architecture} validation grid')):
         folder = root / f'candidate_{index:04d}'
         folder.mkdir(exist_ok=True)
         save_json(params, folder / 'params.json')
         q = (teachers[params['gamma']].to(device) / params['T']).softmax(1).double()
         state_path = folder / 'resume.pt'
         state = torch.load(state_path, map_location='cpu', weights_only=False) if state_path.exists() else None
-        if state is None or state['step'] < steps:
+        if source is not None:
+            checkpoint_dir = folder / 'checkpoints'
+            checkpoint_dir.mkdir(exist_ok=True)
+            for step in checkpoints:
+                target = checkpoint_dir / f'step_{step:06d}.pt'
+                if not target.exists():
+                    shutil.copy2(source / folder.name / 'checkpoints' / target.name, target)
+        elif state is None or state['step'] < steps:
             optimize_ce_assignment(
                 z, q, assignment, penalty=params['penalty'], lr=params['assignment_lr'], steps=steps,
                 folder=folder, checkpoint_steps=checkpoints, mixing=mixing,
@@ -258,11 +289,23 @@ def run_condensation_diagnostics(method, output_dir, space, dataset='cora', rati
         for step in checkpoints:
             snapshot = torch.load(folder / 'checkpoints' / f'step_{step:06d}.pt', map_location='cpu', weights_only=False)
             metrics = sgc_metrics(snapshot, z, q, graph['y'], search_masks)
+            sgc_rows.append(dict(candidate=index, step=step, **params, **metrics))
+            if selection_architecture == 'GCN':
+                cx, cy, mass = representative(snapshot['moments'], transform, z.shape[1], device)
+                trials = [fit_gcn_diagnostic(
+                    cx, cy, mass, graph, q, search_masks, student_seed, epochs, eval_every,
+                    hidden, dropout, student_lr, weight_decay,
+                    folder / 'gcn_search' / f'step_{step:06d}') for student_seed in search_seeds]
+                metrics = {key: float(np.mean([trial[key] for trial in trials]))
+                           for key in ('val_acc', 'train_acc', 'val_ce', 'train_ce')}
+                metrics['val_acc_std'] = float(np.std([trial['val_acc'] for trial in trials]))
             rows.append(dict(candidate=index, step=step, **params, **metrics))
-        pd.DataFrame(rows).to_csv(root / 'search_sgc.csv', index=False)
+        pd.DataFrame(sgc_rows).to_csv(root / 'search_sgc.csv', index=False)
+        pd.DataFrame(rows).to_csv(root / f'search_{selection_architecture.lower()}.csv', index=False)
     search = pd.DataFrame(rows)
     profile = boundary_profile(search.rename(columns={'val_acc': 'val'}), space)
-    sgc_penalty_profile = boundary_profile(search.rename(columns={'val_acc': 'val'}).assign(step=1),
+    sgc_penalty_profile = boundary_profile(search.rename(columns={'val_acc': 'val'}).assign(step=1)
+                                           if selection_architecture == 'SGC' else search.rename(columns={'val_acc': 'val'}),
                                            {'penalty': space['penalty']})
     profile = pd.concat([profile[profile.parameter != 'penalty'], sgc_penalty_profile], ignore_index=True)
     profile.to_csv(root / 'boundaries.csv', index=False)
@@ -273,7 +316,8 @@ def run_condensation_diagnostics(method, output_dir, space, dataset='cora', rati
     records = []
     for step in tqdm(checkpoints, desc=f'{method}: frozen selection, SGC + GCN curves'):
         snapshot = torch.load(folder / 'checkpoints' / f'step_{step:06d}.pt', map_location='cpu', weights_only=False)
-        common = dict(method=method, step=step, selected=step == int(choice['step']))
+        common = dict(method=method, step=step, selected=step == int(choice['step']),
+                      selection_architecture=selection_architecture)
         records.append(dict(**common, architecture='SGC', seed=-1,
                             **sgc_metrics(snapshot, z, q, graph['y'], masks)))
         cx, cy, mass = representative(snapshot['moments'], transform, z.shape[1], device)
@@ -289,7 +333,7 @@ def run_condensation_diagnostics(method, output_dir, space, dataset='cora', rati
     summaries = []
     for architecture, group in trajectory[trajectory.selected].groupby('architecture'):
         summary = dict(method=method, architecture=architecture, dataset=dataset, ratio=ratio,
-                       nodes=cells, selected_step=int(choice['step']), selection_architecture='SGC',
+                       nodes=cells, selected_step=int(choice['step']), selection_architecture=selection_architecture,
                        loss_weighting='uniform' if method == 'C-prior' else 'mass',
                        **{key: choice[key] for key in space}, search_val=choice['val_acc'], n_runs=len(group))
         for metric in ('train_acc', 'val_acc', 'test_acc', 'train_ce', 'val_ce', 'test_ce',
@@ -361,7 +405,8 @@ def plot_diagnostics(trajectory, fixed_epoch=True):
             ax.set(xlabel='Condensation step', ylabel=ylabel, title=architecture)
             ax.legend(fontsize=8)
         axes[row, 2].axhline(0, color='gray', linewidth=.8)
-    fig.suptitle('SGC-selected configuration | GCN: ' + ('fixed final epoch' if fixed_epoch else 'best validation epoch'))
+    selection = trajectory.selection_architecture.iloc[0] if 'selection_architecture' in trajectory else 'SGC'
+    fig.suptitle(f'{selection}-selected configuration | GCN: ' + ('fixed final epoch' if fixed_epoch else 'best validation epoch'))
     fig.tight_layout()
     return fig
 

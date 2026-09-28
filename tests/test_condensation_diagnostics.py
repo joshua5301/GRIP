@@ -122,3 +122,62 @@ def test_gcn_retains_selected_and_fixed_epoch_metrics(tmp_path, monkeypatch):
     assert result['last_val_ce'] > result['val_ce']
     assert json.loads((tmp_path / 'seed_0.json').read_text()) == result
     assert len(pd.read_csv(tmp_path / 'seed_0_epochs.csv')) == 2
+
+
+def test_gcn_reselection_reuses_checkpoints_and_keeps_test_out_of_search(tmp_path, monkeypatch):
+    from pathlib import Path
+    x = torch.arange(18, dtype=torch.float).reshape(6, 3) / 10
+    graph = dict(x=x, y=torch.arange(6) % 2, adj=torch.eye(6).to_sparse_csr())
+    masks = [torch.arange(6) // 2 == k for k in range(3)]
+    monkeypatch.setattr(experiment, '_prepare_dataset', lambda *args: (
+        graph, masks[0], (graph, masks[1]), (graph, masks[2]), x))
+    monkeypatch.setitem(experiment.BUDGET, ('cora', .052), 2)
+    monkeypatch.setattr(experiment, 'feature_kmeans', lambda *args: torch.arange(6) % 2)
+    monkeypatch.setattr(experiment.subprocess, 'check_output', lambda *args, **kwargs: 'test-revision')
+    def teachers(*args, **kwargs):
+        value = {.01: torch.zeros(6, 2, dtype=torch.double)}
+        torch.save(value, args[8] / 'teachers.pt')
+        return value
+    monkeypatch.setattr(experiment, 'teacher_logits', teachers)
+    def optimize(*args, **kwargs):
+        folder = kwargs['folder'] / 'checkpoints'
+        folder.mkdir()
+        for step in kwargs['checkpoint_steps']:
+            torch.save(dict(step=step, moments=torch.ones(2, 6, dtype=torch.double)),
+                       folder / f'step_{step:06d}.pt')
+    monkeypatch.setattr(experiment, 'optimize_ce_assignment', optimize)
+    def metrics(value):
+        return dict(train_acc=90., val_acc=value, test_acc=75., train_ce=.2, val_ce=.4,
+                    test_ce=.5, val_minus_train_ce=.2, train_minus_val_acc=90 - value,
+                    full_teacher_ce=.3, condensed_ce=.1)
+    monkeypatch.setattr(experiment, 'sgc_metrics', lambda snapshot, *args:
+                        metrics(60. if snapshot['step'] == 0 else 90.))
+    seen = []
+    def evaluate(cx, cy, mass, graph, q, masks, seed, *args, **kwargs):
+        folder = args[-1]
+        search = 'gcn_search' in folder.parts
+        seen.append((search, set(masks), seed))
+        step = int(folder.name.split('_')[-1])
+        row = metrics(85. if step == 0 else 80.)
+        if search:
+            row.pop('test_acc')
+            row.pop('test_ce')
+        return dict(seed=seed, **row)
+    monkeypatch.setattr(experiment, 'fit_gcn_diagnostic', evaluate)
+    args = dict(method='A', output_dir=tmp_path, space=dict(
+        gamma=[.01], T=[1.], penalty=[.01], assignment_lr=[.003]),
+        steps=1, checkpoint_steps=[0, 1], device='cpu', full_baseline=False, final_seeds=[100])
+    original = experiment.run_condensation_diagnostics(**args)
+    assert set(original.selected_step) == {1}
+    def forbidden(*args, **kwargs):
+        raise AssertionError('Saved condensation must not be optimized again')
+    monkeypatch.setattr(experiment, 'optimize_ce_assignment', forbidden)
+    selected = experiment.run_condensation_diagnostics(
+        **args, selection_architecture='GCN', search_seeds=[0, 1],
+        checkpoint_source=original.output_dir.iloc[0])
+    assert set(selected.selected_step) == {0}
+    assert set(selected.selection_architecture) == {'GCN'}
+    assert all('test' not in masks and seed in (0, 1) for search, masks, seed in seen if search)
+    assert all(seed == 100 for search, _, seed in seen if not search)
+    search = pd.read_csv(Path(selected.output_dir.iloc[0]) / 'search_gcn.csv')
+    assert 'test_acc' not in search and search.val_acc.max() == 85.

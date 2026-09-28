@@ -1,5 +1,27 @@
 # SGC selection, GCN transfer and overfitting diagnostics
 
+## GCN validation reselection
+
+Use `selection_architecture="GCN", search_seeds=[0, 1, 2]` to select both
+hyperparameters and condensation checkpoint by the mean best-validation accuracy
+of fresh GCN students. Every supplied candidate and checkpoint, including zero,
+is evaluated. Search metrics use train and validation masks only. Final seeds
+must be disjoint from search seeds; test labels are evaluated after selection.
+The optimizer itself remains CE-linear SGC inner/outer, so this changes selection,
+not the condensation objective. This is GCN-tuned evaluation, not blind transfer.
+
+Pass `checkpoint_source` as an earlier method directory containing `config.json`,
+`teachers.pt`, `initialization.pt` and all candidate checkpoints to reuse previous
+optimization. The runner validates the method, graph/feature digest and every
+optimization setting before copying checkpoints into the new experiment. It
+does not modify the source. Selection/training settings can change; optimization
+settings cannot. The source revision and path are recorded. Partial GCN evaluation
+resumes from completed per-seed files. A grid with 72 candidates, 7 checkpoints
+and 3 search seeds requires 1512 GCN fits per method, in addition to final
+evaluation. `search_gcn.csv` contains selection scores; `search_sgc.csv` remains
+available as a diagnostic. For comparison with earlier SGC results, retain the
+same grid, checkpoints and GCN training settings.
+
 `src.condensation_diagnostics.run_condensation_diagnostics` compares three methods
 under the same teacher grid and CE inner/outer objective. The first experiment is
 Cora, ratio 0.052, 140 representatives. Cora, Citeseer and Arxiv are supported.
