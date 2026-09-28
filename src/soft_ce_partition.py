@@ -200,6 +200,10 @@ def implicit_moment_gradient(moments, dimension, theta, vector, penalty):
     return result
 
 
+def fixed_target_moments(centers, labels, mass):
+    return torch.cat((mass[:, None], mass[:, None] * centers, mass[:, None] * labels), dim=1)
+
+
 def cpu_state(value):
     if torch.is_tensor(value):
         return value.detach().cpu().clone()
@@ -219,7 +223,8 @@ def optimize_ce_assignment(z, q, assignment, penalty=3e-5, steps=300, lr=.01,
                            outer_chunk_size=65536, log_every=10, assignment_rank=None, factor_seed=0,
                            assignment_input='node', assignment_encoder='linear', encoder_hidden=64,
                            resume_state=None, save_resume=False, solver_mode='exact',
-                           tracking_inner_steps=2, tracking_cg_steps=8, tracking_refresh=20):
+                           tracking_inner_steps=2, tracking_cg_steps=8, tracking_refresh=20,
+                           feature_control='joint'):
     resume_config = {key: value for key, value in locals().copy().items()
                      if key not in ('z', 'q', 'assignment', 'steps', 'folder', 'checkpoint_steps',
                                     'resume_state', 'save_resume', 'log_every')}
@@ -231,6 +236,10 @@ def optimize_ce_assignment(z, q, assignment, penalty=3e-5, steps=300, lr=.01,
         raise ValueError('Require positive finite solver settings and nonnegative steps')
     if mass_mode not in ('free', 'uniform') or balance_steps < 1 or not 0 < balance_tol < 1:
         raise ValueError('Invalid mass constraint settings')
+    if feature_control not in ('joint', 'assignment', 'direct'):
+        raise ValueError('Unknown feature control')
+    if feature_control != 'joint' and mass_mode != 'free':
+        raise ValueError('Fixed-target controls use free geometric assignments and fixed initial loss mass')
     if (balance_backend not in ('cached', 'chunked') or min(balance_cg_steps, outer_chunk_size, log_every) < 1
             or not 0 < balance_cg_rtol < 1):
         raise ValueError('Invalid performance settings')
@@ -265,6 +274,17 @@ def optimize_ce_assignment(z, q, assignment, penalty=3e-5, steps=300, lr=.01,
     else:
         u, v = initialize_factors(assignment, clusters, assignment_rank, factor_seed)
         parameters = [u, v]
+    if feature_control != 'joint':
+        with torch.no_grad():
+            if assignment_rank is None:
+                initial = AssignmentMoments.apply(logits, material, chunk_size)
+            else:
+                initial_u = encode_nodes(inputs, encoder_parameters) if assignment_input != 'node' else u
+                initial = LowRankMoments.apply(initial_u, v, assignment, material, mixing, chunk_size)
+            initial_centers, fixed_labels, fixed_mass = decode_moments(initial, z.shape[1])
+        if feature_control == 'direct':
+            free_centers = initial_centers.clone().requires_grad_()
+            parameters = [free_centers]
     optimizer = torch.optim.Adam(parameters, lr=lr, eps=1e-12, foreach=False)
     folder = Path(folder) if folder is not None else None
     if folder is not None:
@@ -304,10 +324,12 @@ def optimize_ce_assignment(z, q, assignment, penalty=3e-5, steps=300, lr=.01,
     for step in trange(start_step, steps + 1, desc='CE inner + CE outer'):
         tick = timestamp()
         optimizer.zero_grad(set_to_none=True)
-        if assignment_input != 'node':
+        if assignment_input != 'node' and feature_control != 'direct':
             u = encode_nodes(inputs, encoder_parameters)
         balance = dict(balance_iterations=0, row_residual=np.nan, column_residual=np.nan)
-        if mass_mode == 'uniform':
+        if feature_control == 'direct':
+            moments = fixed_target_moments(free_centers, fixed_labels, fixed_mass)
+        elif mass_mode == 'uniform':
             if assignment_rank is not None:
                 logits = LowRankLogits.apply(u, v, assignment, mixing, chunk_size)
             if balance_backend == 'cached':
@@ -323,6 +345,9 @@ def optimize_ce_assignment(z, q, assignment, penalty=3e-5, steps=300, lr=.01,
             moments = LowRankMoments.apply(u, v, assignment, material, mixing, chunk_size)
         else:
             moments = AssignmentMoments.apply(logits, material, chunk_size)
+        if feature_control == 'assignment':
+            moving_centers, _, _ = decode_moments(moments, z.shape[1])
+            moments = fixed_target_moments(moving_centers, fixed_labels, fixed_mass)
         if not bool(torch.isfinite(moments).all()) or bool((moments[:, 0] <= 0).any()):
             raise FloatingPointError('Nonfinite moments or empty soft cell')
         centers, labels, mass = decode_moments(moments.detach(), z.shape[1])
@@ -448,9 +473,16 @@ def optimize_ce_assignment(z, q, assignment, penalty=3e-5, steps=300, lr=.01,
                   assignment_rank=assignment_rank, factor_seed=factor_seed,
                   assignment_input=assignment_input,
                   assignment_encoder=assignment_encoder,
-                  solver_mode=solver_mode, assignment_parameters=sum(parameter.numel() for parameter in parameters))
+                  solver_mode=solver_mode, feature_control=feature_control,
+                  assignment_parameters=sum(parameter.numel() for parameter in parameters))
     if folder is not None and save_assignment:
-        if assignment_rank is None:
+        if feature_control != 'joint':
+            torch.save(dict(labels=fixed_labels.cpu(), mass=fixed_mass.cpu(), feature_control=feature_control),
+                       folder / 'fixed_targets.pt')
+        if feature_control == 'direct':
+            torch.save(dict(centers=best_parameters[0].cpu(), labels=fixed_labels.cpu(),
+                            mass=fixed_mass.cpu(), step=best_step), folder / 'best_free_features.pt')
+        elif assignment_rank is None:
             torch.save(best_parameters[0].cpu(), folder / 'best_assignment_logits.pt')
         elif assignment_input != 'node':
             saved = dict(v=best_parameters[-1].cpu(), assignment=assignment.cpu(), mixing=mixing,

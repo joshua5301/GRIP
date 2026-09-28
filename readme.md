@@ -604,3 +604,8 @@ Assignment MLP joint full grid: use `run_assignment_sweep(full_grid=True, assign
 CE assignment optimization supports `solver_mode="tracking"`: bounded warm-started
 head/adjoint updates with periodic exact correction. The original solver remains
 available as `exact`. See [tracking solver](docs/ce_tracking.md).
+
+`src.feature_control_sweep.run_feature_control_sweep` compares assignment-derived
+centers (B) against freely optimized features (C), with shared initialization,
+fixed teacher-average labels and fixed initial mass CE. Both get the same full
+grid and validation selection. See [fixed-target controls](docs/feature_controls.md).

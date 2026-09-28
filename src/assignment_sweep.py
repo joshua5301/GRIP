@@ -96,11 +96,14 @@ def run_assignment_sweep(dataset, ratios, output_dir, space, gammas, teacher_ker
                          rank=16, encoder_hidden=64, seed=0, partition_B=1., partition_sweeps=30,
                          epochs=1000, eval_every=10, hidden=256, student_lr=.01, weight_decay=.0005,
                          data_dir='/content/data/', device='cuda', solver=None, full_grid=False,
-                         assignment_steps=200, checkpoint_steps=(25, 50, 100, 150, 200)):
+                         assignment_steps=200, checkpoint_steps=(25, 50, 100, 150, 200),
+                         feature_control='joint', initialization_source=None):
     if dataset not in ('cora', 'citeseer', 'flickr'):
         raise ValueError('Supported datasets: cora, citeseer, flickr')
     if set(space) != {'T', 'penalty', 'assignment_lr'}:
         raise ValueError('Sweep T, penalty and assignment_lr')
+    if feature_control not in ('joint', 'assignment', 'direct'):
+        raise ValueError('Unknown feature control')
     candidates = grid_rows(dict(gamma=list(gammas), **space) if full_grid else space)
     if any(not np.isfinite(v) or v <= 0 for row in candidates for v in row.values()):
         raise ValueError('Sweep values must be positive finite numbers')
@@ -124,7 +127,9 @@ def run_assignment_sweep(dataset, ratios, output_dir, space, gammas, teacher_ker
         adj = graph['adj'].to_sparse_csr()
         return [value.cpu().numpy() for value in (graph['x'], graph['y'], adj.crow_indices(),
                                                  adj.col_indices(), adj.values())]
-    config = dict(full_grid=full_grid, assignment_steps=assignment_steps, checkpoint_steps=list(checkpoint_steps),
+    config = dict(full_grid=full_grid, feature_control=feature_control,
+                  initialization_source=str(initialization_source) if initialization_source is not None else None,
+                  assignment_steps=assignment_steps, checkpoint_steps=list(checkpoint_steps),
                   dataset=dataset, ratios=list(ratios), space=space, gammas=list(gammas),
                   teacher_kernel=teacher_kernel, basis=basis, dropouts=list(dropouts),
                   stage_steps=list(stage_steps), keep=keep, search_seeds=list(search_seeds),
@@ -139,7 +144,17 @@ def run_assignment_sweep(dataset, ratios, output_dir, space, gammas, teacher_ker
     root = Path(output_dir) / _fingerprint(config)
     root.mkdir(parents=True, exist_ok=True)
     (root / 'config.json').write_text(json.dumps(config, indent=2), encoding='utf-8')
-    teachers = teacher_logits(h, train, mask, validation, teacher_kernel, gammas, basis, seed, root,
+    source = Path(initialization_source) if initialization_source is not None else root
+    if initialization_source is not None:
+        source_config = json.loads((source / 'config.json').read_text())
+        keys = ('dataset', 'ratios', 'gammas', 'teacher_kernel', 'basis', 'seed', 'partition_B',
+                'partition_sweeps', 'data_digest', 'full_grid', 'revision')
+        if (any(source_config[key] != config[key] for key in keys)
+                or source_config['space']['T'] != list(space['T'])):
+            raise ValueError('Shared initialization settings differ')
+        if not (source / ('teachers.pt' if full_grid else 'teacher.pt')).exists():
+            raise ValueError('Shared teacher cache is missing')
+    teachers = teacher_logits(h, train, mask, validation, teacher_kernel, gammas, basis, seed, source,
                               return_all=full_grid)
     if not full_grid:
         logits, gamma = teachers
@@ -157,7 +172,9 @@ def run_assignment_sweep(dataset, ratios, output_dir, space, gammas, teacher_ker
         assignments = {}
         for gamma, temperature in itertools.product(teachers, dict.fromkeys(space['T'])):
             q = (teachers[gamma].to(device) / temperature).softmax(1).double()
-            path = folder / f'initial_{_fingerprint([gamma, temperature])}.pt'
+            path = source / f'ratio_{ratio:g}' / f'initial_{_fingerprint([gamma, temperature])}.pt'
+            if initialization_source is not None and not path.exists():
+                raise ValueError('Shared initial partition is missing')
             if path.exists():
                 assignment = torch.load(path, map_location=device, weights_only=True)
             else:
@@ -204,7 +221,8 @@ def run_assignment_sweep(dataset, ratios, output_dir, space, gammas, teacher_ker
                         lr=candidate['assignment_lr'], folder=path, checkpoint_steps=checkpoints,
                         assignment_rank=rank, factor_seed=seed, assignment_input='features',
                         assignment_encoder='mlp', encoder_hidden=encoder_hidden,
-                        save_assignment=False, save_resume=True, resume_state=state, **solver)
+                        save_assignment=False, save_resume=True, resume_state=state,
+                        feature_control=feature_control, **solver)
                     del optimized
                 for step in checkpoints:
                     snapshot = torch.load(path / 'checkpoints' / f'step_{step:06d}.pt', map_location='cpu', weights_only=False)
@@ -255,6 +273,7 @@ def run_assignment_sweep(dataset, ratios, output_dir, space, gammas, teacher_ker
         cx, cy, mass = representative(snapshot['moments'], transform, z.shape[1], device)
         torch.save(dict(x=cx.cpu(), y=cy.cpu(), mass=mass.cpu(), choice=choice), folder / 'selected_partition.pt')
         summaries.append(dict(dataset=dataset, ratio=ratio, nodes=len(cx), gamma=choice['gamma'],
+                              feature_control=feature_control, loss_weighting='mass',
                               **{key: choice[key] for key in ('T', 'penalty', 'assignment_lr', 'dropout')},
                               selected_step=step, search_val=choice['val'], final_val=final.val.mean(),
                               final_val_std=final.val.std(ddof=0), test_mean=final.test.mean(),
