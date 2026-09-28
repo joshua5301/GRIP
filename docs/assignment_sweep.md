@@ -65,3 +65,28 @@ tolerance relaxation is introduced. The original full-coordinate residual must
 still satisfy the requested tolerance or optimization stops. The same solver
 supports inner-head Newton polishing. Logs include hessian_solver and the reduced
 dimension; cg_residual denotes the verified residual for either solver.
+
+
+## Joint full grid, maximum 200 assignment updates
+
+Set `full_grid=True`, `assignment_steps=200` and
+`checkpoint_steps=(25, 50, 100, 150, 200)` in `run_assignment_sweep`.
+Every gamma x T x penalty x assignment_lr candidate runs to the full budget;
+there is no promotion or early elimination. Teacher validation remains diagnostic:
+gamma is selected jointly using the final student's validation accuracy.
+Student training epochs are controlled separately by `epochs`.
+
+Step zero is evaluated once per gamma/T/dropout and competes as a baseline.
+Its penalty and assignment learning rate are not identifiable; selected output
+uses null for these fields. `baselines.csv` stores these unique baselines.
+`boundaries.csv` profiles the best validation per parameter value, excluding
+step zero from penalty and assignment learning rate profiles. An edge winner
+indicates a reason to expand the grid, not proof of a global optimum.
+
+`full_grid.csv` stores all evaluated checkpoints. Search uses `search_seeds`;
+only the globally selected configuration is evaluated with `final_seeds` on test.
+Use disjoint seeds. Final evaluation does not choose another configuration.
+Resume by rerunning identical settings and code revision against the same Drive
+output directory. Each candidate saves optimizer state at checkpoints; student
+scores are cached separately. An interruption may repeat work after the latest
+saved checkpoint. The staged runner remains the default.

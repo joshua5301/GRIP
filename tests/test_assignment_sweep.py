@@ -51,3 +51,38 @@ def test_resume_preserves_optimizer_trajectory_and_checks_data(tmp_path):
     assert [row['step'] for row in resumed['history']] == list(range(5))
     with pytest.raises(ValueError, match='Resume state'):
         optimize_ce_assignment(z + .1, q, assignment, steps=4, resume_state=state, **options)
+
+
+def test_boundary_profile_excludes_baseline_for_penalty():
+    from src.assignment_sweep import boundary_profile
+    table = pd.DataFrame([
+        dict(step=0, gamma=.1, T=.2, penalty=1e-5, val=90.),
+        dict(step=25, gamma=.1, T=.2, penalty=1e-5, val=70.),
+        dict(step=200, gamma=1., T=4., penalty=1e-3, val=80.),
+    ])
+    profile = boundary_profile(table, dict(gamma=[.1, 1.], penalty=[1e-5, 1e-3]))
+    penalty = profile[profile.parameter == 'penalty'].set_index('value')
+    assert penalty.loc[1e-5, 'best_val'] == 70.
+    assert penalty.loc[1e-3, 'boundary'] == 'upper'
+    assert profile[profile.parameter == 'gamma'].best_val.max() == 90.
+
+
+def test_teacher_full_grid_keeps_every_gamma_and_reloads(tmp_path, monkeypatch):
+    import src.assignment_sweep as module
+    h = torch.eye(3, dtype=torch.double)
+    graph = {'y': torch.arange(3)}
+    mask = torch.arange(3)
+    monkeypatch.setattr(module, 'get_kernel_values', lambda a, b, kernel: a @ b.T)
+    calls = []
+    def fit(x, y, gamma):
+        calls.append(gamma)
+        return gamma * torch.eye(3, dtype=torch.double)
+    monkeypatch.setattr(module, 'fit_logistic', fit)
+    args = (h, graph, mask, (graph, mask), 'relu', [.1, 1.], 3, 0, tmp_path)
+    logits = module.teacher_logits(*args, return_all=True)
+    assert calls == [.1, 1.]
+    assert set(logits) == {.1, 1.}
+    torch.testing.assert_close(logits[1.], 10 * logits[.1])
+    restored = module.teacher_logits(*args, return_all=True)
+    assert calls == [.1, 1.]
+    torch.testing.assert_close(restored[1.], logits[1.])

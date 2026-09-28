@@ -598,3 +598,5 @@ a low-rank correction to the original assignment logits with the same CE inner
 and outer objectives. Free mass streams node-cell blocks; uniform mass retains
 the existing balancing cache. `assignment_rank=None` uses the dense baseline.
 See `docs/soft_ce_partition.md` for initialization, memory limits and saved factors.
+
+Assignment MLP joint full grid: use `run_assignment_sweep(full_grid=True, assignment_steps=200)` to search teacher gamma together with temperature and inner CE penalty, without candidate pruning. See [assignment sweep](docs/assignment_sweep.md).
