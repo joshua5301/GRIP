@@ -614,3 +614,8 @@ grid and validation selection. See [fixed-target controls](docs/feature_controls
 and C-prior using SGC-only selection, then measures GCN transfer and original-graph
 train/validation learning curves. Sessions write independently and resume from
 saved checkpoints. See [transfer and overfitting diagnostics](docs/condensation_diagnostics.md).
+
+`src.trajectory_clustering.run_trajectory_sweep` alternates SGC training trajectories
+with CE-preserving hard assignments and freely optimized representatives. It uses
+cell-average labels, mass CE, GCN validation selection, and round-boundary resume.
+See [trajectory clustering](docs/trajectory_clustering.md).
