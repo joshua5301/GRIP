@@ -224,10 +224,16 @@ def optimize_ce_assignment(z, q, assignment, penalty=3e-5, steps=300, lr=.01,
                            assignment_input='node', assignment_encoder='linear', encoder_hidden=64,
                            resume_state=None, save_resume=False, solver_mode='exact',
                            tracking_inner_steps=2, tracking_cg_steps=8, tracking_refresh=20,
-                           feature_control='joint'):
+                           feature_control='joint', initial_representatives=None, outer_indices=None):
     resume_config = {key: value for key, value in locals().copy().items()
                      if key not in ('z', 'q', 'assignment', 'steps', 'folder', 'checkpoint_steps',
-                                    'resume_state', 'save_resume', 'log_every')}
+                                    'resume_state', 'save_resume', 'log_every',
+                                    'initial_representatives', 'outer_indices')}
+    if initial_representatives is not None:
+        resume_config['initial_digest'] = array_digest(
+            *(initial_representatives[key].detach().cpu().numpy() for key in ('centers', 'labels', 'mass')))
+    if outer_indices is not None:
+        resume_config['outer_digest'] = array_digest(outer_indices.cpu().numpy())
     if resume_state is not None or save_resume:
         resume_config['data_digest'] = array_digest(z.detach().cpu().numpy(), q.detach().cpu().numpy(),
                                                     assignment.cpu().numpy())
@@ -240,6 +246,8 @@ def optimize_ce_assignment(z, q, assignment, penalty=3e-5, steps=300, lr=.01,
         raise ValueError('Unknown feature control')
     if feature_control != 'joint' and mass_mode != 'free':
         raise ValueError('Fixed-target controls use free geometric assignments and fixed initial loss mass')
+    if initial_representatives is not None and feature_control != 'direct':
+        raise ValueError('Custom representatives require direct feature optimization')
     if (balance_backend not in ('cached', 'chunked') or min(balance_cg_steps, outer_chunk_size, log_every) < 1
             or not 0 < balance_cg_rtol < 1):
         raise ValueError('Invalid performance settings')
@@ -258,7 +266,11 @@ def optimize_ce_assignment(z, q, assignment, penalty=3e-5, steps=300, lr=.01,
         checkpoints.update((0, steps))
     snapshots = {}
     material = make_material(z, q)
-    full_features = augmented(z)
+    outer_z = z if outer_indices is None else z[outer_indices]
+    outer_q = q if outer_indices is None else q[outer_indices]
+    if not len(outer_z):
+        raise ValueError('Outer loss requires at least one node')
+    full_features = augmented(outer_z)
     clusters = int(assignment.max()) + 1
     if assignment_rank is None:
         logits = initial_logits(assignment, clusters, mixing).requires_grad_()
@@ -282,6 +294,17 @@ def optimize_ce_assignment(z, q, assignment, penalty=3e-5, steps=300, lr=.01,
                 initial_u = encode_nodes(inputs, encoder_parameters) if assignment_input != 'node' else u
                 initial = LowRankMoments.apply(initial_u, v, assignment, material, mixing, chunk_size)
             initial_centers, fixed_labels, fixed_mass = decode_moments(initial, z.shape[1])
+            if initial_representatives is not None:
+                initial_centers, fixed_labels, fixed_mass = (
+                    initial_representatives[key].detach().to(z).clone()
+                    for key in ('centers', 'labels', 'mass'))
+                if (initial_centers.shape != (clusters, z.shape[1])
+                        or fixed_labels.shape != (clusters, q.shape[1]) or fixed_mass.shape != (clusters,)
+                        or not all(bool(torch.isfinite(t).all()) for t in (initial_centers, fixed_labels, fixed_mass))
+                        or bool((fixed_mass <= 0).any()) or bool((fixed_labels < 0).any())
+                        or not torch.allclose(fixed_mass.sum(), z.new_tensor(1.))
+                        or not torch.allclose(fixed_labels.sum(1), z.new_ones(clusters))):
+                    raise ValueError('Invalid initial features, probability labels or mass')
         if feature_control == 'direct':
             free_centers = initial_centers.clone().requires_grad_()
             parameters = [free_centers]
@@ -369,7 +392,7 @@ def optimize_ce_assignment(z, q, assignment, penalty=3e-5, steps=300, lr=.01,
                                      inner_tol, cg_max_iter=cg_max_iter)
         theta = fitted.pop('theta')
         after_inner = timestamp()
-        value, outer_gradient = outer_value_gradient(z, q, theta, outer_chunk_size, full_features)
+        value, outer_gradient = outer_value_gradient(outer_z, outer_q, theta, outer_chunk_size, full_features)
         after_outer = timestamp()
         row = dict(step=step, J=value, **fitted, **balance, cg_iterations=0, cg_residual=np.nan,
                    cg_relative_residual=np.nan, cg_converged=False,

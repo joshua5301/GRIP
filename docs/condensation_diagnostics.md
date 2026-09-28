@@ -1,0 +1,117 @@
+# SGC selection, GCN transfer and overfitting diagnostics
+
+`src.condensation_diagnostics.run_condensation_diagnostics` compares three methods
+under the same teacher grid and CE inner/outer objective. The first experiment is
+Cora, ratio 0.052, 140 representatives. Cora and Citeseer are supported.
+
+| Method | Initialization | Optimized quantities | Condensed CE |
+| --- | --- | --- | --- |
+| A | Feature-only k-means++ | Feature-input MLP assignment; induced features, labels and masses | Current cell mass |
+| C-mean | Same k-means++ state | Free representative features; fixed initial teacher-average labels and masses | Fixed initial mass |
+| C-prior | Random true-class train nodes; counts follow train-label proportions | Free representative features; fixed one-hot labels | Uniform |
+
+All feature materials are S²X. C-prior also samples S²X at the selected train
+nodes, not raw X. A and C-mean start from the existing 5% uniform smoothing of
+the hard k-means assignments, with zero initial learned assignment correction.
+They therefore share exactly the same initial soft means, labels and mass.
+Neither runs a GRIP or variance-moment refinement before optimization.
+`collect_diagnostics` verifies their step-zero moments after both runs finish.
+
+C-prior allocates integer class counts by largest remainders. Sampling is without
+replacement unless a class quota exceeds its available train nodes. For Cora
+0.052, the 140 representatives use all 140 true-label training nodes. C-prior
+changes initialization, labels and weighting together; A versus C-mean is the
+more controlled comparison. A still changes labels and masses with assignment,
+so that comparison does not isolate the feature constraint alone.
+
+## Selection and architecture transfer
+
+SGC is the regularized CE linear classifier on RMS-normalized S²X with an affine
+head. Its inner fit is solved to the configured gradient tolerance at each saved
+checkpoint. The positive L2 penalty applies to the bias as well. This is a
+deterministic convex fit, not a stochastic multi-seed average. It is both the
+optimization surrogate and the source evaluation model.
+
+Teacher gamma, temperature, inner penalty, assignment/feature learning rate and
+condensation checkpoint are selected **only by SGC ground-truth validation
+accuracy**. Ties prefer earlier candidate indices and then earlier checkpoints.
+The teacher uses only true train labels; its validation scores are logged, but
+all supplied gamma values enter the outer grid.
+
+After selection is frozen, every saved checkpoint of that configuration is
+evaluated on SGC and fresh two-layer GCNs. GCN sees the same representative
+features transformed back from RMS coordinates, the same labels and the same
+mass. Its condensed adjacency is I, and evaluation uses the original graph.
+GCN dropout/lr/weight decay are fixed in the protocol; GCN validation chooses
+only its training epoch, never the condensation setting or checkpoint.
+
+SGC and GCN test values are recorded after source selection. Do not select a
+new checkpoint or grid from these diagnostic test curves. The primary comparison
+uses SGC-selected checkpoints; the GCN result has not been tuned for GCN.
+
+An optional full-data reference trains each architecture using the original true
+train labels. SGC selects its penalty from the same grid; GCN uses the same fixed
+training settings and seeds. `test_drop_from_full` reports full-reference test
+accuracy minus condensed test accuracy in percentage points. These references
+are not claims about the best achievable full-data accuracy.
+
+## Overfitting measurements
+
+At each condensation checkpoint, `trajectory.csv` records:
+
+- True-label train/validation/test accuracy and CE on the original graph.
+- Teacher-target CE, both whole-graph and per split, and condensed training CE.
+- Validation CE minus train CE, and train accuracy minus validation accuracy.
+- GCN metrics at its best-validation epoch and at the fixed final epoch (`last_*`).
+
+`plot_diagnostics` defaults to fixed-final-epoch GCN results, so changing the
+selected GCN epoch does not obscure the condensation-step curves. Pass
+`fixed_epoch=False` for the best-validation-epoch view. Each GCN run also saves
+its training-epoch history. `plot_student_learning` plots true train/validation
+CE and accuracy versus GCN training epoch for each selected condensed dataset.
+
+A stronger overfitting signal is decreasing train CE accompanied by worsening
+validation CE/accuracy. A large gap alone is not proof. Teacher errors, label
+distribution differences and representation mismatch can also produce it.
+Likewise, SGC improvement without GCN improvement is evidence of limited
+transfer for this pair, not proof of general architecture independence.
+
+Each method selects its own best source configuration. Differences at those
+configurations combine method and hyperparameter effects; do not interpret them
+as a pure causal effect of the clustering constraint. For controlled SGC
+comparisons, join `search_sgc.csv` on gamma, T, penalty, assignment_lr and step.
+Teacher CE values are comparable across methods only when gamma and T match.
+True-label CE does not have that target-distribution ambiguity.
+
+The default outer loss uses teacher targets at **all** nodes, retaining the
+previous transductive protocol. Validation/test ground-truth labels never enter
+the outer gradient, but their graph features and teacher targets do. Set
+`outer_scope="train"` for a separate train-only outer-target experiment. Features,
+propagation and clustering still use the full graph, so this is not an inductive
+holdout experiment. Use a different output directory for that comparison.
+
+## Parallel execution and recovery
+
+Run the same Colab cell in three sessions, changing only `method` to `A`,
+`C-mean`, or `C-prior`. A common protocol hash includes the grid, seeds, graph,
+CPU-prepared propagated features, optimizer settings and Git revision. Each
+method writes into its own subdirectory, including its teacher cache, avoiding
+shared concurrent writers. Do not run two sessions for the same method/path.
+
+Re-running the identical protocol restores assignment/feature Adam state, the
+head and adjoint at the last saved condensation checkpoint. Finished candidates
+and completed GCN seed evaluations are reused. An interrupted GCN seed restarts
+that seed. Changing the grid, checkpoint list, settings or Git revision creates
+a new protocol directory. To resume across a repository update, use the original
+revision recorded in `config.json`.
+
+After all sessions finish, `collect_diagnostics(protocol_dir)` returns all three
+summaries, trajectories and initial-state checks. Re-run only the result-reading
+section of the cell to update plots. Each method saves its own plots to avoid
+parallel overwrites. Standard deviations summarize GCN training seeds only;
+they do not include teacher, partition or hyperparameter-selection variation.
+
+The tests cover true-train prior initialization, preservation of custom fixed
+targets, restricted outer targets, optimizer resumption, source-only selection,
+and best-validation versus final-epoch GCN recording. They are intended to run
+in Colab; no local numerical test or training was performed for this change.

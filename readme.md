@@ -609,3 +609,8 @@ available as `exact`. See [tracking solver](docs/ce_tracking.md).
 centers (B) against freely optimized features (C), with shared initialization,
 fixed teacher-average labels and fixed initial mass CE. Both get the same full
 grid and validation selection. See [fixed-target controls](docs/feature_controls.md).
+
+`src.condensation_diagnostics.run_condensation_diagnostics` compares A, C-mean
+and C-prior using SGC-only selection, then measures GCN transfer and original-graph
+train/validation learning curves. Sessions write independently and resume from
+saved checkpoints. See [transfer and overfitting diagnostics](docs/condensation_diagnostics.md).
