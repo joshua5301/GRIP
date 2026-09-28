@@ -600,3 +600,7 @@ the existing balancing cache. `assignment_rank=None` uses the dense baseline.
 See `docs/soft_ce_partition.md` for initialization, memory limits and saved factors.
 
 Assignment MLP joint full grid: use `run_assignment_sweep(full_grid=True, assignment_steps=200)` to search teacher gamma together with temperature and inner CE penalty, without candidate pruning. See [assignment sweep](docs/assignment_sweep.md).
+
+CE assignment optimization supports `solver_mode="tracking"`: bounded warm-started
+head/adjoint updates with periodic exact correction. The original solver remains
+available as `exact`. See [tracking solver](docs/ce_tracking.md).

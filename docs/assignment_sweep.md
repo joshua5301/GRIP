@@ -90,3 +90,12 @@ Resume by rerunning identical settings and code revision against the same Drive
 output directory. Each candidate saves optimizer state at checkpoints; student
 scores are cached separately. An interruption may repeat work after the latest
 saved checkpoint. The staged runner remains the default.
+
+
+## Faster inner/adjoint tracking
+
+Pass `solver=dict(solver_mode="tracking", tracking_inner_steps=2,
+tracking_cg_steps=8, tracking_refresh=20)` to use warm, bounded solver updates
+between exact corrections. The full grid, checkpoint selection, gamma search,
+GCN seeds and mass-weighted CE are unchanged. See [tracking details](ce_tracking.md)
+for residual diagnostics, numerical limits, timing and resume semantics.

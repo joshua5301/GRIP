@@ -39,9 +39,9 @@ def hessian_operator(x, labels, mass, theta, penalty):
 
 
 @torch.no_grad()
-def conjugate_gradient(multiply, rhs, diagonal, rtol=1e-6, atol=1e-12, max_iter=512):
-    solution = torch.zeros_like(rhs)
-    residual = rhs.clone()
+def conjugate_gradient(multiply, rhs, diagonal, rtol=1e-6, atol=1e-12, max_iter=512, initial=None):
+    solution = torch.zeros_like(rhs) if initial is None else initial.detach().clone()
+    residual = rhs.clone() if initial is None else rhs - multiply(solution)
     norm = float(rhs.norm())
     target = max(atol, rtol * norm)
     direction = residual / diagonal
@@ -147,6 +147,39 @@ def solve_inner(centers, labels, mass, penalty, initial=None, max_iter=2000, gra
 
 
 @torch.no_grad()
+def track_inner(centers, labels, mass, penalty, initial, steps=2, cg_steps=8, grad_tol=1e-7):
+    x, theta = augmented(centers), initial.detach().clone()
+    accepted, failed = 0, False
+    for _ in range(steps):
+        gradient = head_gradient(x, labels, mass, theta, penalty)
+        if float(gradient.abs().max()) <= grad_tol:
+            break
+        multiply, diagonal = hessian_operator(x, labels, mass, theta, penalty)
+        direction, _ = conjugate_gradient(multiply, gradient, diagonal, max_iter=cg_steps, rtol=1e-2)
+        decrease = (gradient * direction).sum()
+        if not bool(torch.isfinite(direction).all()) or float(decrease) <= 0:
+            direction = gradient / diagonal
+            decrease = (gradient * direction).sum()
+        objective = head_objective(x, labels, mass, theta, penalty)
+        for exponent in range(16):
+            step = .5 ** exponent
+            candidate = theta - step * direction
+            value = head_objective(x, labels, mass, candidate, penalty)
+            if torch.isfinite(value) and value <= objective - 1e-4 * step * decrease:
+                theta = candidate
+                accepted += 1
+                break
+        else:
+            failed = True
+            break
+    maximum = float(head_gradient(x, labels, mass, theta, penalty).abs().max())
+    return dict(theta=theta, inner_grad_max=maximum,
+                inner_converged=np.isfinite(maximum) and maximum <= grad_tol,
+                inner_iterations=accepted, inner_polish_steps=0,
+                tracking_failed=failed or not np.isfinite(maximum))
+
+
+@torch.no_grad()
 def outer_value_gradient(z, q, theta, chunk_size=4096, features=None):
     value, gradient = z.new_zeros(()), torch.zeros_like(theta)
     for start in range(0, len(z), chunk_size):
@@ -185,7 +218,8 @@ def optimize_ce_assignment(z, q, assignment, penalty=3e-5, steps=300, lr=.01,
                            balance_backend='cached', balance_cg_steps=512, balance_cg_rtol=1e-7,
                            outer_chunk_size=65536, log_every=10, assignment_rank=None, factor_seed=0,
                            assignment_input='node', assignment_encoder='linear', encoder_hidden=64,
-                           resume_state=None, save_resume=False):
+                           resume_state=None, save_resume=False, solver_mode='exact',
+                           tracking_inner_steps=2, tracking_cg_steps=8, tracking_refresh=20):
     resume_config = {key: value for key, value in locals().copy().items()
                      if key not in ('z', 'q', 'assignment', 'steps', 'folder', 'checkpoint_steps',
                                     'resume_state', 'save_resume', 'log_every')}
@@ -204,6 +238,10 @@ def optimize_ce_assignment(z, q, assignment, penalty=3e-5, steps=300, lr=.01,
         raise ValueError('Feature assignment requires assignment_rank and a supported input mode')
     if assignment_encoder not in ('linear', 'mlp') or (assignment_input == 'node' and assignment_encoder != 'linear'):
         raise ValueError('MLP encoder requires feature-conditioned assignments')
+    if (solver_mode not in ('exact', 'tracking') or any(
+            not isinstance(v, (int, np.integer)) or v < 1
+            for v in (tracking_inner_steps, tracking_cg_steps, tracking_refresh))):
+        raise ValueError('Invalid tracking solver settings')
     checkpoints = set(checkpoint_steps)
     if any(not isinstance(step, (int, np.integer)) or not 0 <= step <= steps for step in checkpoints):
         raise ValueError('Checkpoint steps must be integers within the optimization budget')
@@ -232,6 +270,7 @@ def optimize_ce_assignment(z, q, assignment, penalty=3e-5, steps=300, lr=.01,
     if folder is not None:
         folder.mkdir(parents=True, exist_ok=True)
     history, theta, best, dual = [], None, float('inf'), None
+    vector = None
     start_step = 0
     if resume_state is not None:
         if resume_state['config'] != resume_config or resume_state['step'] > steps:
@@ -242,6 +281,11 @@ def optimize_ce_assignment(z, q, assignment, penalty=3e-5, steps=300, lr=.01,
         optimizer.load_state_dict(resume_state['optimizer'])
         start_step = resume_state['step']
         theta = resume_state['theta'].to(z)
+        if solver_mode == 'tracking':
+            theta = resume_state['tracking_theta_before']
+            theta = theta.to(z) if theta is not None else None
+            vector = resume_state['tracking_vector_before']
+            vector = vector.to(z) if vector is not None else None
         dual = resume_state['dual'].to(z) if resume_state['dual'] is not None else None
         best, best_step = resume_state['best'], resume_state['best_step']
         best_moments, best_theta = resume_state['best_moments'], resume_state['best_theta']
@@ -283,26 +327,44 @@ def optimize_ce_assignment(z, q, assignment, penalty=3e-5, steps=300, lr=.01,
             raise FloatingPointError('Nonfinite moments or empty soft cell')
         centers, labels, mass = decode_moments(moments.detach(), z.shape[1])
         after_assignment = timestamp()
-        fitted = solve_inner(centers, labels, mass, penalty, theta, inner_max_iter,
-                             inner_tol, cg_max_iter=cg_max_iter)
+        theta_before, vector_before = theta, vector
+        refresh = (solver_mode == 'exact' or theta is None or step == steps
+                   or step in checkpoints or step % tracking_refresh == 0)
+        head_fallback = False
+        if refresh:
+            fitted = solve_inner(centers, labels, mass, penalty, theta, inner_max_iter,
+                                 inner_tol, cg_max_iter=cg_max_iter)
+        else:
+            fitted = track_inner(centers, labels, mass, penalty, theta,
+                                 tracking_inner_steps, tracking_cg_steps, inner_tol)
+            head_fallback = fitted.pop('tracking_failed')
+            if head_fallback:
+                refresh = True
+                fitted = solve_inner(centers, labels, mass, penalty, theta, inner_max_iter,
+                                     inner_tol, cg_max_iter=cg_max_iter)
         theta = fitted.pop('theta')
         after_inner = timestamp()
         value, outer_gradient = outer_value_gradient(z, q, theta, outer_chunk_size, full_features)
         after_outer = timestamp()
         row = dict(step=step, J=value, **fitted, **balance, cg_iterations=0, cg_residual=np.nan,
                    cg_relative_residual=np.nan, cg_converged=False,
+                   solver_mode=solver_mode, exact_refresh=refresh, head_fallback=head_fallback,
+                   J_exact=fitted['inner_converged'], implicit_fallback=False,
+                   head_correction_relative=(float((theta - theta_before).norm() / theta.norm().clamp_min(1e-30))
+                                             if theta_before is not None else np.nan),
+                   implicit_correction_relative=np.nan,
                    min_mass=float(mass.min()), max_mass=float(mass.max()),
                    effective_cells=float(1 / mass.square().sum()))
         row.update(assignment_seconds=after_assignment - tick, inner_seconds=after_inner - after_assignment,
                    outer_seconds=after_outer - after_inner, implicit_seconds=0., backward_seconds=0.)
         failure = None
-        if not fitted['inner_converged'] or not np.isfinite(value):
+        if (refresh and not fitted['inner_converged']) or not np.isfinite(value):
             failure = 'Inner CE did not converge; increase inner_max_iter or inspect inner_tol'
         else:
             if step == 0:
                 initial_moments = moments.detach().cpu()
                 scale = max(value, 1e-12)
-            if value < best:
+            if fitted['inner_converged'] and value < best:
                 best, best_step = value, step
                 best_moments, best_theta = moments.detach().cpu(), theta.cpu()
                 if save_assignment:
@@ -310,11 +372,25 @@ def optimize_ce_assignment(z, q, assignment, penalty=3e-5, steps=300, lr=.01,
                     best_dual = dual.clone() if dual is not None else None
             if step < steps:
                 implicit_start = timestamp()
-                vector, diagnostic = solve_head_system(augmented(centers), labels, mass, theta, penalty,
-                                                        outer_gradient, rtol=cg_rtol, max_iter=cg_max_iter)
+                if refresh:
+                    vector, diagnostic = solve_head_system(augmented(centers), labels, mass, theta, penalty,
+                                                            outer_gradient, rtol=cg_rtol, max_iter=cg_max_iter)
+                else:
+                    multiply, diagonal = hessian_operator(augmented(centers), labels, mass, theta, penalty)
+                    vector, diagnostic = conjugate_gradient(multiply, outer_gradient, diagonal,
+                                                              rtol=cg_rtol, max_iter=tracking_cg_steps,
+                                                              initial=vector)
+                    diagnostic.update(hessian_solver='tracking_pcg', hessian_reduced_dimension=0)
+                    if not bool(torch.isfinite(vector).all()) or not np.isfinite(diagnostic['cg_residual']):
+                        row['implicit_fallback'] = True
+                        vector, diagnostic = solve_head_system(augmented(centers), labels, mass, theta, penalty,
+                                                                outer_gradient, rtol=cg_rtol, max_iter=cg_max_iter)
                 row.update(diagnostic)
                 row['implicit_seconds'] = timestamp() - implicit_start
-                if not diagnostic['cg_converged']:
+                if vector_before is not None:
+                    row['implicit_correction_relative'] = float(
+                        (vector - vector_before).norm() / vector.norm().clamp_min(1e-30))
+                if (refresh or row['implicit_fallback']) and not diagnostic['cg_converged']:
                     failure = (f'Implicit Hessian solve did not converge: solver={diagnostic["hessian_solver"]}, '
                                f'relative residual={diagnostic["cg_relative_residual"]:.3g}, target={cg_rtol:.3g}')
         row.update(best_J=best, seconds=elapsed + time.perf_counter() - started,
@@ -328,7 +404,8 @@ def optimize_ce_assignment(z, q, assignment, penalty=3e-5, steps=300, lr=.01,
             raise RuntimeError(f'Step {step}: {failure}')
         if step in checkpoints:
             snapshot = dict(step=step, moments=moments.detach().cpu().clone(),
-                            theta=theta.cpu().clone(), teacher_ce=value, inner_grad_max=fitted['inner_grad_max'])
+                            theta=theta.cpu().clone(), teacher_ce=value, inner_grad_max=fitted['inner_grad_max'],
+                            J_exact=fitted['inner_converged'])
             snapshots[step] = snapshot
             if folder is not None:
                 checkpoint_dir = folder / 'checkpoints'
@@ -337,6 +414,7 @@ def optimize_ce_assignment(z, q, assignment, penalty=3e-5, steps=300, lr=.01,
         if save_resume and (step in checkpoints or step == steps):
             state = cpu_state(dict(config=resume_config, step=step, parameters=parameters,
                                    optimizer=optimizer.state_dict(), theta=theta, dual=dual,
+                                   tracking_theta_before=theta_before, tracking_vector_before=vector_before,
                                    best=best, best_step=best_step, best_moments=best_moments,
                                    best_theta=best_theta, initial_moments=initial_moments, scale=scale,
                                    history=history, snapshots=snapshots, elapsed=row['seconds'],
@@ -370,7 +448,7 @@ def optimize_ce_assignment(z, q, assignment, penalty=3e-5, steps=300, lr=.01,
                   assignment_rank=assignment_rank, factor_seed=factor_seed,
                   assignment_input=assignment_input,
                   assignment_encoder=assignment_encoder,
-                  assignment_parameters=sum(parameter.numel() for parameter in parameters))
+                  solver_mode=solver_mode, assignment_parameters=sum(parameter.numel() for parameter in parameters))
     if folder is not None and save_assignment:
         if assignment_rank is None:
             torch.save(best_parameters[0].cpu(), folder / 'best_assignment_logits.pt')
@@ -424,7 +502,8 @@ def run_soft_ce(previous_run, output_dir=None, penalty=3e-5, steps=300, lr=.01,
                  balance_backend='cached', balance_cg_steps=512, balance_cg_rtol=1e-7,
                  outer_chunk_size=65536, log_every=10, checkpoint_source=None,
                  assignment_rank=None, factor_seed=0, assignment_input='node',
-                 assignment_encoder='linear', encoder_hidden=64):
+                 assignment_encoder='linear', encoder_hidden=64, solver_mode='exact',
+                 tracking_inner_steps=2, tracking_cg_steps=8, tracking_refresh=20):
     previous_run = Path(previous_run)
     prior = json.loads((previous_run / 'config.json').read_text())
     original, source = prior['original'], Path(prior['source'])
@@ -456,6 +535,9 @@ def run_soft_ce(previous_run, output_dir=None, penalty=3e-5, steps=300, lr=.01,
                    balance_steps=balance_steps, balance_tol=balance_tol, balance_backend=balance_backend,
                    balance_cg_steps=balance_cg_steps, balance_cg_rtol=balance_cg_rtol,
                    outer_chunk_size=outer_chunk_size, log_every=log_every)
+    if solver_mode != 'exact':
+        options.update(solver_mode=solver_mode, tracking_inner_steps=tracking_inner_steps,
+                       tracking_cg_steps=tracking_cg_steps, tracking_refresh=tracking_refresh)
     if assignment_rank is not None:
         options.update(assignment_rank=assignment_rank, factor_seed=factor_seed)
     if assignment_input != 'node':

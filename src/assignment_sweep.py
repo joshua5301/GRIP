@@ -110,7 +110,8 @@ def run_assignment_sweep(dataset, ratios, output_dir, space, gammas, teacher_ker
     if set(final_seeds) & (set(search_seeds) | set(refine_seeds)):
         raise ValueError('Final student seeds must be separate from search seeds')
     solver = dict(solver or {})
-    allowed = {'inner_max_iter', 'inner_tol', 'cg_max_iter', 'cg_rtol', 'chunk_size', 'outer_chunk_size'}
+    allowed = {'inner_max_iter', 'inner_tol', 'cg_max_iter', 'cg_rtol', 'chunk_size', 'outer_chunk_size',
+               'solver_mode', 'tracking_inner_steps', 'tracking_cg_steps', 'tracking_refresh'}
     if set(solver) - allowed:
         raise ValueError('Unknown solver option')
     if full_grid and (assignment_steps < 1 or any(s < 1 or s > assignment_steps for s in checkpoint_steps)):
