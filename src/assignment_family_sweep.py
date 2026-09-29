@@ -199,3 +199,106 @@ def run_family_sweep(output_dir, space, gammas, ratio=.0005, methods=METHODS,
         pd.DataFrame(summaries).to_csv(root / 'summary.csv', index=False)
         pd.DataFrame(all_final).to_csv(root / 'final_students.csv', index=False)
     return pd.DataFrame(summaries), root
+
+
+def extend_family_sweep(previous_runs, methods=METHODS, steps=1000,
+                        checkpoint_steps=(400, 500, 750, 1000),
+                        data_dir='/content/data/', device='cuda'):
+    tables = []
+    for source in previous_runs:
+        table = pd.read_csv(Path(source) / 'search.csv')
+        table['source'] = str(Path(source))
+        tables.append(table)
+    search = pd.concat(tables, ignore_index=True)
+    if steps < 1 or any(s < 0 or s > steps for s in checkpoint_steps):
+        raise ValueError('Invalid extension checkpoints')
+    torch.backends.cuda.matmul.allow_tf32 = False
+    torch.backends.cudnn.allow_tf32 = False
+    graph, train_mask, validation, testing, unused = _prepare_dataset('arxiv', data_dir, device)
+    del unused
+    adj = graph['adj']
+    digest = array_digest(*(t.cpu().numpy() for t in (
+        graph['x'], graph['y'], adj.crow_indices(), adj.col_indices(), adj.values(),
+        train_mask, validation[1], testing[1])))
+    masks = dict(train=train_mask, val=validation[1], test=testing[1])
+    summaries, curves = [], []
+    for method in methods:
+        eligible = search[search.method == method]
+        if eligible.empty:
+            raise ValueError(f'No saved candidates for {method}')
+        choice = eligible.sort_values(['val', 'step', 'source', 'candidate'],
+                                      ascending=[False, True, True, True]).iloc[0]
+        source = Path(choice.source)
+        config = json.loads((source / 'config.json').read_text())
+        if config['data_digest'] != digest:
+            raise ValueError('Dataset differs from the original sweep')
+        index = int(choice.candidate)
+        original = source / f'candidate_{index:04d}'
+        candidate = json.loads((original / 'params.json').read_text())
+        folder = original / 'extended'
+        folder.mkdir(exist_ok=True)
+        save_json(dict(source=str(source), candidate=index, parameters=candidate,
+                       steps=steps, checkpoint_steps=list(checkpoint_steps)), folder / 'config.json')
+        saved = torch.load(source / 'inputs.pt', map_location=device, weights_only=False)
+        z, assignment = saved['z'], saved['assignment']
+        transform = FeatureTransform(**saved['transform'])
+        del saved
+        teacher = torch.load(source / 'teacher.pt', map_location=device, weights_only=False)
+        q = (teacher['logits'] / candidate['T']).softmax(1).double()
+        gamma = teacher['gamma']
+        del teacher
+        resume = folder / 'resume.pt'
+        state = torch.load(resume if resume.exists() else original / 'resume.pt',
+                           map_location='cpu', weights_only=False)
+        if steps < state['step']:
+            raise ValueError('Target step precedes the saved resume state')
+        checkpoints = sorted({steps, *(s for s in checkpoint_steps if s > config['steps'])})
+        if state['step'] < steps:
+            result = optimize_ce_assignment(
+                z, q, assignment, penalty=candidate['penalty'], lr=candidate['assignment_lr'],
+                steps=steps, mixing=config['mixing'], factor_seed=config['seed'], folder=folder,
+                checkpoint_steps=checkpoints, resume_state=state, save_resume=True,
+                save_assignment=False, mass_mode='free', feature_control='joint',
+                **family_options(candidate), **config['solver'])
+            del result
+        del state
+        settings = dict(epochs=config['epochs'], eval_every=config['eval_every'], hidden=config['hidden'],
+                        dropout=config['dropout'], lr=config['student_lr'], weight_decay=config['weight_decay'])
+
+        def evaluate(step, seeds, final=False):
+            parent = original if step <= config['steps'] else folder
+            snapshot = torch.load(parent / 'checkpoints' / f'step_{step:06d}.pt',
+                                  map_location='cpu', weights_only=False)
+            cx, cy, mass = representative(snapshot['moments'], transform, z.shape[1], device)
+            cache = parent / ('final' if final else 'search') / f'step_{step:06d}'
+            if step == 0:
+                cache = source / ('initial_final' if final else 'initial_search') / _fingerprint(dict(T=candidate['T']))
+            evaluation_masks = masks if final else {k: masks[k] for k in ('train', 'val')}
+            records = [fit_gcn_diagnostic(cx, cy, mass, graph, q, evaluation_masks, seed,
+                       folder=cache, **settings) for seed in seeds]
+            return pd.DataFrame(records), snapshot['teacher_ce']
+
+        old = eligible[(eligible.source == str(source)) & (eligible.candidate == index)].copy()
+        rows = old.to_dict('records')
+        available = sorted(int(p.stem.split('_')[-1]) for p in (folder / 'checkpoints').glob('step_*.pt'))
+        for step in available:
+            if config['steps'] < step <= steps:
+                scores, outer_ce = evaluate(step, config['search_seeds'])
+                rows.append(dict(candidate=index, step=step, **candidate, source=str(source),
+                                 val=scores.val_acc.mean(), val_std=scores.val_acc.std(ddof=0), outer_ce=outer_ce))
+                pd.DataFrame(rows).to_csv(folder / 'search.csv', index=False)
+        curve = pd.DataFrame(rows).sort_values('step')
+        curve.to_csv(folder / 'search.csv', index=False)
+        curves.append(curve)
+        selected = validation_choice(curve)
+        save_json(selected, folder / 'selected.json')
+        for phase, step in [('initial', 0), ('previous', int(choice.step)), ('selected', int(selected['step']))]:
+            scores, _ = evaluate(step, config['final_seeds'], final=True)
+            summaries.append(dict(method=method, phase=phase, step=step, **{k: candidate[k] for k in
+                ('rank', 'width', 'T', 'penalty', 'assignment_lr')}, gamma=gamma,
+                search_val=float(curve.loc[curve.step == step, 'val'].iloc[0]),
+                final_val=scores.val_acc.mean(), final_val_std=scores.val_acc.std(ddof=0),
+                test_mean=scores.test_acc.mean(), test_std=scores.test_acc.std(ddof=0), output_dir=str(folder)))
+        pd.DataFrame([r for r in summaries if r['method'] == method]).to_csv(folder / 'summary.csv', index=False)
+        del z, q, assignment, transform
+    return pd.DataFrame(summaries), pd.concat(curves, ignore_index=True)

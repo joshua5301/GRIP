@@ -57,3 +57,22 @@ The returned table contains initial and selected performance for each family.
 student-seed analyses. Tests exercise initial equality, parameter counts,
 candidate enumeration, and validation-only selection. Numerical tests are for
 Colab; local verification is limited to static parsing and diff checks.
+
+## Extending selected candidates
+
+`extend_family_sweep(previous_runs, methods, steps=1000)` selects one fixed candidate
+per method using the original sweeps' GCN search validation scores, including both
+MLP sessions. It restores the cached features, teacher logits, assignment parameters
+and Adam state. New outputs live in each selected candidate's `extended` directory;
+original sweep files remain unchanged. Repeating the call resumes from its saved
+checkpoint and reuses cached student evaluations. Use disjoint method lists in
+parallel sessions to avoid writing the same extension directory concurrently.
+
+All original checkpoints of the selected candidate and all available extension
+checkpoints up to the requested budget compete on the original search seeds.
+Independent final seeds evaluate the initial, previous selected, and newly selected
+steps. Test accuracy is not used for selection. The returned second table contains
+the fixed-candidate validation and outer CE trajectories. Changing the step budget
+extends the same run rather than starting another sweep. Missing original resume
+state or a changed dataset is an error. Local validation for this addition was
+limited to Python syntax and diff checks; numerical execution belongs in Colab.
