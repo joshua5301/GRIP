@@ -157,6 +157,57 @@ def solve_inner(centers, labels, mass, penalty, initial=None, max_iter=2000, gra
                 inner_iterations=fitted['iterations'], inner_polish_steps=polished)
 
 
+def solve_inner_newton_first(centers, labels, mass, penalty, initial=None, max_iter=2000,
+                             grad_tol=1e-7, cg_max_iter=512, newton_steps=8):
+    if newton_steps < 0:
+        raise ValueError('Newton budget must be nonnegative')
+    theta = initial.detach().to(centers).clone() if initial is not None else None
+    accepted, attempts, cg_iterations, line_evaluations = 0, 0, 0, 0
+    with torch.no_grad():
+        x = augmented(centers.detach())
+        if theta is not None:
+            for _ in range(newton_steps):
+                gradient = head_gradient(x, labels, mass, theta, penalty)
+                maximum = float(gradient.abs().max())
+                if not np.isfinite(maximum) or maximum <= grad_tol:
+                    break
+                attempts += 1
+                tolerance = min(.1, max(1e-4, maximum ** .5))
+                direction, diagnostic = solve_head_system(
+                    x, labels, mass, theta, penalty, gradient, rtol=tolerance,
+                    atol=1e-14, max_iter=cg_max_iter)
+                cg_iterations += diagnostic['cg_iterations']
+                decrease = float((gradient * direction).sum())
+                if not diagnostic['cg_converged'] or not np.isfinite(decrease) or decrease <= 0:
+                    break
+                objective = head_objective(x, labels, mass, theta, penalty)
+                for exponent in range(24):
+                    step = .5 ** exponent
+                    proposal = theta - step * direction
+                    value = head_objective(x, labels, mass, proposal, penalty)
+                    line_evaluations += 1
+                    if bool(torch.isfinite(value)) and bool(value <= objective - 1e-4 * step * decrease):
+                        theta = proposal
+                        accepted += 1
+                        break
+                else:
+                    break
+            maximum = float(head_gradient(x, labels, mass, theta, penalty).abs().max())
+        else:
+            maximum = float('inf')
+    converged = np.isfinite(maximum) and maximum <= grad_tol
+    if converged:
+        result = dict(theta=theta.detach(), inner_grad_max=maximum, inner_converged=True,
+                      inner_iterations=0, inner_polish_steps=0)
+    else:
+        result = solve_inner(centers, labels, mass, penalty, theta, max_iter, grad_tol,
+                             cg_max_iter=cg_max_iter)
+    result.update(inner_newton_steps=accepted, inner_newton_attempts=attempts,
+                  inner_newton_cg_iterations=cg_iterations, inner_newton_line_evaluations=line_evaluations,
+                  inner_lbfgs_fallback=not converged)
+    return result
+
+
 @torch.no_grad()
 def track_inner(centers, labels, mass, penalty, initial, steps=2, cg_steps=8, grad_tol=1e-7):
     x, theta = augmented(centers), initial.detach().clone()
@@ -237,13 +288,18 @@ def optimize_ce_assignment(z, q, assignment, penalty=3e-5, steps=300, lr=.01,
                            tracking_inner_steps=2, tracking_cg_steps=8, tracking_refresh=20,
                            feature_control='joint', initial_representatives=None, outer_indices=None,
                            node_weighting=False, node_weight_penalty=0., node_weight_lr=None,
-                           implicit_solver=None, implicit_warm_start=None):
+                           implicit_solver=None, implicit_warm_start=None,
+                           inner_method='lbfgs', inner_solver=None):
     if implicit_warm_start is None:
         implicit_warm_start = True if resume_state is None else resume_state['config'].get('implicit_warm_start', False)
     resume_config = {key: value for key, value in locals().copy().items()
                      if key not in ('z', 'q', 'assignment', 'steps', 'folder', 'checkpoint_steps',
                                     'resume_state', 'save_resume', 'log_every',
-                                    'initial_representatives', 'outer_indices', 'implicit_solver')}
+                                    'initial_representatives', 'outer_indices', 'implicit_solver', 'inner_solver')}
+    if inner_method not in ('lbfgs', 'newton_first'):
+        raise ValueError('Unknown exact inner solver')
+    if inner_method == 'lbfgs':
+        resume_config.pop('inner_method')
     if initial_representatives is not None:
         resume_config['initial_digest'] = array_digest(
             *(initial_representatives[key].detach().cpu().numpy() for key in ('centers', 'labels', 'mass')))
@@ -345,6 +401,7 @@ def optimize_ce_assignment(z, q, assignment, penalty=3e-5, steps=300, lr=.01,
     history, theta, best, dual = [], None, float('inf'), None
     vector = None
     start_step = 0
+    solve_student = inner_solver or (solve_inner_newton_first if inner_method == 'newton_first' else solve_inner)
     if resume_state is not None:
         saved_config = dict(resume_state['config'])
         saved_config.setdefault('implicit_warm_start', False)
@@ -418,16 +475,16 @@ def optimize_ce_assignment(z, q, assignment, penalty=3e-5, steps=300, lr=.01,
                    or step in checkpoints or step % tracking_refresh == 0)
         head_fallback = False
         if refresh:
-            fitted = solve_inner(centers, labels, mass, penalty, theta, inner_max_iter,
-                                 inner_tol, cg_max_iter=cg_max_iter)
+            fitted = solve_student(centers, labels, mass, penalty, theta, inner_max_iter,
+                                   inner_tol, cg_max_iter=cg_max_iter)
         else:
             fitted = track_inner(centers, labels, mass, penalty, theta,
                                  tracking_inner_steps, tracking_cg_steps, inner_tol)
             head_fallback = fitted.pop('tracking_failed')
             if head_fallback:
                 refresh = True
-                fitted = solve_inner(centers, labels, mass, penalty, theta, inner_max_iter,
-                                     inner_tol, cg_max_iter=cg_max_iter)
+                fitted = solve_student(centers, labels, mass, penalty, theta, inner_max_iter,
+                                       inner_tol, cg_max_iter=cg_max_iter)
         theta = fitted.pop('theta')
         after_inner = timestamp()
         value, outer_gradient = outer_value_gradient(outer_z, outer_q, theta, outer_chunk_size, full_features)
@@ -444,6 +501,9 @@ def optimize_ce_assignment(z, q, assignment, penalty=3e-5, steps=300, lr=.01,
                    effective_cells=float(1 / mass.square().sum()))
         row.update(assignment_seconds=after_assignment - tick, inner_seconds=after_inner - after_assignment,
                    outer_seconds=after_outer - after_inner, implicit_seconds=0., backward_seconds=0.)
+        if 'benchmark_lbfgs_seconds' in fitted:
+            row['inner_benchmark_seconds'] = row['inner_seconds']
+            row['inner_seconds'] = fitted['benchmark_lbfgs_seconds']
         objective = value
         if node_weighting:
             objective += node_weight_penalty * float(weight_kl.detach())
@@ -561,6 +621,7 @@ def optimize_ce_assignment(z, q, assignment, penalty=3e-5, steps=300, lr=.01,
                   assignment_encoder=assignment_encoder,
                   solver_mode=solver_mode, feature_control=feature_control,
                   implicit_warm_start=implicit_warm_start,
+                  inner_method=inner_method,
                   node_weighting=node_weighting, node_weight_penalty=node_weight_penalty,
                   assignment_parameters=sum(parameter.numel() for parameter in parameters))
     if folder is not None and save_assignment:
