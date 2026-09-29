@@ -15,6 +15,11 @@ teacher selection without sharing writable cache files. selected_teacher.json
 records gamma and a logit digest to verify agreement between sessions. No teacher
 variation is introduced across condensation seeds within a density.
 
+After gamma selection, teacher_calibration.json records a scalar temperature fit
+to validation CE over T in [0.01, 100]. It reports boundary status, CE before and
+after, and the invariant teacher accuracy. This is diagnostic only: the grid's
+inner/outer T values and teacher logits are unchanged. No test labels are used.
+
 Features are RMS-normalized S^2X for optimization, with the existing inverse scale
 used for synthetic GCN inputs. Low-rank corrections start from k-means assignments.
 Inner linear CE is cell-mass weighted; outer teacher CE is uniform over original

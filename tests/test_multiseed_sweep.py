@@ -1,7 +1,8 @@
 import pandas as pd
 import pytest
+import torch
 
-from src.multiseed_sweep import aggregate_search
+from src.multiseed_sweep import aggregate_search, calibrate_teacher_temperature
 
 
 def records():
@@ -34,3 +35,14 @@ def test_selection_uses_common_step():
     selected = table.sort_values(['val', 'step', 'candidate'], ascending=[False, True, True]).iloc[0]
     assert selected['candidate'] == 1
     assert selected['step'] == 100
+
+
+def test_temperature_calibration_preserves_accuracy():
+    logits = torch.tensor([[10., 0.]] * 8 + [[0., 10.]] * 2, dtype=torch.double)
+    labels = torch.zeros(10, dtype=torch.long)
+    result = calibrate_teacher_temperature(logits, labels)
+    assert result['validation_ce_after'] < result['validation_ce_before']
+    assert result['T_cal'] == pytest.approx(10 / 1.38629436112, rel=1e-4)
+    assert result['validation_accuracy'] == 80.
+    assert result['applied_to_sweep'] is False
+    assert torch.equal(logits.argmax(1), (logits / result['T_cal']).argmax(1))

@@ -17,6 +17,31 @@ from src.trajectory_clustering import save_state
 from src.utils import BUDGET
 
 
+@torch.no_grad()
+def calibrate_teacher_temperature(logits, labels, bounds=(.01, 100.)):
+    from scipy.optimize import minimize_scalar
+
+    lower, upper = bounds
+    if not 0 < lower <= 1 <= upper or lower == upper:
+        raise ValueError('Calibration bounds must bracket T=1')
+    logits = logits.detach().double()
+    def objective(log_t):
+        return float(torch.nn.functional.cross_entropy(logits / np.exp(log_t), labels))
+    result = minimize_scalar(objective, bounds=np.log(bounds), method='bounded', options={'xatol': 1e-7})
+    if not result.success:
+        raise RuntimeError('Teacher temperature calibration failed')
+    candidates = [0., float(result.x), float(np.log(lower)), float(np.log(upper))]
+    log_t = min(candidates, key=objective)
+    temperature = float(np.exp(log_t))
+    return dict(T_cal=temperature, validation_ce_before=objective(0.),
+                validation_ce_after=objective(log_t),
+                validation_accuracy=100 * float((logits.argmax(1) == labels).double().mean()),
+                lower_bound=lower, upper_bound=upper,
+                boundary='lower' if np.isclose(temperature, lower) else
+                         'upper' if np.isclose(temperature, upper) else 'interior',
+                applied_to_sweep=False)
+
+
 def aggregate_search(records, condensation_seeds, student_seeds):
     frame = pd.DataFrame(records)
     keys = ['candidate', 'T', 'rank', 'penalty', 'step']
@@ -79,6 +104,8 @@ def run_cora_multiseed(ratio, output_dir, space, gammas, steps=1000,
                                    basis, teacher_seed, root)
     save_json(dict(gamma=gamma, teacher_seed=teacher_seed,
                    logits_digest=array_digest(logits.cpu().numpy())), root / 'selected_teacher.json')
+    calibration = calibrate_teacher_temperature(logits[validation[1]], graph['y'][validation[1]])
+    save_json(dict(gamma=gamma, **calibration), root / 'teacher_calibration.json')
     inputs = root / 'inputs.pt'
     if inputs.exists():
         saved = torch.load(inputs, map_location=device, weights_only=False)
