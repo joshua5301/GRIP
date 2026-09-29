@@ -138,3 +138,113 @@ def run_node_weight_sweep(previous_run, output_dir, space, shard=0, shards=3, st
     write_table(result, root / 'summary.csv')
     write_table(baseline, root / 'baseline_curve.csv')
     return result, search, baseline, root
+
+
+def extend_node_weights(previous_run, steps=1000, checkpoint_steps=(400, 500, 750, 1000),
+                        data_dir='/content/data/', device='cuda'):
+    run = Path(previous_run)
+    choice = json.loads((run / 'selected.json').read_text())
+    part = run / f'shard_{int(choice["shard"])}'
+    config = json.loads((part / 'config.json').read_text())
+    prior, fixed, source = config['prior'], config['fixed'], Path(config['source'])
+    original = part / f'candidate_{int(choice["candidate"]):04d}'
+    params = json.loads((original / 'params.json').read_text())
+    checkpoints = sorted({steps, *checkpoint_steps})
+    if steps <= config['steps'] or any(not isinstance(s, int) or not config['steps'] < s <= steps for s in checkpoints):
+        raise ValueError('Extension checkpoints must follow the original budget')
+    folder = original / 'extended'
+    folder.mkdir(exist_ok=True)
+    torch.backends.cuda.matmul.allow_tf32 = False
+    torch.backends.cudnn.allow_tf32 = False
+    graph, train, validation, testing, unused = _prepare_dataset(prior['dataset'], data_dir, device)
+    del unused
+    adj = graph['adj']
+    digest = array_digest(*(t.cpu().numpy() for t in (
+        graph['x'], graph['y'], adj.crow_indices(), adj.col_indices(), adj.values(),
+        train, validation[1], testing[1])))
+    if digest != prior['data_digest']:
+        raise ValueError('Dataset differs from original experiment')
+    saved = torch.load(source / 'inputs.pt', map_location=device, weights_only=False)
+    z, assignment = saved['z'], saved['assignment']
+    transform = FeatureTransform(**saved['transform'])
+    del saved
+    teacher = torch.load(source / 'teacher.pt', map_location=device, weights_only=False)
+    q = (teacher['logits'] / fixed['T']).softmax(1).double()
+    gamma = teacher['gamma']
+    del teacher
+    resume = folder / 'resume.pt'
+    state = torch.load(resume if resume.exists() else original / 'resume.pt',
+                       map_location='cpu', weights_only=False)
+    if state['step'] > steps:
+        raise ValueError('Requested budget precedes saved state')
+    if state['step'] < steps:
+        result = optimize_ce_assignment(
+            z, q, assignment, penalty=fixed['penalty'], lr=fixed['assignment_lr'], steps=steps,
+            mixing=prior['mixing'], assignment_rank=fixed['rank'], factor_seed=prior['seed'],
+            folder=folder, checkpoint_steps=checkpoints, save_resume=True, save_assignment=False,
+            resume_state=state, node_weighting=True, **params, **prior['solver'])
+        del result
+    del state
+    save_json(dict(previous_run=str(run), choice=choice, steps=steps, checkpoint_steps=checkpoints),
+              folder / 'config.json')
+    masks = dict(train=train, val=validation[1], test=testing[1])
+    settings = dict(epochs=prior['epochs'], eval_every=prior['eval_every'], hidden=prior['hidden'],
+                    dropout=prior['dropout'], lr=prior['student_lr'], weight_decay=prior['weight_decay'])
+
+    def evaluate(parent, step, final=False):
+        snapshot = torch.load(parent / 'checkpoints' / f'step_{step:06d}.pt', map_location='cpu', weights_only=False)
+        cx, cy, mass = representative(snapshot['moments'], transform, z.shape[1], device)
+        cache = parent / ('final' if final else 'search') / f'step_{step:06d}'
+        if step == 0:
+            cache = part / ('initial_final' if final else 'initial_search')
+        seeds = prior['final_seeds'] if final else prior['search_seeds']
+        selected_masks = masks if final else {k: masks[k] for k in ('train', 'val')}
+        records = pd.DataFrame([fit_gcn_diagnostic(cx, cy, mass, graph, q, selected_masks, seed,
+                                folder=cache, **settings) for seed in seeds])
+        return records, snapshot
+
+    curve = pd.read_csv(run / 'search.csv')
+    curve = curve[curve.candidate == choice['candidate']].copy()
+    rows = curve.to_dict('records')
+    available = sorted(int(p.stem.split('_')[-1]) for p in (folder / 'checkpoints').glob('step_*.pt'))
+    for step in available:
+        if config['steps'] < step <= steps:
+            scores, snapshot = evaluate(folder, step)
+            rows.append(dict(candidate=int(choice['candidate']), shard=int(choice['shard']),
+                method='weighted_low_rank', step=step, **params, val=scores.val_acc.mean(),
+                val_std=scores.val_acc.std(ddof=0), outer_ce=snapshot['teacher_ce'],
+                **{k: snapshot[k] for k in ('weight_kl', 'node_ess_fraction', 'weight_min', 'weight_max')}))
+            write_table(pd.DataFrame(rows), folder / 'search.csv')
+    curve = pd.DataFrame(rows).sort_values('step')
+    selected = validation_choice(curve)
+    save_json(selected, folder / 'selected.json')
+    source_choice = json.loads((source / 'selected_low_rank.json').read_text())
+    baseline_folder = source / f'candidate_{int(source_choice["candidate"]):04d}'
+    baseline = pd.read_csv(source / 'search.csv')
+    baseline = baseline[baseline.candidate == source_choice['candidate']]
+    if (baseline_folder / 'extended' / 'search.csv').exists():
+        baseline = pd.concat([baseline, pd.read_csv(baseline_folder / 'extended' / 'search.csv')])
+    baseline = baseline[baseline.step <= steps].drop_duplicates('step').sort_values('step')
+    baseline_choice = validation_choice(baseline)
+    baseline_step = int(baseline_choice['step'])
+    targets = [('initial', original, 0, float(curve.iloc[0].val)),
+               ('weighted_previous', original, int(choice['step']), choice['val']),
+               ('weighted_selected', original if selected['step'] <= config['steps'] else folder,
+                int(selected['step']), selected['val']),
+               ('low_rank', baseline_folder if baseline_step <= prior['steps'] else baseline_folder / 'extended',
+                baseline_step, baseline_choice['val'])]
+    summaries = []
+    for method, parent, step, search_val in targets:
+        scores, snapshot = evaluate(parent, step, final=True)
+        summaries.append(dict(method=method, step=step, search_val=search_val,
+            gamma=gamma, T=fixed['T'], rank=fixed['rank'],
+            node_weight_penalty=params['node_weight_penalty'] if method.startswith('weighted') else 0.,
+            node_weight_lr=params['node_weight_lr'] if method.startswith('weighted') else 0.,
+            final_val=scores.val_acc.mean(), final_val_std=scores.val_acc.std(ddof=0),
+            test_mean=scores.test_acc.mean(), test_std=scores.test_acc.std(ddof=0),
+            node_ess_fraction=snapshot.get('node_ess_fraction', 1.), weight_max=snapshot.get('weight_max', 1.)))
+    result = pd.DataFrame(summaries)
+    write_table(result, folder / 'summary.csv')
+    write_table(curve, folder / 'search.csv')
+    write_table(baseline, folder / 'baseline_curve.csv')
+    return result, curve, baseline, folder

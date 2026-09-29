@@ -38,3 +38,10 @@ initialization, not from an already optimized low-rank checkpoint. Tests cover
 streamed derivatives against dense autograd, normalization, shift invariance,
 resume and saved-factor reconstruction. Run tests in Colab; local checks are
 limited to AST parsing and diff checks.
+
+`extend_node_weights(previous_run, steps=1000)` restores the original sweep winner's
+last Adam checkpoint with its node logits and low-rank factors. It does not rerun the
+grid. Outputs go to that candidate's `extended` directory. Original and new validation
+checkpoints compete for selection, while final student seeds remain disjoint. Existing
+unweighted extension results are reused up to the same budget; the returned baseline
+curve makes its available budget explicit. Repeating the call resumes saved state.
