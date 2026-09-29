@@ -628,3 +628,7 @@ See [linear metric condensation](docs/metric_clustering.md).
 accuracy, then compares dense, low-rank, one-layer and two-layer feature-based
 assignments with rank/width grids and shared initial moments. See
 [assignment family sweep](docs/assignment_family_sweep.md).
+
+Node-weighted low-rank assignments and a three-session matched sweep are documented
+in [docs/node_weights.md](docs/node_weights.md). The optional node weights preserve
+total mass while learning individual node contributions; outer CE stays uniform.

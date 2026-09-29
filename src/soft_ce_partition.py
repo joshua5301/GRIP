@@ -11,7 +11,8 @@ from tqdm.auto import trange
 
 from src.balanced_assignment import BalancedMoments, CachedBalancedMoments
 from src.low_rank_assignment import (LowRankLogits, LowRankMoments, assignment_inputs,
-                                     encode_nodes, initialize_encoder, initialize_factors, initialize_mlp)
+                                     encode_nodes, initialize_encoder, initialize_factors, initialize_mlp,
+                                     WeightedLowRankMoments, normalized_node_weights)
 from src.node_distances import array_digest
 from src.ntk_transforms import FeatureTransform
 from src.risk_experiment import _fingerprint, _prepare_dataset, _train_student
@@ -234,7 +235,8 @@ def optimize_ce_assignment(z, q, assignment, penalty=3e-5, steps=300, lr=.01,
                            assignment_input='node', assignment_encoder='linear', encoder_hidden=64,
                            resume_state=None, save_resume=False, solver_mode='exact',
                            tracking_inner_steps=2, tracking_cg_steps=8, tracking_refresh=20,
-                           feature_control='joint', initial_representatives=None, outer_indices=None):
+                           feature_control='joint', initial_representatives=None, outer_indices=None,
+                           node_weighting=False, node_weight_penalty=0., node_weight_lr=None):
     resume_config = {key: value for key, value in locals().copy().items()
                      if key not in ('z', 'q', 'assignment', 'steps', 'folder', 'checkpoint_steps',
                                     'resume_state', 'save_resume', 'log_every',
@@ -247,6 +249,15 @@ def optimize_ce_assignment(z, q, assignment, penalty=3e-5, steps=300, lr=.01,
     if resume_state is not None or save_resume:
         resume_config['data_digest'] = array_digest(z.detach().cpu().numpy(), q.detach().cpu().numpy(),
                                                     assignment.cpu().numpy())
+    if not node_weighting:
+        for key in ('node_weighting', 'node_weight_penalty', 'node_weight_lr'):
+            resume_config.pop(key)
+    if node_weighting and (assignment_rank is None or assignment_input != 'node'
+                          or feature_control != 'joint' or mass_mode != 'free'):
+        raise ValueError('Node weighting requires free-mass node-factor joint optimization')
+    if not np.isfinite(node_weight_penalty) or node_weight_penalty < 0 or (
+            node_weight_lr is not None and (not np.isfinite(node_weight_lr) or node_weight_lr < 0)):
+        raise ValueError('Invalid node weight penalty or learning rate')
     if steps < 0 or any(not np.isfinite(v) or v <= 0 for v in
                         (penalty, lr, chunk_size, inner_max_iter, inner_tol, cg_max_iter, cg_rtol)):
         raise ValueError('Require positive finite solver settings and nonnegative steps')
@@ -318,7 +329,13 @@ def optimize_ce_assignment(z, q, assignment, penalty=3e-5, steps=300, lr=.01,
         if feature_control == 'direct':
             free_centers = initial_centers.clone().requires_grad_()
             parameters = [free_centers]
-    optimizer = torch.optim.Adam(parameters, lr=lr, eps=1e-12, foreach=False)
+    if node_weighting:
+        node_logits = z.new_zeros(len(z), dtype=torch.float32).requires_grad_()
+        groups = [dict(params=parameters), dict(params=[node_logits], lr=lr if node_weight_lr is None else node_weight_lr)]
+        parameters = [*parameters, node_logits]
+    else:
+        groups = parameters
+    optimizer = torch.optim.Adam(groups, lr=lr, eps=1e-12, foreach=False)
     folder = Path(folder) if folder is not None else None
     if folder is not None:
         folder.mkdir(parents=True, exist_ok=True)
@@ -360,7 +377,10 @@ def optimize_ce_assignment(z, q, assignment, penalty=3e-5, steps=300, lr=.01,
         if assignment_input != 'node' and feature_control != 'direct':
             u = encode_nodes(inputs, encoder_parameters)
         balance = dict(balance_iterations=0, row_residual=np.nan, column_residual=np.nan)
-        if feature_control == 'direct':
+        if node_weighting:
+            node_weights, weight_kl = normalized_node_weights(node_logits)
+            moments = WeightedLowRankMoments.apply(u, v, node_weights, assignment, material, mixing, chunk_size)
+        elif feature_control == 'direct':
             moments = fixed_target_moments(free_centers, fixed_labels, fixed_mass)
         elif mass_mode == 'uniform':
             if assignment_rank is not None:
@@ -415,6 +435,13 @@ def optimize_ce_assignment(z, q, assignment, penalty=3e-5, steps=300, lr=.01,
                    effective_cells=float(1 / mass.square().sum()))
         row.update(assignment_seconds=after_assignment - tick, inner_seconds=after_inner - after_assignment,
                    outer_seconds=after_outer - after_inner, implicit_seconds=0., backward_seconds=0.)
+        objective = value
+        if node_weighting:
+            objective += node_weight_penalty * float(weight_kl.detach())
+            row.update(weight_kl=float(weight_kl.detach()), weight_min=float(node_weights.min().detach()),
+                       weight_max=float(node_weights.max().detach()), weight_mean=float(node_weights.mean().detach()),
+                       node_ess_fraction=float((1 / node_weights.square().mean()).detach()),
+                       objective=objective)
         failure = None
         if (refresh and not fitted['inner_converged']) or not np.isfinite(value):
             failure = 'Inner CE did not converge; increase inner_max_iter or inspect inner_tol'
@@ -422,8 +449,8 @@ def optimize_ce_assignment(z, q, assignment, penalty=3e-5, steps=300, lr=.01,
             if step == 0:
                 initial_moments = moments.detach().cpu()
                 scale = max(value, 1e-12)
-            if fitted['inner_converged'] and value < best:
-                best, best_step = value, step
+            if fitted['inner_converged'] and objective < best:
+                best, best_step = objective, step
                 best_moments, best_theta = moments.detach().cpu(), theta.cpu()
                 if save_assignment:
                     best_parameters = [parameter.detach().clone() for parameter in parameters]
@@ -464,6 +491,10 @@ def optimize_ce_assignment(z, q, assignment, penalty=3e-5, steps=300, lr=.01,
             snapshot = dict(step=step, moments=moments.detach().cpu().clone(),
                             theta=theta.cpu().clone(), teacher_ce=value, inner_grad_max=fitted['inner_grad_max'],
                             J_exact=fitted['inner_converged'])
+            if node_weighting:
+                snapshot.update(node_weight_logits=node_logits.detach().cpu().clone(),
+                                weight_kl=row['weight_kl'], node_ess_fraction=row['node_ess_fraction'],
+                                weight_min=row['weight_min'], weight_max=row['weight_max'])
             snapshots[step] = snapshot
             if folder is not None:
                 checkpoint_dir = folder / 'checkpoints'
@@ -488,7 +519,11 @@ def optimize_ce_assignment(z, q, assignment, penalty=3e-5, steps=300, lr=.01,
         if not bool(torch.isfinite(direction).all()):
             raise FloatingPointError('Nonfinite implicit gradient')
         try:
-            moments.backward(direction / scale)
+            if node_weighting:
+                torch.autograd.backward((moments, weight_kl),
+                                        (direction / scale, weight_kl.new_tensor(node_weight_penalty / scale)))
+            else:
+                moments.backward(direction / scale)
         except RuntimeError as error:
             row.update(status='failed', backward_seconds=timestamp() - backward_start)
             if folder is not None:
@@ -507,6 +542,7 @@ def optimize_ce_assignment(z, q, assignment, penalty=3e-5, steps=300, lr=.01,
                   assignment_input=assignment_input,
                   assignment_encoder=assignment_encoder,
                   solver_mode=solver_mode, feature_control=feature_control,
+                  node_weighting=node_weighting, node_weight_penalty=node_weight_penalty,
                   assignment_parameters=sum(parameter.numel() for parameter in parameters))
     if folder is not None and save_assignment:
         if feature_control != 'joint':
@@ -527,9 +563,12 @@ def optimize_ce_assignment(z, q, assignment, penalty=3e-5, steps=300, lr=.01,
                 saved['weight'] = best_parameters[0].cpu()
             torch.save(saved, folder / 'best_assignment_encoder.pt')
         else:
-            torch.save(dict(u=best_parameters[0].cpu(), v=best_parameters[1].cpu(),
+            saved = dict(u=best_parameters[0].cpu(), v=best_parameters[1].cpu(),
                             assignment=assignment.cpu(), mixing=mixing, rank=assignment_rank,
-                            factor_seed=factor_seed, step=best_step), folder / 'best_assignment_factors.pt')
+                            factor_seed=factor_seed, step=best_step)
+            if node_weighting:
+                saved['node_weight_logits'] = best_parameters[2].cpu()
+            torch.save(saved, folder / 'best_assignment_factors.pt')
         if best_dual is not None:
             torch.save(best_dual.cpu(), folder / 'best_assignment_column_dual.pt')
     return result

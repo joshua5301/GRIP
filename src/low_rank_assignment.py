@@ -108,3 +108,38 @@ class LowRankMoments(torch.autograd.Function):
             du[start:end] = block @ v
             dv += block.T @ u[start:end]
         return du, dv, None, None, None, None
+
+
+class WeightedLowRankMoments(torch.autograd.Function):
+    @staticmethod
+    def forward(ctx, u, v, weights, assignment, material, mixing, chunk_size):
+        ctx.save_for_backward(u, v, weights, assignment, material)
+        ctx.mixing, ctx.chunk_size = mixing, chunk_size
+        result = material.new_zeros(len(v), material.shape[1])
+        for start in range(0, len(u), chunk_size):
+            end = start + chunk_size
+            probability = logit_block(u[start:end], v, assignment[start:end], mixing).to(material.dtype).softmax(1)
+            result += probability.T @ (weights[start:end, None] * material[start:end]) / len(u)
+        return result
+
+    @staticmethod
+    def backward(ctx, gradient):
+        u, v, weights, assignment, material = ctx.saved_tensors
+        du, dv, dw = torch.empty_like(u), torch.zeros_like(v), torch.empty_like(weights)
+        scale = math.sqrt(u.shape[1])
+        for start in range(0, len(u), ctx.chunk_size):
+            end = start + ctx.chunk_size
+            probability = logit_block(u[start:end], v, assignment[start:end], ctx.mixing).to(material.dtype).softmax(1)
+            direction = material[start:end] @ gradient.T / len(u)
+            expectation = (probability * direction).sum(1, keepdim=True)
+            dw[start:end] = expectation[:, 0]
+            block = (weights[start:end, None] * probability * (direction - expectation)).to(u.dtype) / scale
+            du[start:end] = block @ v
+            dv += block.T @ u[start:end]
+        return du, dv, dw, None, None, None, None
+
+
+def normalized_node_weights(logits):
+    log_weights = logits.double().log_softmax(0) + math.log(len(logits))
+    weights = log_weights.exp()
+    return weights, (weights * log_weights).mean()
