@@ -347,7 +347,7 @@ def optimize_ce_assignment(z, q, assignment, penalty=3e-5, steps=300, lr=.01,
                            implicit_solver=None, implicit_warm_start=None,
                            inner_method='lbfgs', inner_solver=None, cg_check_interval=1,
                            cache_assignment=False, temperature_logits=None,
-                           temperature_initial=.3, temperature_lr=.003):
+                           temperature_initial=.3, temperature_lr=.003, outer_targets=None):
     if not isinstance(cg_check_interval, int) or cg_check_interval < 1:
         raise ValueError('cg_check_interval must be a positive integer')
     if cache_assignment and (assignment_rank is None or mass_mode != 'free' or node_weighting):
@@ -358,7 +358,13 @@ def optimize_ce_assignment(z, q, assignment, penalty=3e-5, steps=300, lr=.01,
                      if key not in ('z', 'q', 'assignment', 'steps', 'folder', 'checkpoint_steps',
                                     'resume_state', 'save_resume', 'log_every',
                                     'initial_representatives', 'outer_indices', 'implicit_solver', 'inner_solver',
-                                    'temperature_logits')}
+                                    'temperature_logits', 'outer_targets')}
+    if outer_targets is not None:
+        if (outer_targets.shape != q.shape or not bool(torch.isfinite(outer_targets).all())
+                or bool((outer_targets < 0).any())
+                or not torch.allclose(outer_targets.sum(1), torch.ones_like(outer_targets[:, 0]), atol=1e-6)):
+            raise ValueError('Outer targets must be node-aligned probability labels')
+        resume_config['outer_targets_digest'] = array_digest(outer_targets.detach().cpu().numpy())
     if temperature_logits is None:
         resume_config.pop('temperature_initial')
         resume_config.pop('temperature_lr')
@@ -426,7 +432,8 @@ def optimize_ce_assignment(z, q, assignment, penalty=3e-5, steps=300, lr=.01,
     snapshots = {}
     material = make_material(z, q)
     outer_z = z if outer_indices is None else z[outer_indices]
-    outer_q = (q if outer_indices is None else q[outer_indices]).detach()
+    outer_q = q if outer_targets is None else outer_targets.detach().to(q)
+    outer_q = (outer_q if outer_indices is None else outer_q[outer_indices]).detach()
     if not len(outer_z):
         raise ValueError('Outer loss requires at least one node')
     full_features = augmented(outer_z)
