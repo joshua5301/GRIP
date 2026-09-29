@@ -237,7 +237,9 @@ def optimize_ce_assignment(z, q, assignment, penalty=3e-5, steps=300, lr=.01,
                            tracking_inner_steps=2, tracking_cg_steps=8, tracking_refresh=20,
                            feature_control='joint', initial_representatives=None, outer_indices=None,
                            node_weighting=False, node_weight_penalty=0., node_weight_lr=None,
-                           implicit_solver=None):
+                           implicit_solver=None, implicit_warm_start=None):
+    if implicit_warm_start is None:
+        implicit_warm_start = True if resume_state is None else resume_state['config'].get('implicit_warm_start', False)
     resume_config = {key: value for key, value in locals().copy().items()
                      if key not in ('z', 'q', 'assignment', 'steps', 'folder', 'checkpoint_steps',
                                     'resume_state', 'save_resume', 'log_every',
@@ -344,7 +346,9 @@ def optimize_ce_assignment(z, q, assignment, penalty=3e-5, steps=300, lr=.01,
     vector = None
     start_step = 0
     if resume_state is not None:
-        if resume_state['config'] != resume_config or resume_state['step'] > steps:
+        saved_config = dict(resume_state['config'])
+        saved_config.setdefault('implicit_warm_start', False)
+        if saved_config != resume_config or resume_state['step'] > steps:
             raise ValueError('Resume state does not match data, solver settings or step budget')
         with torch.no_grad():
             for parameter, saved in zip(parameters, resume_state['parameters'], strict=True):
@@ -356,6 +360,9 @@ def optimize_ce_assignment(z, q, assignment, penalty=3e-5, steps=300, lr=.01,
             theta = resume_state['tracking_theta_before']
             theta = theta.to(z) if theta is not None else None
             vector = resume_state['tracking_vector_before']
+            vector = vector.to(z) if vector is not None else None
+        elif implicit_warm_start:
+            vector = resume_state.get('tracking_vector_before')
             vector = vector.to(z) if vector is not None else None
         dual = resume_state['dual'].to(z) if resume_state['dual'] is not None else None
         best, best_step = resume_state['best'], resume_state['best_step']
@@ -429,6 +436,7 @@ def optimize_ce_assignment(z, q, assignment, penalty=3e-5, steps=300, lr=.01,
                    cg_relative_residual=np.nan, cg_converged=False,
                    solver_mode=solver_mode, exact_refresh=refresh, head_fallback=head_fallback,
                    J_exact=fitted['inner_converged'], implicit_fallback=False,
+                   implicit_warm_start=False,
                    head_correction_relative=(float((theta - theta_before).norm() / theta.norm().clamp_min(1e-30))
                                              if theta_before is not None else np.nan),
                    implicit_correction_relative=np.nan,
@@ -459,9 +467,14 @@ def optimize_ce_assignment(z, q, assignment, penalty=3e-5, steps=300, lr=.01,
             if step < steps:
                 implicit_start = timestamp()
                 if refresh:
-                    solve = solve_head_system if implicit_solver is None else implicit_solver
-                    vector, diagnostic = solve(augmented(centers), labels, mass, theta, penalty,
-                                                outer_gradient, rtol=cg_rtol, max_iter=cg_max_iter)
+                    if implicit_solver is not None:
+                        vector, diagnostic = implicit_solver(augmented(centers), labels, mass, theta, penalty,
+                                                             outer_gradient, rtol=cg_rtol, max_iter=cg_max_iter)
+                    else:
+                        row['implicit_warm_start'] = implicit_warm_start and vector is not None
+                        vector, diagnostic = solve_head_system(augmented(centers), labels, mass, theta, penalty,
+                            outer_gradient, rtol=cg_rtol, max_iter=cg_max_iter,
+                            initial=vector if implicit_warm_start else None)
                 else:
                     multiply, diagonal = hessian_operator(augmented(centers), labels, mass, theta, penalty)
                     vector, diagnostic = conjugate_gradient(multiply, outer_gradient, diagonal,
@@ -547,6 +560,7 @@ def optimize_ce_assignment(z, q, assignment, penalty=3e-5, steps=300, lr=.01,
                   assignment_input=assignment_input,
                   assignment_encoder=assignment_encoder,
                   solver_mode=solver_mode, feature_control=feature_control,
+                  implicit_warm_start=implicit_warm_start,
                   node_weighting=node_weighting, node_weight_penalty=node_weight_penalty,
                   assignment_parameters=sum(parameter.numel() for parameter in parameters))
     if folder is not None and save_assignment:

@@ -23,3 +23,12 @@ speed. Inner Newton systems are unchanged.
 Completed timing windows are cached. Interrupted windows rerun from their original
 source checkpoint. Changing source resume metadata invalidates the timing cache.
 Numerical tests are provided for Colab; local validation uses syntax and diff checks.
+
+New optimization runs now default to warm-starting exact implicit solves from the
+previous solution, with unchanged residual tolerances. An explicit
+`implicit_warm_start=False` retains cold starts. The default `None` resolves to warm
+for new runs and the saved setting for resumed runs. Legacy checkpoints without
+this field remain cold, preventing silent solver changes in existing sweeps.
+The choice is stored in resume configuration and actual use is logged per step.
+The paired benchmark callback continues to control both starts independently and
+always returns its cold solution for updates.
