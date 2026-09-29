@@ -99,15 +99,18 @@ class LowRankMoments(torch.autograd.Function):
     def backward(ctx, gradient):
         u, v, assignment, material = ctx.saved_tensors
         du, dv = torch.empty_like(u), torch.zeros_like(v)
+        dm = torch.empty_like(material) if ctx.needs_input_grad[3] else None
         scale = math.sqrt(u.shape[1])
         for start in range(0, len(u), ctx.chunk_size):
             end = start + ctx.chunk_size
             probability = logit_block(u[start:end], v, assignment[start:end], ctx.mixing).to(material.dtype).softmax(1)
+            if dm is not None:
+                dm[start:end] = probability @ gradient / len(u)
             direction = material[start:end] @ gradient.T / len(u)
             block = (probability * (direction - (probability * direction).sum(1, keepdim=True))).to(u.dtype) / scale
             du[start:end] = block @ v
             dv += block.T @ u[start:end]
-        return du, dv, None, None, None, None
+        return du, dv, None, dm, None, None
 
 
 class CachedLowRankMoments(torch.autograd.Function):
@@ -128,15 +131,18 @@ class CachedLowRankMoments(torch.autograd.Function):
     def backward(ctx, gradient):
         u, v, material, probability = ctx.saved_tensors
         du, dv = torch.empty_like(u), torch.zeros_like(v)
+        dm = torch.empty_like(material) if ctx.needs_input_grad[3] else None
         scale = math.sqrt(u.shape[1])
         for start in range(0, len(u), ctx.chunk_size):
             end = start + ctx.chunk_size
             p = probability[start:end]
+            if dm is not None:
+                dm[start:end] = p @ gradient / len(u)
             direction = material[start:end] @ gradient.T / len(u)
             block = (p * (direction - (p * direction).sum(1, keepdim=True))).to(u.dtype) / scale
             du[start:end] = block @ v
             dv += block.T @ u[start:end]
-        return du, dv, None, None, None, None
+        return du, dv, None, dm, None, None
 
 
 class WeightedLowRankMoments(torch.autograd.Function):

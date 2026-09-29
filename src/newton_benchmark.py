@@ -4,13 +4,14 @@ import time
 from pathlib import Path
 
 import pandas as pd
+import numpy as np
 import torch
 
 from src.assignment_family_sweep import family_options
 from src.cmean_family_sweep import write_table
 from src.condensation_diagnostics import save_json
 from src.risk_experiment import _fingerprint
-from src.soft_ce_partition import optimize_ce_assignment, solve_inner, solve_inner_newton_first
+from src.soft_ce_partition import optimize_ce_assignment, solve_inner, solve_inner_newton_first, temperature_labels
 from src.soft_ridge_partition import augmented
 from src.stationarity_risk import head_objective
 
@@ -141,7 +142,7 @@ def compare_newton_performance(previous_run, output_dir, steps=1000,
                                checkpoint_steps=(0, 100, 300, 500, 750, 1000),
                                search_seeds=(0, 1, 2), final_seeds=tuple(range(100, 110)),
                                data_dir='/content/data/', device='cuda', compare_fast=False,
-                               cg_check_interval=8):
+                               cg_check_interval=8, temperature_lr=None):
     from src.assignment_sweep import representative
     from src.condensation_diagnostics import fit_gcn_diagnostic
     from src.node_distances import array_digest
@@ -164,6 +165,9 @@ def compare_newton_performance(previous_run, output_dir, steps=1000,
     methods = ('newton_first', 'newton_fast') if compare_fast else ('lbfgs', 'newton_first')
     if compare_fast:
         config.update(compare_fast=True, cg_check_interval=cg_check_interval)
+    if temperature_lr is not None:
+        methods = ('fixed_T', 'learned_T')
+        config.update(temperature_lr=temperature_lr, outer_T=params['T'], initial_T=params['T'])
     root = Path(output_dir) / _fingerprint(config)
     root.mkdir(parents=True, exist_ok=True)
     save_json(config, root / 'config.json')
@@ -182,7 +186,10 @@ def compare_newton_performance(previous_run, output_dir, steps=1000,
     transform = FeatureTransform(**saved['transform'])
     del saved
     teacher = torch.load(source / 'teacher.pt', map_location=device, weights_only=False)
-    q = (teacher['logits'] / params['T']).softmax(1).double()
+    teacher_logits = teacher['logits'].detach()
+    q = (teacher_logits / params['T']).softmax(1).double()
+    if temperature_lr is not None:
+        q = temperature_labels(teacher_logits, z.new_tensor(np.log(params['T']))).detach()
     del teacher
     masks = dict(train=train_mask, val=validation[1], test=testing[1])
     settings = dict(epochs=prior['epochs'], eval_every=prior['eval_every'], hidden=prior['hidden'],
@@ -196,15 +203,20 @@ def compare_newton_performance(previous_run, output_dir, steps=1000,
         if not complete.exists():
             resume = folder / 'resume.pt'
             state = torch.load(resume, map_location='cpu', weights_only=False) if resume.exists() else None
+            temperature_options = (dict(temperature_logits=teacher_logits,
+                temperature_initial=params['T'], temperature_lr=temperature_lr) if method == 'learned_T' else {})
+            fast = method == 'newton_fast' or (temperature_lr is not None and compare_fast)
             result = optimize_ce_assignment(z, q, assignment, penalty=params['penalty'],
                 lr=params['assignment_lr'], steps=steps, mixing=prior['mixing'], factor_seed=prior['seed'],
                 folder=folder, checkpoint_steps=checkpoints, resume_state=state, save_resume=True,
-                save_assignment=False, inner_method='newton_first' if compare_fast else method,
-                cg_check_interval=cg_check_interval if method == 'newton_fast' else 1,
-                cache_assignment=method == 'newton_fast', **family_options(params), **options)
+                save_assignment=False, inner_method='newton_first' if compare_fast or temperature_lr is not None else method,
+                cg_check_interval=cg_check_interval if fast else 1,
+                cache_assignment=fast, **temperature_options, **family_options(params), **options)
             save_json(dict(steps=steps), complete)
             del result, state
         history = pd.read_csv(folder / 'optimization.csv')
+        if temperature_lr is not None and method == 'fixed_T':
+            history['temperature'] = params['T']
         histories.append(history.assign(method=method))
         moments0 = torch.load(folder / 'checkpoints/step_000000.pt', map_location='cpu',
                               weights_only=False)['moments']
@@ -227,6 +239,8 @@ def compare_newton_performance(previous_run, output_dir, steps=1000,
             scores = evaluate(step, search_seeds)
             method_curve.append(dict(method=method, step=step, val=scores.val_acc.mean(),
                                      val_std=scores.val_acc.std(ddof=0)))
+            if temperature_lr is not None:
+                method_curve[-1]['temperature'] = float(history.loc[history.step == step, 'temperature'].iloc[0])
         curve = pd.DataFrame(method_curve)
         curves.extend(method_curve)
         selected = int(curve.sort_values(['val', 'step'], ascending=[False, True]).iloc[0].step)
@@ -240,6 +254,9 @@ def compare_newton_performance(previous_run, output_dir, steps=1000,
                 final_val=scores.val_acc.mean(), final_val_std=scores.val_acc.std(ddof=0),
                 test_mean=scores.test_acc.mean(), test_std=scores.test_acc.std(ddof=0),
                 update_seconds=update_time, condensation_seconds=float(history.seconds.iloc[-1])))
+            if temperature_lr is not None:
+                summaries[-1].update(temperature=float(history.loc[history.step == step, 'temperature'].iloc[0]),
+                                     outer_T=params['T'])
         write_table(pd.DataFrame(summaries), root / 'summary.csv')
         write_table(pd.DataFrame(curves), root / 'search.csv')
         write_table(pd.DataFrame(students), root / 'final_students.csv')

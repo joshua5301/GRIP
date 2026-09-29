@@ -328,6 +328,10 @@ def cpu_state(value):
     return value
 
 
+def temperature_labels(logits, log_temperature):
+    return (logits.detach() / log_temperature.exp().to(logits.dtype)).softmax(1).double()
+
+
 def optimize_ce_assignment(z, q, assignment, penalty=3e-5, steps=300, lr=.01,
                            mixing=.05, chunk_size=4096, inner_max_iter=2000,
                            inner_tol=1e-7, cg_max_iter=512, cg_rtol=1e-6,
@@ -342,7 +346,8 @@ def optimize_ce_assignment(z, q, assignment, penalty=3e-5, steps=300, lr=.01,
                            node_weighting=False, node_weight_penalty=0., node_weight_lr=None,
                            implicit_solver=None, implicit_warm_start=None,
                            inner_method='lbfgs', inner_solver=None, cg_check_interval=1,
-                           cache_assignment=False):
+                           cache_assignment=False, temperature_logits=None,
+                           temperature_initial=.3, temperature_lr=.003):
     if not isinstance(cg_check_interval, int) or cg_check_interval < 1:
         raise ValueError('cg_check_interval must be a positive integer')
     if cache_assignment and (assignment_rank is None or mass_mode != 'free' or node_weighting):
@@ -352,7 +357,20 @@ def optimize_ce_assignment(z, q, assignment, penalty=3e-5, steps=300, lr=.01,
     resume_config = {key: value for key, value in locals().copy().items()
                      if key not in ('z', 'q', 'assignment', 'steps', 'folder', 'checkpoint_steps',
                                     'resume_state', 'save_resume', 'log_every',
-                                    'initial_representatives', 'outer_indices', 'implicit_solver', 'inner_solver')}
+                                    'initial_representatives', 'outer_indices', 'implicit_solver', 'inner_solver',
+                                    'temperature_logits')}
+    if temperature_logits is None:
+        resume_config.pop('temperature_initial')
+        resume_config.pop('temperature_lr')
+    else:
+        if (assignment_rank is None or assignment_input != 'node' or mass_mode != 'free'
+                or feature_control != 'joint' or node_weighting or solver_mode != 'exact'):
+            raise ValueError('Learnable temperature requires exact, unweighted, free-mass node-factor optimization')
+        if (temperature_logits.shape != q.shape or not bool(torch.isfinite(temperature_logits).all())
+                or any(not np.isfinite(t) or t <= 0 for t in (temperature_initial, temperature_lr))):
+            raise ValueError('Invalid temperature logits or settings')
+        resume_config['temperature_logits_digest'] = array_digest(temperature_logits.detach().cpu().numpy())
+        temperature_logits = temperature_logits.detach().to(z.device)
     if inner_method not in ('lbfgs', 'newton_first'):
         raise ValueError('Unknown exact inner solver')
     if inner_method == 'lbfgs':
@@ -408,7 +426,7 @@ def optimize_ce_assignment(z, q, assignment, penalty=3e-5, steps=300, lr=.01,
     snapshots = {}
     material = make_material(z, q)
     outer_z = z if outer_indices is None else z[outer_indices]
-    outer_q = q if outer_indices is None else q[outer_indices]
+    outer_q = (q if outer_indices is None else q[outer_indices]).detach()
     if not len(outer_z):
         raise ValueError('Outer loss requires at least one node')
     full_features = augmented(outer_z)
@@ -455,6 +473,10 @@ def optimize_ce_assignment(z, q, assignment, penalty=3e-5, steps=300, lr=.01,
         parameters = [*parameters, node_logits]
     else:
         groups = parameters
+    if temperature_logits is not None:
+        log_temperature = z.new_tensor(np.log(temperature_initial)).requires_grad_()
+        groups = [dict(params=parameters), dict(params=[log_temperature], lr=temperature_lr)]
+        parameters = [*parameters, log_temperature]
     optimizer = torch.optim.Adam(groups, lr=lr, eps=1e-12, foreach=False)
     folder = Path(folder) if folder is not None else None
     if folder is not None:
@@ -502,6 +524,11 @@ def optimize_ce_assignment(z, q, assignment, penalty=3e-5, steps=300, lr=.01,
     for step in trange(start_step, steps + 1, desc='CE inner + CE outer'):
         tick = timestamp()
         optimizer.zero_grad(set_to_none=True)
+        if temperature_logits is not None:
+            temperature = float(log_temperature.detach().exp())
+            if not np.isfinite(temperature) or temperature <= 0:
+                raise FloatingPointError('Nonfinite or nonpositive learned temperature')
+            material = make_material(z, temperature_labels(temperature_logits, log_temperature))
         if assignment_input != 'node' and feature_control != 'direct':
             u = encode_nodes(inputs, encoder_parameters)
         balance = dict(balance_iterations=0, row_residual=np.nan, column_residual=np.nan)
@@ -565,6 +592,8 @@ def optimize_ce_assignment(z, q, assignment, penalty=3e-5, steps=300, lr=.01,
                    effective_cells=float(1 / mass.square().sum()))
         row.update(assignment_seconds=after_assignment - tick, inner_seconds=after_inner - after_assignment,
                    outer_seconds=after_outer - after_inner, implicit_seconds=0., backward_seconds=0.)
+        if temperature_logits is not None:
+            row['temperature'] = temperature
         if 'benchmark_lbfgs_seconds' in fitted:
             row['inner_benchmark_seconds'] = row['inner_seconds']
             row['inner_seconds'] = fitted['benchmark_lbfgs_seconds']
@@ -634,6 +663,8 @@ def optimize_ce_assignment(z, q, assignment, penalty=3e-5, steps=300, lr=.01,
             snapshot = dict(step=step, moments=moments.detach().cpu().clone(),
                             theta=theta.cpu().clone(), teacher_ce=value, inner_grad_max=fitted['inner_grad_max'],
                             J_exact=fitted['inner_converged'])
+            if temperature_logits is not None:
+                snapshot['temperature'] = temperature
             if node_weighting:
                 snapshot.update(node_weight_logits=node_logits.detach().cpu().clone(),
                                 weight_kl=row['weight_kl'], node_ess_fraction=row['node_ess_fraction'],
@@ -673,6 +704,10 @@ def optimize_ce_assignment(z, q, assignment, penalty=3e-5, steps=300, lr=.01,
                 pd.DataFrame(history).to_csv(folder / 'optimization.csv', index=False)
                 (folder / 'failure.json').write_text(json.dumps(dict(step=step, reason=str(error)), indent=2))
             raise
+        if temperature_logits is not None:
+            if log_temperature.grad is None or not bool(torch.isfinite(log_temperature.grad)):
+                raise FloatingPointError('Missing or nonfinite temperature gradient')
+            row['log_temperature_gradient'] = float(log_temperature.grad)
         optimizer.step()
         row['backward_seconds'] = timestamp() - backward_start
         row['seconds'] = elapsed + time.perf_counter() - started
@@ -713,6 +748,8 @@ def optimize_ce_assignment(z, q, assignment, penalty=3e-5, steps=300, lr=.01,
                             factor_seed=factor_seed, step=best_step)
             if node_weighting:
                 saved['node_weight_logits'] = best_parameters[2].cpu()
+            if temperature_logits is not None:
+                saved['temperature'] = float(best_parameters[-1].exp())
             torch.save(saved, folder / 'best_assignment_factors.pt')
         if best_dual is not None:
             torch.save(best_dual.cpu(), folder / 'best_assignment_column_dual.pt')
