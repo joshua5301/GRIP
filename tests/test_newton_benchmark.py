@@ -64,3 +64,15 @@ def test_newton_first_optimizer_resume(tmp_path):
     assert state['config']['inner_method'] == 'newton_first'
     resumed = optimize_ce_assignment(x, labels, assignment, steps=2, resume_state=state, **options)
     assert all(r['inner_converged'] for r in resumed['history'])
+
+
+def test_independent_solver_trajectories_start_identically():
+    x, labels, _ = problem()
+    assignment = torch.arange(len(x)) % 3
+    results = [optimize_ce_assignment(x, labels, assignment, steps=3, penalty=.2,
+        assignment_rank=2, factor_seed=7, inner_tol=1e-9, inner_method=method,
+        checkpoint_steps=(0, 3), save_assignment=False)
+        for method in ('lbfgs', 'newton_first')]
+    for result in results:
+        assert all(row['inner_converged'] for row in result['history'])
+    torch.testing.assert_close(results[0]['initial_moments'], results[1]['initial_moments'], atol=0, rtol=0)

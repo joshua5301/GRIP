@@ -135,3 +135,112 @@ def benchmark_newton_first(previous_run, output_dir, windows=('original', 'exten
     write_table(summary, root / 'summary.csv')
     write_table(timings, root / 'timings.csv')
     return summary, timings, root
+
+
+def compare_newton_performance(previous_run, output_dir, steps=1000,
+                               checkpoint_steps=(0, 100, 300, 500, 750, 1000),
+                               search_seeds=(0, 1, 2), final_seeds=tuple(range(100, 110)),
+                               data_dir='/content/data/', device='cuda'):
+    from src.assignment_sweep import representative
+    from src.condensation_diagnostics import fit_gcn_diagnostic
+    from src.node_distances import array_digest
+    from src.ntk_transforms import FeatureTransform
+    from src.risk_experiment import _prepare_dataset
+
+    checkpoints = sorted({0, steps, *checkpoint_steps})
+    if steps < 1 or any(s < 0 or s > steps for s in checkpoints) or not search_seeds or not final_seeds:
+        raise ValueError('Invalid comparison budget or evaluation seeds')
+    source = Path(previous_run)
+    prior = json.loads((source / 'config.json').read_text())
+    choice = json.loads((source / 'selected_low_rank.json').read_text())
+    candidate = source / f'candidate_{int(choice["candidate"]):04d}'
+    params = json.loads((candidate / 'params.json').read_text())
+    options = dict(prior['solver'], solver_mode='exact', implicit_warm_start=True)
+    options.pop('inner_method', None)
+    config = dict(source=str(source), prior=prior, params=params, steps=steps,
+                  checkpoints=checkpoints, search_seeds=list(search_seeds),
+                  final_seeds=list(final_seeds), solver=options, version=1)
+    root = Path(output_dir) / _fingerprint(config)
+    root.mkdir(parents=True, exist_ok=True)
+    save_json(config, root / 'config.json')
+    torch.backends.cuda.matmul.allow_tf32 = False
+    torch.backends.cudnn.allow_tf32 = False
+    graph, train_mask, validation, testing, unused = _prepare_dataset(prior['dataset'], data_dir, device)
+    del unused
+    adj = graph['adj']
+    digest = array_digest(*(t.cpu().numpy() for t in (
+        graph['x'], graph['y'], adj.crow_indices(), adj.col_indices(), adj.values(),
+        train_mask, validation[1], testing[1])))
+    if digest != prior['data_digest']:
+        raise ValueError('Dataset differs from the source experiment')
+    saved = torch.load(source / 'inputs.pt', map_location=device, weights_only=False)
+    z, assignment = saved['z'], saved['assignment']
+    transform = FeatureTransform(**saved['transform'])
+    del saved
+    teacher = torch.load(source / 'teacher.pt', map_location=device, weights_only=False)
+    q = (teacher['logits'] / params['T']).softmax(1).double()
+    del teacher
+    masks = dict(train=train_mask, val=validation[1], test=testing[1])
+    settings = dict(epochs=prior['epochs'], eval_every=prior['eval_every'], hidden=prior['hidden'],
+                    dropout=prior['dropout'], lr=prior['student_lr'], weight_decay=prior['weight_decay'])
+    summaries, curves, students, histories = [], [], [], []
+    initial = None
+    for method in ('lbfgs', 'newton_first'):
+        folder = root / method
+        folder.mkdir(exist_ok=True)
+        complete = folder / 'complete.json'
+        if not complete.exists():
+            resume = folder / 'resume.pt'
+            state = torch.load(resume, map_location='cpu', weights_only=False) if resume.exists() else None
+            result = optimize_ce_assignment(z, q, assignment, penalty=params['penalty'],
+                lr=params['assignment_lr'], steps=steps, mixing=prior['mixing'], factor_seed=prior['seed'],
+                folder=folder, checkpoint_steps=checkpoints, resume_state=state, save_resume=True,
+                save_assignment=False, inner_method=method, **family_options(params), **options)
+            save_json(dict(steps=steps), complete)
+            del result, state
+        history = pd.read_csv(folder / 'optimization.csv')
+        histories.append(history.assign(method=method))
+        moments0 = torch.load(folder / 'checkpoints/step_000000.pt', map_location='cpu',
+                              weights_only=False)['moments']
+        if initial is not None and not torch.equal(initial, moments0):
+            raise ValueError('Initial moments differ between solvers')
+        initial = moments0
+
+        def evaluate(step, seeds, final=False):
+            snapshot = torch.load(folder / 'checkpoints' / f'step_{step:06d}.pt',
+                                  map_location='cpu', weights_only=False)
+            cx, cy, mass = representative(snapshot['moments'], transform, z.shape[1], device)
+            cache = folder / ('final' if final else 'search') / f'step_{step:06d}'
+            scores = pd.DataFrame([fit_gcn_diagnostic(cx, cy, mass, graph, q,
+                masks if final else {k: masks[k] for k in ('train', 'val')}, seed,
+                folder=cache, **settings) for seed in seeds])
+            return scores
+
+        method_curve = []
+        for step in checkpoints:
+            scores = evaluate(step, search_seeds)
+            method_curve.append(dict(method=method, step=step, val=scores.val_acc.mean(),
+                                     val_std=scores.val_acc.std(ddof=0)))
+        curve = pd.DataFrame(method_curve)
+        curves.extend(method_curve)
+        selected = int(curve.sort_values(['val', 'step'], ascending=[False, True]).iloc[0].step)
+        update_time = history.loc[history.step < steps,
+            ['assignment_seconds', 'inner_seconds', 'outer_seconds', 'implicit_seconds', 'backward_seconds']].sum().sum()
+        for phase, step in [('initial', 0), ('fixed_budget', steps), ('selected', selected)]:
+            scores = evaluate(step, final_seeds, final=True)
+            students.extend(scores.assign(method=method, phase=phase, step=step).to_dict('records'))
+            summaries.append(dict(method=method, phase=phase, step=step,
+                search_val=float(curve.loc[curve.step == step, 'val'].iloc[0]),
+                final_val=scores.val_acc.mean(), final_val_std=scores.val_acc.std(ddof=0),
+                test_mean=scores.test_acc.mean(), test_std=scores.test_acc.std(ddof=0),
+                update_seconds=update_time, condensation_seconds=float(history.seconds.iloc[-1])))
+        write_table(pd.DataFrame(summaries), root / 'summary.csv')
+        write_table(pd.DataFrame(curves), root / 'search.csv')
+        write_table(pd.DataFrame(students), root / 'final_students.csv')
+    paired = pd.DataFrame(students).pivot(index=['phase', 'seed'], columns='method',
+                                        values=['val_acc', 'test_acc'])
+    differences = pd.DataFrame({key + '_delta_pp': paired[key]['newton_first'] - paired[key]['lbfgs']
+                               for key in ('val_acc', 'test_acc')}).reset_index()
+    write_table(differences, root / 'paired_differences.csv')
+    write_table(pd.concat(histories, ignore_index=True), root / 'optimization.csv')
+    return pd.DataFrame(summaries), pd.DataFrame(curves), differences, root

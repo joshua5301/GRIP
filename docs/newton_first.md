@@ -27,3 +27,18 @@ The reported total-step gain is an estimate, not a separate end-to-end Newton-fi
 training measurement. A faster solve with failed convergence is not an improvement.
 Completed timing windows are cached; interrupted windows restart from the source.
 Numerical tests are supplied for Colab, with only syntax/diff checks run locally.
+
+`compare_newton_performance` reruns the selected low-rank configuration from step
+zero with each inner solver independently. Both use implicit warm starts, identical
+cached inputs, initial factors, teacher labels and tolerances. Only the inner method
+differs. Original artifacts remain untouched. Each trajectory resumes from its own
+checkpoints and GCN evaluations are cached by seed.
+
+Report both the fixed 1000-step result and the checkpoint selected by three GCN
+validation seeds, then evaluate with ten separate paired seeds. GCN training uses
+two layers, identity synthetic adjacency and mass CE, matching the source. Test
+scores never choose checkpoints. The output includes per-seed differences and
+validation trajectories. Optimization timings exclude downstream GCN evaluation;
+the summed update times exclude checkpoint I/O, while condensation_seconds includes
+optimizer bookkeeping and most I/O. These sequential timings are not a repeated
+hardware benchmark. One condensation seed does not establish seed-wide equivalence.
