@@ -23,3 +23,18 @@ report this asymmetry rather than claiming equal tuning budgets. Independent
 condensation-seed repetitions remain a separate experiment.
 
 Local checks: syntax parsing and diff checks only; training is reserved for Colab.
+
+## Matched low-rank hyperparameter extension
+
+`run_low_rank_shard` reuses this sharded runner with joint feature/label/mass updates
+from a fixed-rank assignment. Node weights remain one; no weighted-node extension
+or implicit-solver benchmark is enabled. Teacher logits, features and initial
+assignments are loaded from the original family sweep. Each new candidate starts
+from the original initialization and resumes only its own checkpoint if interrupted.
+The output fingerprint separates low-rank and C-mean runs. Existing C-mean paths
+and optimizer configuration remain compatible.
+
+Suggested Arxiv rank-eight grid: T = [0.3, 0.5, 1.0], inner penalty = [1e-5, 3e-5,
+1e-4], assignment learning rate = [0.01, 0.03], 1000 steps. Eighteen candidates are
+split into six per session. Validation chooses both hyperparameters and checkpoint;
+only the final selected candidate receives test evaluation on disjoint student seeds.

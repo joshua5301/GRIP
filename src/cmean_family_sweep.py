@@ -34,15 +34,19 @@ def write_table(table, path):
 
 def run_cmean_shard(previous_run, output_dir, space, shard=0, shards=3, steps=1000,
                     checkpoint_steps=(0, 25, 50, 100, 200, 300, 500, 750, 1000),
-                    data_dir='/content/data/', device='cuda'):
+                    data_dir='/content/data/', device='cuda', method='C-mean', rank=8):
     assigned = shard_candidates(space, shard, shards)
     checkpoints = sorted({0, steps, *checkpoint_steps})
     if steps < 1 or any(not isinstance(s, int) or s < 0 or s > steps for s in checkpoints):
         raise ValueError('Invalid checkpoint budget')
     source = Path(previous_run)
     prior = json.loads((source / 'config.json').read_text())
+    if method not in ('C-mean', 'low_rank') or not isinstance(rank, int) or not 1 <= rank <= prior['cells']:
+        raise ValueError('Invalid matched control method or rank')
     config = dict(source=str(source), prior=prior, space=space, shards=shards,
                   steps=steps, checkpoint_steps=checkpoints, algorithm_version=1)
+    if method == 'low_rank':
+        config.update(method=method, rank=rank)
     root = Path(output_dir) / _fingerprint(config)
     root.mkdir(parents=True, exist_ok=True)
     shard_dir = root / f'shard_{shard}'
@@ -76,7 +80,7 @@ def run_cmean_shard(previous_run, output_dir, space, shard=0, shards=3, steps=10
                             folder=cache, **settings) for seed in seeds])
 
     rows = []
-    for index, params in tqdm(assigned, desc=f'C-mean shard {shard + 1}/{shards}'):
+    for index, params in tqdm(assigned, desc=f'{method} shard {shard + 1}/{shards}'):
         folder = shard_dir / f'candidate_{index:04d}'
         folder.mkdir(exist_ok=True)
         save_json(params, folder / 'params.json')
@@ -87,7 +91,8 @@ def run_cmean_shard(previous_run, output_dir, space, shard=0, shards=3, steps=10
             result = optimize_ce_assignment(
                 z, q, assignment, penalty=params['penalty'], lr=params['assignment_lr'], steps=steps,
                 mixing=prior['mixing'], folder=folder, checkpoint_steps=checkpoints,
-                assignment_rank=8, factor_seed=prior['seed'], feature_control='direct',
+                assignment_rank=rank if method == 'low_rank' else 8, factor_seed=prior['seed'],
+                feature_control='joint' if method == 'low_rank' else 'direct',
                 save_assignment=False, save_resume=True, resume_state=state, **prior['solver'])
             del result
         del state
@@ -96,7 +101,7 @@ def run_cmean_shard(previous_run, output_dir, space, shard=0, shards=3, steps=10
         if reference.exists():
             expected = torch.load(reference, map_location='cpu', weights_only=True)
             if not torch.allclose(initial['moments'], expected, atol=1e-10, rtol=1e-8):
-                raise ValueError('C-mean initialization differs from the source sweep')
+                raise ValueError('Initialization differs from the source sweep')
         for step in checkpoints:
             snapshot = torch.load(folder / 'checkpoints' / f'step_{step:06d}.pt',
                                   map_location='cpu', weights_only=False)
@@ -123,7 +128,7 @@ def run_cmean_shard(previous_run, output_dir, space, shard=0, shards=3, steps=10
     for phase, step in [('initial', 0), ('selected', int(choice['step']))]:
         snapshot = torch.load(folder / 'checkpoints' / f'step_{step:06d}.pt', map_location='cpu', weights_only=False)
         scores = evaluate(snapshot, q, prior['final_seeds'], folder / 'final' / f'step_{step:06d}', final=True)
-        summaries.append(dict(method='C-mean', phase=phase, step=step, dataset=prior['dataset'],
+        summaries.append(dict(method=method, phase=phase, step=step, dataset=prior['dataset'],
             ratio=prior['ratio'], nodes=prior['cells'], gamma=gamma, loss_weighting='mass',
             **{k: choice[k] for k in space}, final_val=scores.val_acc.mean(),
             final_val_std=scores.val_acc.std(ddof=0), test_mean=scores.test_acc.mean(),
@@ -132,3 +137,7 @@ def run_cmean_shard(previous_run, output_dir, space, shard=0, shards=3, steps=10
     result = pd.DataFrame(summaries)
     write_table(result, root / 'summary.csv')
     return result, search, root
+
+
+def run_low_rank_shard(previous_run, output_dir, space, rank=8, **kwargs):
+    return run_cmean_shard(previous_run, output_dir, space, method='low_rank', rank=rank, **kwargs)
