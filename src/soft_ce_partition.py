@@ -306,9 +306,11 @@ def outer_value_gradient(z, q, theta, chunk_size=4096, features=None):
     return float(value), gradient
 
 
-def implicit_moment_gradient(moments, dimension, theta, vector, penalty):
+def implicit_moment_gradient(moments, dimension, theta, vector, penalty, loss_weighting='mass'):
     variable = moments.detach().requires_grad_()
     centers, labels, mass = decode_moments(variable, dimension)
+    if loss_weighting == 'uniform':
+        mass = torch.full_like(mass, 1 / len(mass))
     gradient = head_gradient(augmented(centers), labels, mass, theta.detach(), penalty)
     result, = torch.autograd.grad(-(gradient * vector.detach()).sum(), variable)
     return result
@@ -347,7 +349,10 @@ def optimize_ce_assignment(z, q, assignment, penalty=3e-5, steps=300, lr=.01,
                            implicit_solver=None, implicit_warm_start=None,
                            inner_method='lbfgs', inner_solver=None, cg_check_interval=1,
                            cache_assignment=False, temperature_logits=None,
-                           temperature_initial=.3, temperature_lr=.003, outer_targets=None):
+                           temperature_initial=.3, temperature_lr=.003, outer_targets=None,
+                           inner_loss_weighting='mass'):
+    if inner_loss_weighting not in ('mass', 'uniform'):
+        raise ValueError('Unknown inner CE weighting')
     if not isinstance(cg_check_interval, int) or cg_check_interval < 1:
         raise ValueError('cg_check_interval must be a positive integer')
     if cache_assignment and (assignment_rank is None or mass_mode != 'free' or node_weighting):
@@ -359,6 +364,8 @@ def optimize_ce_assignment(z, q, assignment, penalty=3e-5, steps=300, lr=.01,
                                     'resume_state', 'save_resume', 'log_every',
                                     'initial_representatives', 'outer_indices', 'implicit_solver', 'inner_solver',
                                     'temperature_logits', 'outer_targets')}
+    if inner_loss_weighting == 'mass':
+        resume_config.pop('inner_loss_weighting')
     if outer_targets is not None:
         if (outer_targets.shape != q.shape or not bool(torch.isfinite(outer_targets).all())
                 or bool((outer_targets < 0).any())
@@ -567,21 +574,22 @@ def optimize_ce_assignment(z, q, assignment, penalty=3e-5, steps=300, lr=.01,
         if not bool(torch.isfinite(moments).all()) or bool((moments[:, 0] <= 0).any()):
             raise FloatingPointError('Nonfinite moments or empty soft cell')
         centers, labels, mass = decode_moments(moments.detach(), z.shape[1])
+        student_mass = torch.full_like(mass, 1 / len(mass)) if inner_loss_weighting == 'uniform' else mass
         after_assignment = timestamp()
         theta_before, vector_before = theta, vector
         refresh = (solver_mode == 'exact' or theta is None or step == steps
                    or step in checkpoints or step % tracking_refresh == 0)
         head_fallback = False
         if refresh:
-            fitted = solve_student(centers, labels, mass, penalty, theta, inner_max_iter,
+            fitted = solve_student(centers, labels, student_mass, penalty, theta, inner_max_iter,
                                    inner_tol, cg_max_iter=cg_max_iter)
         else:
-            fitted = track_inner(centers, labels, mass, penalty, theta,
+            fitted = track_inner(centers, labels, student_mass, penalty, theta,
                                  tracking_inner_steps, tracking_cg_steps, inner_tol)
             head_fallback = fitted.pop('tracking_failed')
             if head_fallback:
                 refresh = True
-                fitted = solve_student(centers, labels, mass, penalty, theta, inner_max_iter,
+                fitted = solve_student(centers, labels, student_mass, penalty, theta, inner_max_iter,
                                        inner_tol, cg_max_iter=cg_max_iter)
         theta = fitted.pop('theta')
         after_inner = timestamp()
@@ -628,22 +636,22 @@ def optimize_ce_assignment(z, q, assignment, penalty=3e-5, steps=300, lr=.01,
                 implicit_start = timestamp()
                 if refresh:
                     if implicit_solver is not None:
-                        vector, diagnostic = implicit_solver(augmented(centers), labels, mass, theta, penalty,
+                        vector, diagnostic = implicit_solver(augmented(centers), labels, student_mass, theta, penalty,
                                                              outer_gradient, rtol=cg_rtol, max_iter=cg_max_iter)
                     else:
                         row['implicit_warm_start'] = implicit_warm_start and vector is not None
-                        vector, diagnostic = solve_head_system(augmented(centers), labels, mass, theta, penalty,
+                        vector, diagnostic = solve_head_system(augmented(centers), labels, student_mass, theta, penalty,
                             outer_gradient, rtol=cg_rtol, max_iter=cg_max_iter,
                             initial=vector if implicit_warm_start else None, cg_check_interval=cg_check_interval)
                 else:
-                    multiply, diagonal = hessian_operator(augmented(centers), labels, mass, theta, penalty)
+                    multiply, diagonal = hessian_operator(augmented(centers), labels, student_mass, theta, penalty)
                     vector, diagnostic = conjugate_gradient(multiply, outer_gradient, diagonal,
                                                               rtol=cg_rtol, max_iter=tracking_cg_steps,
                                                               initial=vector, check_interval=cg_check_interval)
                     diagnostic.update(hessian_solver='tracking_pcg', hessian_reduced_dimension=0)
                     if not bool(torch.isfinite(vector).all()) or not np.isfinite(diagnostic['cg_residual']):
                         row['implicit_fallback'] = True
-                        vector, diagnostic = solve_head_system(augmented(centers), labels, mass, theta, penalty,
+                        vector, diagnostic = solve_head_system(augmented(centers), labels, student_mass, theta, penalty,
                                                                 outer_gradient, rtol=cg_rtol, max_iter=cg_max_iter,
                                                                 cg_check_interval=cg_check_interval)
                 row.update(diagnostic)
@@ -696,7 +704,7 @@ def optimize_ce_assignment(z, q, assignment, penalty=3e-5, steps=300, lr=.01,
         if step == steps:
             break
         backward_start = timestamp()
-        direction = implicit_moment_gradient(moments, z.shape[1], theta, vector, penalty)
+        direction = implicit_moment_gradient(moments, z.shape[1], theta, vector, penalty, inner_loss_weighting)
         if not bool(torch.isfinite(direction).all()):
             raise FloatingPointError('Nonfinite implicit gradient')
         try:
@@ -729,6 +737,7 @@ def optimize_ce_assignment(z, q, assignment, penalty=3e-5, steps=300, lr=.01,
                   solver_mode=solver_mode, feature_control=feature_control,
                   implicit_warm_start=implicit_warm_start,
                   inner_method=inner_method,
+                  inner_loss_weighting=inner_loss_weighting,
                   node_weighting=node_weighting, node_weight_penalty=node_weight_penalty,
                   assignment_parameters=sum(parameter.numel() for parameter in parameters))
     if folder is not None and save_assignment:

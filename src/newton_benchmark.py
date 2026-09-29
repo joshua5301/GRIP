@@ -142,12 +142,15 @@ def compare_newton_performance(previous_run, output_dir, steps=1000,
                                checkpoint_steps=(0, 100, 300, 500, 750, 1000),
                                search_seeds=(0, 1, 2), final_seeds=tuple(range(100, 110)),
                                data_dir='/content/data/', device='cuda', compare_fast=False,
-                               cg_check_interval=8, temperature_lr=None):
+                               cg_check_interval=8, temperature_lr=None, compare_uniform=False):
     from src.assignment_sweep import representative
     from src.condensation_diagnostics import fit_gcn_diagnostic
     from src.node_distances import array_digest
     from src.ntk_transforms import FeatureTransform
     from src.risk_experiment import _prepare_dataset
+
+    if compare_uniform and temperature_lr is not None:
+        raise ValueError('Compare loss weighting with fixed temperatures')
 
     checkpoints = sorted({0, steps, *checkpoint_steps})
     if steps < 1 or any(s < 0 or s > steps for s in checkpoints) or not search_seeds or not final_seeds:
@@ -168,6 +171,9 @@ def compare_newton_performance(previous_run, output_dir, steps=1000,
     if temperature_lr is not None:
         methods = ('fixed_T', 'learned_T')
         config.update(temperature_lr=temperature_lr, outer_T=params['T'], initial_T=params['T'])
+    if compare_uniform:
+        methods = ('mass_CE', 'uniform_CE')
+        config['compare_uniform'] = True
     root = Path(output_dir) / _fingerprint(config)
     root.mkdir(parents=True, exist_ok=True)
     save_json(config, root / 'config.json')
@@ -197,6 +203,7 @@ def compare_newton_performance(previous_run, output_dir, steps=1000,
     summaries, curves, students, histories = [], [], [], []
     initial = None
     for method in methods:
+        weighting = 'uniform' if method == 'uniform_CE' else 'mass'
         folder = root / method
         folder.mkdir(exist_ok=True)
         complete = folder / 'complete.json'
@@ -205,11 +212,12 @@ def compare_newton_performance(previous_run, output_dir, steps=1000,
             state = torch.load(resume, map_location='cpu', weights_only=False) if resume.exists() else None
             temperature_options = (dict(temperature_logits=teacher_logits,
                 temperature_initial=params['T'], temperature_lr=temperature_lr) if method == 'learned_T' else {})
-            fast = method == 'newton_fast' or (temperature_lr is not None and compare_fast)
+            fast = method == 'newton_fast' or ((temperature_lr is not None or compare_uniform) and compare_fast)
             result = optimize_ce_assignment(z, q, assignment, penalty=params['penalty'],
                 lr=params['assignment_lr'], steps=steps, mixing=prior['mixing'], factor_seed=prior['seed'],
                 folder=folder, checkpoint_steps=checkpoints, resume_state=state, save_resume=True,
-                save_assignment=False, inner_method='newton_first' if compare_fast or temperature_lr is not None else method,
+                save_assignment=False, inner_method='newton_first' if compare_fast or temperature_lr is not None or compare_uniform else method,
+                inner_loss_weighting=weighting,
                 cg_check_interval=cg_check_interval if fast else 1,
                 cache_assignment=fast, **temperature_options, **family_options(params), **options)
             save_json(dict(steps=steps), complete)
@@ -228,6 +236,8 @@ def compare_newton_performance(previous_run, output_dir, steps=1000,
             snapshot = torch.load(folder / 'checkpoints' / f'step_{step:06d}.pt',
                                   map_location='cpu', weights_only=False)
             cx, cy, mass = representative(snapshot['moments'], transform, z.shape[1], device)
+            if weighting == 'uniform':
+                mass = torch.full_like(mass, 1 / len(mass))
             cache = folder / ('final' if final else 'search') / f'step_{step:06d}'
             scores = pd.DataFrame([fit_gcn_diagnostic(cx, cy, mass, graph, q,
                 masks if final else {k: masks[k] for k in ('train', 'val')}, seed,
@@ -250,6 +260,7 @@ def compare_newton_performance(previous_run, output_dir, steps=1000,
             scores = evaluate(step, final_seeds, final=True)
             students.extend(scores.assign(method=method, phase=phase, step=step).to_dict('records'))
             summaries.append(dict(method=method, phase=phase, step=step,
+                inner_loss_weighting=weighting, gcn_loss_weighting=weighting,
                 search_val=float(curve.loc[curve.step == step, 'val'].iloc[0]),
                 final_val=scores.val_acc.mean(), final_val_std=scores.val_acc.std(ddof=0),
                 test_mean=scores.test_acc.mean(), test_std=scores.test_acc.std(ddof=0),
