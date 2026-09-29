@@ -75,14 +75,14 @@ def conjugate_gradient(multiply, rhs, diagonal, rtol=1e-6, atol=1e-12, max_iter=
 
 @torch.no_grad()
 def solve_head_system(x, labels, mass, theta, penalty, rhs, rtol=1e-6, atol=1e-12,
-                      max_iter=512, reduced_limit=2048, direct_limit=8192):
+                      max_iter=512, reduced_limit=2048, direct_limit=8192, initial=None):
     multiply, diagonal = hessian_operator(x, labels, mass, theta, penalty)
     classes = theta.shape[0]
     dimension = min(x.shape) * classes
     diagnostic = dict(cg_iterations=0)
     if not (x.shape[1] > 2 * x.shape[0] and dimension <= reduced_limit):
         solution, diagnostic = conjugate_gradient(multiply, rhs, diagonal, rtol=rtol,
-                                                   atol=atol, max_iter=max_iter)
+                                                   atol=atol, max_iter=max_iter, initial=initial)
         diagnostic.update(hessian_solver='pcg', hessian_reduced_dimension=0)
         if diagnostic['cg_converged']:
             return solution, diagnostic
@@ -236,11 +236,12 @@ def optimize_ce_assignment(z, q, assignment, penalty=3e-5, steps=300, lr=.01,
                            resume_state=None, save_resume=False, solver_mode='exact',
                            tracking_inner_steps=2, tracking_cg_steps=8, tracking_refresh=20,
                            feature_control='joint', initial_representatives=None, outer_indices=None,
-                           node_weighting=False, node_weight_penalty=0., node_weight_lr=None):
+                           node_weighting=False, node_weight_penalty=0., node_weight_lr=None,
+                           implicit_solver=None):
     resume_config = {key: value for key, value in locals().copy().items()
                      if key not in ('z', 'q', 'assignment', 'steps', 'folder', 'checkpoint_steps',
                                     'resume_state', 'save_resume', 'log_every',
-                                    'initial_representatives', 'outer_indices')}
+                                    'initial_representatives', 'outer_indices', 'implicit_solver')}
     if initial_representatives is not None:
         resume_config['initial_digest'] = array_digest(
             *(initial_representatives[key].detach().cpu().numpy() for key in ('centers', 'labels', 'mass')))
@@ -458,8 +459,9 @@ def optimize_ce_assignment(z, q, assignment, penalty=3e-5, steps=300, lr=.01,
             if step < steps:
                 implicit_start = timestamp()
                 if refresh:
-                    vector, diagnostic = solve_head_system(augmented(centers), labels, mass, theta, penalty,
-                                                            outer_gradient, rtol=cg_rtol, max_iter=cg_max_iter)
+                    solve = solve_head_system if implicit_solver is None else implicit_solver
+                    vector, diagnostic = solve(augmented(centers), labels, mass, theta, penalty,
+                                                outer_gradient, rtol=cg_rtol, max_iter=cg_max_iter)
                 else:
                     multiply, diagonal = hessian_operator(augmented(centers), labels, mass, theta, penalty)
                     vector, diagnostic = conjugate_gradient(multiply, outer_gradient, diagonal,
@@ -472,6 +474,9 @@ def optimize_ce_assignment(z, q, assignment, penalty=3e-5, steps=300, lr=.01,
                                                                 outer_gradient, rtol=cg_rtol, max_iter=cg_max_iter)
                 row.update(diagnostic)
                 row['implicit_seconds'] = timestamp() - implicit_start
+                if 'benchmark_cold_seconds' in diagnostic:
+                    row['implicit_benchmark_seconds'] = row['implicit_seconds']
+                    row['implicit_seconds'] = diagnostic['benchmark_cold_seconds']
                 if vector_before is not None:
                     row['implicit_correction_relative'] = float(
                         (vector - vector_before).norm() / vector.norm().clamp_min(1e-30))
