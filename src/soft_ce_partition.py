@@ -1,6 +1,7 @@
 import json
 import subprocess
 import time
+from functools import partial
 from pathlib import Path
 
 import numpy as np
@@ -12,7 +13,7 @@ from tqdm.auto import trange
 from src.balanced_assignment import BalancedMoments, CachedBalancedMoments
 from src.low_rank_assignment import (LowRankLogits, LowRankMoments, assignment_inputs,
                                      encode_nodes, initialize_encoder, initialize_factors, initialize_mlp,
-                                     WeightedLowRankMoments, normalized_node_weights)
+                                     WeightedLowRankMoments, CachedLowRankMoments, normalized_node_weights)
 from src.node_distances import array_digest
 from src.ntk_transforms import FeatureTransform
 from src.risk_experiment import _fingerprint, _prepare_dataset, _train_student
@@ -41,7 +42,10 @@ def hessian_operator(x, labels, mass, theta, penalty):
 
 @torch.no_grad()
 def conjugate_gradient(multiply, rhs, diagonal, rtol=1e-6, atol=1e-12, max_iter=512, initial=None,
-                       restart_interval=50):
+                       restart_interval=50, check_interval=1):
+    if check_interval > 1:
+        return grouped_conjugate_gradient(multiply, rhs, diagonal, rtol, atol, max_iter,
+                                          initial, restart_interval, check_interval)
     solution = torch.zeros_like(rhs) if initial is None else initial.detach().clone()
     residual = rhs.clone() if initial is None else rhs - multiply(solution)
     norm = float(rhs.norm())
@@ -74,15 +78,63 @@ def conjugate_gradient(multiply, rhs, diagonal, rtol=1e-6, atol=1e-12, max_iter=
 
 
 @torch.no_grad()
+def grouped_conjugate_gradient(multiply, rhs, diagonal, rtol, atol, max_iter,
+                               initial, restart_interval, check_interval):
+    solution = torch.zeros_like(rhs) if initial is None else initial.detach().clone()
+    residual = rhs - multiply(solution)
+    norm = float(rhs.norm())
+    target = max(atol, rtol * norm)
+    direction = residual / diagonal
+    product = (residual * direction).sum()
+    iterations = 0
+    broken = rhs.new_tensor(False, dtype=torch.bool)
+    residual_norm = float(residual.norm())
+    while iterations < max_iter and residual_norm > target and np.isfinite(residual_norm):
+        for _ in range(min(check_interval, max_iter - iterations)):
+            active = (residual.norm() > target) & ~broken
+            image = multiply(direction)
+            curvature = (direction * image).sum()
+            valid = torch.isfinite(curvature) & (curvature > 0) & torch.isfinite(product) & (product > 0)
+            broken = broken | (active & ~valid)
+            take = active & valid
+            alpha = torch.where(take, product / torch.where(valid, curvature, torch.ones_like(curvature)), 0.)
+            solution.add_(torch.where(take, alpha * direction, torch.zeros_like(direction)))
+            residual.sub_(torch.where(take, alpha * image, torch.zeros_like(image)))
+            iterations += 1
+            if iterations % restart_interval == 0:
+                residual = rhs - multiply(solution)
+                direction = residual / diagonal
+                product = (residual * direction).sum()
+            else:
+                preconditioned = residual / diagonal
+                next_product = (residual * preconditioned).sum()
+                beta = torch.where(take, next_product / torch.where(valid, product, torch.ones_like(product)), 0.)
+                direction = preconditioned + beta * direction
+                product = next_product
+        residual_norm = float(residual.norm())
+        if bool(broken):
+            break
+        if residual_norm <= target:
+            residual = rhs - multiply(solution)
+            residual_norm = float(residual.norm())
+            direction = residual / diagonal
+            product = (residual * direction).sum()
+    residual_norm = float((rhs - multiply(solution)).norm())
+    return solution, dict(cg_iterations=iterations, cg_residual=residual_norm,
+                          cg_relative_residual=residual_norm / max(norm, 1e-30),
+                          cg_converged=np.isfinite(residual_norm) and residual_norm <= target)
+
+
+@torch.no_grad()
 def solve_head_system(x, labels, mass, theta, penalty, rhs, rtol=1e-6, atol=1e-12,
-                      max_iter=512, reduced_limit=2048, direct_limit=8192, initial=None):
+                      max_iter=512, reduced_limit=2048, direct_limit=8192, initial=None, cg_check_interval=1):
     multiply, diagonal = hessian_operator(x, labels, mass, theta, penalty)
     classes = theta.shape[0]
     dimension = min(x.shape) * classes
     diagnostic = dict(cg_iterations=0)
     if not (x.shape[1] > 2 * x.shape[0] and dimension <= reduced_limit):
         solution, diagnostic = conjugate_gradient(multiply, rhs, diagonal, rtol=rtol,
-                                                   atol=atol, max_iter=max_iter, initial=initial)
+                                                   atol=atol, max_iter=max_iter, initial=initial, check_interval=cg_check_interval)
         diagnostic.update(hessian_solver='pcg', hessian_reduced_dimension=0)
         if diagnostic['cg_converged']:
             return solution, diagnostic
@@ -90,7 +142,7 @@ def solve_head_system(x, labels, mass, theta, penalty, rhs, rtol=1e-6, atol=1e-1
         solution, retry = conjugate_gradient(multiply, rhs, diagonal, rtol=rtol,
                                               atol=atol, max_iter=4 * max_iter,
                                               initial=solution if bool(torch.isfinite(solution).all()) else None,
-                                              restart_interval=512)
+                                              restart_interval=512, check_interval=cg_check_interval)
         retry.update(hessian_solver='pcg_extended', hessian_reduced_dimension=0,
                      cg_iterations=diagnostic['cg_iterations'] + retry['cg_iterations'])
         if retry['cg_converged'] or dimension > direct_limit:
@@ -121,7 +173,7 @@ def solve_head_system(x, labels, mass, theta, penalty, rhs, rtol=1e-6, atol=1e-1
 
 
 def solve_inner(centers, labels, mass, penalty, initial=None, max_iter=2000, grad_tol=1e-7,
-                polish_steps=8, cg_max_iter=512):
+                polish_steps=8, cg_max_iter=512, cg_check_interval=1):
     fitted = fit_head(centers.detach(), labels.detach(), mass.detach(), penalty,
                       max_iter=max_iter, grad_tol=grad_tol, initial_theta=initial)
     theta = fitted['theta']
@@ -134,7 +186,7 @@ def solve_inner(centers, labels, mass, penalty, initial=None, max_iter=2000, gra
             if float(gradient.abs().max()) <= grad_tol:
                 break
             direction, diagnostic = solve_head_system(x, labels, mass, theta, penalty, gradient,
-                                                       rtol=1e-8, atol=1e-14, max_iter=cg_max_iter)
+                                                       rtol=1e-8, atol=1e-14, max_iter=cg_max_iter, cg_check_interval=cg_check_interval)
             if not diagnostic['cg_converged']:
                 break
             objective = head_objective(x, labels, mass, theta, penalty)
@@ -158,7 +210,7 @@ def solve_inner(centers, labels, mass, penalty, initial=None, max_iter=2000, gra
 
 
 def solve_inner_newton_first(centers, labels, mass, penalty, initial=None, max_iter=2000,
-                             grad_tol=1e-7, cg_max_iter=512, newton_steps=8):
+                             grad_tol=1e-7, cg_max_iter=512, newton_steps=8, cg_check_interval=1):
     if newton_steps < 0:
         raise ValueError('Newton budget must be nonnegative')
     theta = initial.detach().to(centers).clone() if initial is not None else None
@@ -175,7 +227,7 @@ def solve_inner_newton_first(centers, labels, mass, penalty, initial=None, max_i
                 tolerance = min(.1, max(1e-4, maximum ** .5))
                 direction, diagnostic = solve_head_system(
                     x, labels, mass, theta, penalty, gradient, rtol=tolerance,
-                    atol=1e-14, max_iter=cg_max_iter)
+                    atol=1e-14, max_iter=cg_max_iter, cg_check_interval=cg_check_interval)
                 cg_iterations += diagnostic['cg_iterations']
                 decrease = float((gradient * direction).sum())
                 if not diagnostic['cg_converged'] or not np.isfinite(decrease) or decrease <= 0:
@@ -201,7 +253,7 @@ def solve_inner_newton_first(centers, labels, mass, penalty, initial=None, max_i
                       inner_iterations=0, inner_polish_steps=0)
     else:
         result = solve_inner(centers, labels, mass, penalty, theta, max_iter, grad_tol,
-                             cg_max_iter=cg_max_iter)
+                             cg_max_iter=cg_max_iter, cg_check_interval=cg_check_interval)
     result.update(inner_newton_steps=accepted, inner_newton_attempts=attempts,
                   inner_newton_cg_iterations=cg_iterations, inner_newton_line_evaluations=line_evaluations,
                   inner_lbfgs_fallback=not converged)
@@ -289,7 +341,12 @@ def optimize_ce_assignment(z, q, assignment, penalty=3e-5, steps=300, lr=.01,
                            feature_control='joint', initial_representatives=None, outer_indices=None,
                            node_weighting=False, node_weight_penalty=0., node_weight_lr=None,
                            implicit_solver=None, implicit_warm_start=None,
-                           inner_method='lbfgs', inner_solver=None):
+                           inner_method='lbfgs', inner_solver=None, cg_check_interval=1,
+                           cache_assignment=False):
+    if not isinstance(cg_check_interval, int) or cg_check_interval < 1:
+        raise ValueError('cg_check_interval must be a positive integer')
+    if cache_assignment and (assignment_rank is None or mass_mode != 'free' or node_weighting):
+        raise ValueError('Assignment caching requires unweighted free-mass low-rank assignments')
     if implicit_warm_start is None:
         implicit_warm_start = True if resume_state is None else resume_state['config'].get('implicit_warm_start', False)
     resume_config = {key: value for key, value in locals().copy().items()
@@ -300,6 +357,10 @@ def optimize_ce_assignment(z, q, assignment, penalty=3e-5, steps=300, lr=.01,
         raise ValueError('Unknown exact inner solver')
     if inner_method == 'lbfgs':
         resume_config.pop('inner_method')
+    if cg_check_interval == 1:
+        resume_config.pop('cg_check_interval')
+    if not cache_assignment:
+        resume_config.pop('cache_assignment')
     if initial_representatives is not None:
         resume_config['initial_digest'] = array_digest(
             *(initial_representatives[key].detach().cpu().numpy() for key in ('centers', 'labels', 'mass')))
@@ -401,7 +462,9 @@ def optimize_ce_assignment(z, q, assignment, penalty=3e-5, steps=300, lr=.01,
     history, theta, best, dual = [], None, float('inf'), None
     vector = None
     start_step = 0
-    solve_student = inner_solver or (solve_inner_newton_first if inner_method == 'newton_first' else solve_inner)
+    solve_student = inner_solver or partial(
+        solve_inner_newton_first if inner_method == 'newton_first' else solve_inner,
+        cg_check_interval=cg_check_interval)
     if resume_state is not None:
         saved_config = dict(resume_state['config'])
         saved_config.setdefault('implicit_warm_start', False)
@@ -460,7 +523,8 @@ def optimize_ce_assignment(z, q, assignment, penalty=3e-5, steps=300, lr=.01,
             balance = dict(balance_iterations=int(diagnostic[0]), row_residual=float(diagnostic[1]),
                            column_residual=float(diagnostic[2]))
         elif assignment_rank is not None:
-            moments = LowRankMoments.apply(u, v, assignment, material, mixing, chunk_size)
+            operation = CachedLowRankMoments if cache_assignment else LowRankMoments
+            moments = operation.apply(u, v, assignment, material, mixing, chunk_size)
         else:
             moments = AssignmentMoments.apply(logits, material, chunk_size)
         if feature_control == 'assignment':
@@ -534,17 +598,18 @@ def optimize_ce_assignment(z, q, assignment, penalty=3e-5, steps=300, lr=.01,
                         row['implicit_warm_start'] = implicit_warm_start and vector is not None
                         vector, diagnostic = solve_head_system(augmented(centers), labels, mass, theta, penalty,
                             outer_gradient, rtol=cg_rtol, max_iter=cg_max_iter,
-                            initial=vector if implicit_warm_start else None)
+                            initial=vector if implicit_warm_start else None, cg_check_interval=cg_check_interval)
                 else:
                     multiply, diagonal = hessian_operator(augmented(centers), labels, mass, theta, penalty)
                     vector, diagnostic = conjugate_gradient(multiply, outer_gradient, diagonal,
                                                               rtol=cg_rtol, max_iter=tracking_cg_steps,
-                                                              initial=vector)
+                                                              initial=vector, check_interval=cg_check_interval)
                     diagnostic.update(hessian_solver='tracking_pcg', hessian_reduced_dimension=0)
                     if not bool(torch.isfinite(vector).all()) or not np.isfinite(diagnostic['cg_residual']):
                         row['implicit_fallback'] = True
                         vector, diagnostic = solve_head_system(augmented(centers), labels, mass, theta, penalty,
-                                                                outer_gradient, rtol=cg_rtol, max_iter=cg_max_iter)
+                                                                outer_gradient, rtol=cg_rtol, max_iter=cg_max_iter,
+                                                                cg_check_interval=cg_check_interval)
                 row.update(diagnostic)
                 row['implicit_seconds'] = timestamp() - implicit_start
                 if 'benchmark_cold_seconds' in diagnostic:

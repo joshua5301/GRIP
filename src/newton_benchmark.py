@@ -140,7 +140,8 @@ def benchmark_newton_first(previous_run, output_dir, windows=('original', 'exten
 def compare_newton_performance(previous_run, output_dir, steps=1000,
                                checkpoint_steps=(0, 100, 300, 500, 750, 1000),
                                search_seeds=(0, 1, 2), final_seeds=tuple(range(100, 110)),
-                               data_dir='/content/data/', device='cuda'):
+                               data_dir='/content/data/', device='cuda', compare_fast=False,
+                               cg_check_interval=8):
     from src.assignment_sweep import representative
     from src.condensation_diagnostics import fit_gcn_diagnostic
     from src.node_distances import array_digest
@@ -160,6 +161,9 @@ def compare_newton_performance(previous_run, output_dir, steps=1000,
     config = dict(source=str(source), prior=prior, params=params, steps=steps,
                   checkpoints=checkpoints, search_seeds=list(search_seeds),
                   final_seeds=list(final_seeds), solver=options, version=1)
+    methods = ('newton_first', 'newton_fast') if compare_fast else ('lbfgs', 'newton_first')
+    if compare_fast:
+        config.update(compare_fast=True, cg_check_interval=cg_check_interval)
     root = Path(output_dir) / _fingerprint(config)
     root.mkdir(parents=True, exist_ok=True)
     save_json(config, root / 'config.json')
@@ -185,7 +189,7 @@ def compare_newton_performance(previous_run, output_dir, steps=1000,
                     dropout=prior['dropout'], lr=prior['student_lr'], weight_decay=prior['weight_decay'])
     summaries, curves, students, histories = [], [], [], []
     initial = None
-    for method in ('lbfgs', 'newton_first'):
+    for method in methods:
         folder = root / method
         folder.mkdir(exist_ok=True)
         complete = folder / 'complete.json'
@@ -195,7 +199,9 @@ def compare_newton_performance(previous_run, output_dir, steps=1000,
             result = optimize_ce_assignment(z, q, assignment, penalty=params['penalty'],
                 lr=params['assignment_lr'], steps=steps, mixing=prior['mixing'], factor_seed=prior['seed'],
                 folder=folder, checkpoint_steps=checkpoints, resume_state=state, save_resume=True,
-                save_assignment=False, inner_method=method, **family_options(params), **options)
+                save_assignment=False, inner_method='newton_first' if compare_fast else method,
+                cg_check_interval=cg_check_interval if method == 'newton_fast' else 1,
+                cache_assignment=method == 'newton_fast', **family_options(params), **options)
             save_json(dict(steps=steps), complete)
             del result, state
         history = pd.read_csv(folder / 'optimization.csv')
@@ -239,7 +245,7 @@ def compare_newton_performance(previous_run, output_dir, steps=1000,
         write_table(pd.DataFrame(students), root / 'final_students.csv')
     paired = pd.DataFrame(students).pivot(index=['phase', 'seed'], columns='method',
                                         values=['val_acc', 'test_acc'])
-    differences = pd.DataFrame({key + '_delta_pp': paired[key]['newton_first'] - paired[key]['lbfgs']
+    differences = pd.DataFrame({key + '_delta_pp': paired[key][methods[1]] - paired[key][methods[0]]
                                for key in ('val_acc', 'test_acc')}).reset_index()
     write_table(differences, root / 'paired_differences.csv')
     write_table(pd.concat(histories, ignore_index=True), root / 'optimization.csv')

@@ -42,3 +42,29 @@ validation trajectories. Optimization timings exclude downstream GCN evaluation;
 the summed update times exclude checkpoint I/O, while condensation_seconds includes
 optimizer bookkeeping and most I/O. These sequential timings are not a repeated
 hardware benchmark. One condensation seed does not establish seed-wide equivalence.
+
+## Grouped PCG and cached probabilities
+
+`optimize_ce_assignment(cg_check_interval=8, cache_assignment=True)` opts into
+GPU-resident PCG scalars and saved low-rank assignment probabilities. Defaults
+remain compatible with existing runs. These options are recorded in resume
+configuration; an existing run cannot silently change them.
+
+Grouped PCG masks updates on the GPU after its recursive residual reaches the
+target, and checks on the host once per group. It recomputes the true residual
+before accepting convergence; if recursive convergence was inaccurate it restarts.
+Curvature breakdown freezes updates and is rejected unless the final actual
+residual meets the original criterion. Iteration counts include masked iterations.
+The option affects Newton corrections and implicit solves. Custom solver callbacks
+remain responsible for their own implementation.
+
+Caching is supported for unweighted free-mass low-rank assignments, including
+feature encoders. Forward reduction and backward formulas and precision are
+unchanged. Storage costs N times M times material.element_size bytes. Weighted
+and balanced assignments keep their existing paths and cannot enable this option.
+
+`compare_newton_performance(compare_fast=True, cg_check_interval=8)` compares
+Newton-first with its accelerated version from the same initialization. Both use
+implicit warm starts. It reports independent 1000-step accuracy, selected
+checkpoints, paired GCN seed differences and measured optimization timings.
+Run tests/test_fast_assignment.py on Colab; no local numerical runs are required.

@@ -110,6 +110,35 @@ class LowRankMoments(torch.autograd.Function):
         return du, dv, None, None, None, None
 
 
+class CachedLowRankMoments(torch.autograd.Function):
+    @staticmethod
+    def forward(ctx, u, v, assignment, material, mixing, chunk_size):
+        probability = material.new_empty(len(u), len(v))
+        result = material.new_zeros(len(v), material.shape[1])
+        for start in range(0, len(u), chunk_size):
+            end = start + chunk_size
+            block = logit_block(u[start:end], v, assignment[start:end], mixing).to(material.dtype).softmax(1)
+            probability[start:end] = block
+            result += block.T @ material[start:end] / len(u)
+        ctx.save_for_backward(u, v, material, probability)
+        ctx.chunk_size = chunk_size
+        return result
+
+    @staticmethod
+    def backward(ctx, gradient):
+        u, v, material, probability = ctx.saved_tensors
+        du, dv = torch.empty_like(u), torch.zeros_like(v)
+        scale = math.sqrt(u.shape[1])
+        for start in range(0, len(u), ctx.chunk_size):
+            end = start + ctx.chunk_size
+            p = probability[start:end]
+            direction = material[start:end] @ gradient.T / len(u)
+            block = (p * (direction - (p * direction).sum(1, keepdim=True))).to(u.dtype) / scale
+            du[start:end] = block @ v
+            dv += block.T @ u[start:end]
+        return du, dv, None, None, None, None
+
+
 class WeightedLowRankMoments(torch.autograd.Function):
     @staticmethod
     def forward(ctx, u, v, weights, assignment, material, mixing, chunk_size):
