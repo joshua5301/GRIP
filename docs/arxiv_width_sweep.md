@@ -48,5 +48,15 @@ resume checkpoint states and reuse evaluations. Optimizer resume files are saved
 at checkpoints, so an interrupted interval is repeated. Partial GCN fits restart.
 Source changes require a version bump if they change algorithm behavior.
 
+`src.arxiv_loss_replay.run_arxiv_loss_replay(source_root)` freezes the uniform-CE
+selected candidates/checkpoints and trains only the final GCNs with mass-weighted
+CE. It reuses teacher logits, saved representatives and final seeds, verifies the
+graph/split digest, and pairs each new score with its uniform-CE reference. No
+condensation or checkpoint search runs. Default cost is 60 GCN fits, each with
+1000 epochs and validation-selected student epoch. Outputs/cache are isolated
+under `source_root/mass_replay`; identical reruns reuse completed student fits.
+This is a loss ablation on uniform-selected condensates, not a separately tuned
+mass-CE sweep. Test results do not change either family's candidate/checkpoint.
+
 Local verification is syntax/static checks only. Training and numerical tests
 belong on Colab; local training remains disabled.
