@@ -105,6 +105,12 @@ resumable; use separate output folders for concurrent sessions. Test labels are
 not used in selection. This selects over the supplied finite temperature grid,
 not continuous temperature optimization or cross-validation.
 
+`select_cora_teacher_ce` in the same module instead selects gamma by the teacher's
+hard-label validation CE after temperature calibration for each gamma. Temperature
+is optimized continuously in log space within configurable bounds (0.01, 100 by
+default); boundary selections are reported. No auxiliary student is trained.
+Pass the returned gamma and T as singleton grids to the condensation sweep.
+
 For a teacher-free control, call `run_cora_multiseed(label_source="train",
 gammas=[], space={"rank": [8], "penalty": [...]}, ...)`. Only training nodes and
 their one-hot labels enter condensation and its inner/outer objectives. S²X and

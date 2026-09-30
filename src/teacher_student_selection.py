@@ -13,6 +13,57 @@ from src.teacher import teacher_logits
 from src.transforms import fit_transform
 
 
+def select_cora_teacher_ce(
+    output_dir,
+    gammas=(1e-5, 1e-4, 1e-3, 1e-2, 1e-1),
+    temperature_bounds=(0.01, 100.0),
+    basis=3000,
+    seed=0,
+    data_dir="/content/data/",
+    device="cuda",
+):
+    from src.multiseed_sweep import calibrate_teacher_temperature
+
+    if not gammas or any(not np.isfinite(g) or g <= 0 for g in gammas):
+        raise ValueError("Gamma must be positive and finite")
+    lower, upper = temperature_bounds
+    if not np.isfinite([lower, upper]).all() or not 0 < lower <= 1 <= upper or lower == upper:
+        raise ValueError("Temperature bounds must be finite, positive and bracket one")
+    torch.backends.cuda.matmul.allow_tf32 = False
+    torch.backends.cudnn.allow_tf32 = False
+    graph, train, validation, _, h = _prepare_dataset("cora", data_dir, device)
+    mask = validation[1]
+    config = dict(
+        criterion="teacher_validation_ce", gammas=list(gammas),
+        temperature_bounds=list(temperature_bounds), basis=basis, seed=seed, version=1,
+        data_digest=array_digest(
+            h.cpu().numpy(), train.cpu().numpy(), mask.cpu().numpy(),
+            graph["y"][train].cpu().numpy(), graph["y"][mask].cpu().numpy(),
+        ),
+    )
+    root = Path(output_dir) / _fingerprint(config)
+    root.mkdir(parents=True, exist_ok=True)
+    save_json(config, root / "config.json")
+    teachers = teacher_logits(
+        h, graph, train, validation, "relu", list(gammas), basis, seed, root, return_all=True
+    )
+    rows = []
+    for gamma in gammas:
+        values = calibrate_teacher_temperature(
+            teachers[gamma].to(device)[mask], graph["y"][mask], bounds=temperature_bounds
+        )
+        rows.append(dict(
+            gamma=gamma, T=values["T_cal"], teacher_val=values["validation_accuracy"],
+            val_ce_before=values["validation_ce_before"], val_ce=values["validation_ce_after"],
+            temperature_boundary=values["boundary"],
+        ))
+    table = pd.DataFrame(rows).sort_values(["val_ce", "gamma"])
+    selected = table.iloc[0].to_dict()
+    write_table(table, root / "selection_grid.csv")
+    save_json(selected, root / "selected.json")
+    return selected, table, root
+
+
 def select_cora_teacher(
     output_dir,
     gammas=(1e-5, 1e-4, 1e-3, 1e-2, 1e-1),
