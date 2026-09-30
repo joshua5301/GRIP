@@ -1,7 +1,7 @@
 # Arxiv 0.05% width screening
 
-`src.arxiv_width_sweep.run_arxiv_width_sweep` uses 90 cells and must run on a
-Colab A100. It fixes feature k-means++ initialization, 5% mixing, ReLU kernel
+`src.arxiv_width_sweep.run_arxiv_width_sweep` uses 90 cells and runs on a
+Colab CUDA GPU. It fixes feature k-means++ initialization, 5% mixing, ReLU kernel
 teacher, RMS-normalized S²X, mass-weighted inner CE, Newton-first exact solves,
 and warm-start implicit differentiation. Features and labels remain joint means.
 
@@ -49,4 +49,4 @@ at checkpoints, so an interrupted interval is repeated. Partial GCN fits restart
 Source changes require a version bump if they change algorithm behavior.
 
 Local verification is syntax/static checks only. Training and numerical tests
-belong on Colab A100.
+belong on Colab; local training remains disabled.

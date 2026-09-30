@@ -71,8 +71,6 @@ def run_arxiv_width_sweep(
         or not str(device).startswith("cuda")
     ):
         raise ValueError("Invalid budget, seeds, widths, learning rates or GPU device")
-    if "A100" not in torch.cuda.get_device_name(torch.device(device)):
-        raise RuntimeError("Run this experiment on a Colab A100")
     torch.backends.cuda.matmul.allow_tf32 = False
     torch.backends.cudnn.allow_tf32 = False
     graph, train, validation, testing, h = _prepare_dataset("arxiv", data_dir, device)
