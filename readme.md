@@ -93,3 +93,14 @@ See [the reproduction protocol](docs/risk_reproduction.md).
 
 Prototype and feature-only MLP sweeps are also supported by `run_cora_multiseed`
 with `method="prototype"` or `method="mlp"`; see the sweep protocol for grid keys.
+
+`src.teacher_student_selection.select_cora_teacher` selects gamma and temperature
+before condensation by validation CE of a converged linear student on all original
+RMS-normalized S²X features and teacher soft labels. The kernel teacher uses only
+training labels; validation labels are used for selection, never student fitting.
+The selection student's penalty defaults to 0.001 and remains independent of the
+subsequent condensation penalty sweep. The returned gamma and T can be passed as
+singletons to `run_cora_multiseed` for each density. Selection grids are cached and
+resumable; use separate output folders for concurrent sessions. Test labels are
+not used in selection. This selects over the supplied finite temperature grid,
+not continuous temperature optimization or cross-validation.
