@@ -10,6 +10,25 @@ from sklearn.preprocessing import StandardScaler
 from src.data import get_dataset
 
 
+def test_citation_feature_modes_preserve_raw_values_and_existing_defaults(monkeypatch):
+    from torch_geometric.data import Data
+    features = torch.tensor([[1., 3.], [0., 0.], [2., 1.]])
+
+    def planetoid(directory, name, transform=None):
+        graph = Data(x=features.clone())
+        return [transform(graph) if transform is not None else graph]
+
+    monkeypatch.setattr("src.data.Planetoid", planetoid)
+    raw = get_dataset(SimpleNamespace(dataset_name="citeseer", raw_data_dir="unused", citation_features="raw"))
+    default = get_dataset(SimpleNamespace(dataset_name="citeseer", raw_data_dir="unused"))
+    row = get_dataset(SimpleNamespace(dataset_name="citeseer", raw_data_dir="unused", citation_features="row"))
+    torch.testing.assert_close(raw.x, features)
+    torch.testing.assert_close(default.x, row.x)
+    torch.testing.assert_close(row.x, features / features.sum(1, keepdim=True).clamp_min(1))
+    cora = get_dataset(SimpleNamespace(dataset_name="cora", raw_data_dir="unused"))
+    torch.testing.assert_close(cora.x, features)
+
+
 @pytest.mark.parametrize("name", ["arxiv", "flickr", "reddit"])
 def test_raw_loading_preserves_training_scaling_and_splits(tmp_path, name):
     folder = tmp_path / ("ogbn-arxiv" if name == "arxiv" else name) / "raw"

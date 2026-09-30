@@ -55,8 +55,13 @@ def normalize_adj_sparse(data):
     return adj
 
 
-def _prepare_dataset(name, data_dir, device):
-    args = SimpleNamespace(dataset_name=name, raw_data_dir=str(data_dir).rstrip("/") + "/")
+def _prepare_dataset(name, data_dir, device, citation_features="default"):
+    if citation_features not in ("default", "raw", "row"):
+        raise ValueError("Unknown citation feature preprocessing")
+    if name not in ("cora", "citeseer") and citation_features != "default":
+        raise ValueError("Citation preprocessing only applies to Cora/Citeseer")
+    args = SimpleNamespace(dataset_name=name, raw_data_dir=str(data_dir).rstrip("/") + "/",
+                           citation_features=citation_features)
     datasets = get_dataset(args)
 
     def pack(graph):
@@ -84,7 +89,9 @@ def _prepare_dataset(name, data_dir, device):
 def get_dataset(args):
     name = args.dataset_name
     if name in ("cora", "citeseer"):
-        transform = T.NormalizeFeatures() if name == "citeseer" else None
+        feature_mode = getattr(args, "citation_features", "default")
+        transform = T.NormalizeFeatures() if (feature_mode == "row" or
+                    (feature_mode == "default" and name == "citeseer")) else None
         return Planetoid(args.raw_data_dir, name, transform=transform)[0]
     if name not in ("arxiv", "flickr", "reddit"):
         raise ValueError(f"Unknown dataset: {name}")

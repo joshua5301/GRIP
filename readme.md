@@ -3,7 +3,7 @@
 Learn a soft assignment from graph nodes to condensed cells. Features and labels
 are assignment-weighted means; the condensed graph uses identity adjacency.
 
-The current protocol uses S짼X features, a kernel teacher, cell-mass-weighted inner
+The current protocol uses S²X features, a kernel teacher, cell-mass-weighted inner
 CE and full-node outer CE. A linear inner student is solved with Newton-first
 optimization and implicit differentiation. Final evaluation uses a two-layer GCN
 with uniform CE. Teacher gamma, condensation settings and checkpoints are selected
@@ -17,6 +17,11 @@ using validation only.
 | `src/arxiv_width_sweep.py` | Budgeted Arxiv 0.05% MLP width grid and low-rank comparison |
 | `src/arxiv_loss_replay.py` | Paired mass/uniform GCN CE evaluation of fixed Arxiv condensates |
 | `src/arxiv_dual_evaluation.py` | Same-student MLP/GCN evaluation of fixed Arxiv condensates |
+| `src/citation_search.py` | Short resumable Cora/Citeseer validation screens and fixed-selection tests |
+| `src/partition_initialization.py` | Teacher-aware and teacher-balanced initial partitions |
+| `src/coarsening.py`, `src/coarsening_ce.py` | Edge-preserving quotients and exact CE assignment optimization |
+| `src/inductive_evaluation.py` | Separate-graph validation/testing for Flickr and Reddit |
+| `src/nystrom_ce.py` | Shared teacher Nyström features and streamed nonlinear CE condensation |
 | `src/soft_ce_partition.py` | Bilevel CE optimization, implicit solves and resumable checkpoints |
 | `src/low_rank_assignment.py` | Low-rank factors, linear/MLP encoders and optional node weights |
 | `src/moments.py` | Dense soft assignments and weighted cell statistics |
@@ -76,18 +81,22 @@ feature-conditioned assignment optimization remain available through
 
 See [the sweep protocol](docs/multiseed_sweep.md) for selection and caching details.
 See [the Arxiv width protocol](docs/arxiv_width_sweep.md) for budgeted MLP screening.
+See [short local citation experiments](docs/citation_search.md) for the current
+local research workflow and preprocessing choices.
 
 ## Verification
 
-Run numerical tests in Colab, not on the local workstation:
+Run numerical tests in the same environment used for experiments, either Colab
+or an authorized local setup:
 
 ```python
 %pip -q install pytest
 !python -m pytest -q tests
 ```
 
-Local refactoring checks cover syntax, static imports and lint only. Numerical
-training equivalence must still be verified in Colab.
+The local environment in this workspace is `.venv-local`; its binaries are not
+tracked in Git. Check numerical equivalence and solver convergence when changing
+assignment objectives or graph propagation.
 
 ## Historical comparison
 

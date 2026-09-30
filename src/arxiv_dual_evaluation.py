@@ -30,7 +30,8 @@ def route_metrics(probability, labels, val_mask, test_mask):
     }
 
 
-def fit_dual_student(x, y, graph, propagated, val_mask, test_mask, seed, settings, folder):
+def fit_dual_student(x, y, graph, propagated, val_mask, test_mask, seed, settings, folder,
+                     stop=lambda: False):
     folder.mkdir(parents=True, exist_ok=True)
     cache = folder / f"seed_{seed}.json"
     if cache.exists():
@@ -41,6 +42,8 @@ def fit_dual_student(x, y, graph, propagated, val_mask, test_mask, seed, setting
     weights = x.new_full((len(x),), 1 / len(x))
     history = []
     for epoch in range(1, settings["epochs"] + 1):
+        if stop():
+            raise InterruptedError("Student evaluation interrupted")
         if epoch == settings["epochs"] // 2:
             optimizer = torch.optim.Adam(
                 model.parameters(), lr=settings["lr"] * 0.1, weight_decay=settings["weight_decay"]
