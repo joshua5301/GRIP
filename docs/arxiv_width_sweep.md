@@ -30,8 +30,8 @@ Separate student variability from the sample standard deviation across three
 condensation-seed means. The MLP family gets more trials than the baseline.
 
 GCN hidden=256, dropout=0.31881090213944857, LR=0.01, weight decay=0.0005.
-Synthetic adjacency is identity. Default GCN CE is mass weighted, matching the
-historical Arxiv family runner; `student_loss="uniform"` starts a separate run.
+Synthetic adjacency is identity. Default GCN CE is uniform; `student_loss="mass"` starts a separate run
+matching the historical Arxiv family runner.
 The historical result's actual selected settings still require its saved artifacts.
 
 With default settings, screening costs 12×200=2400 assignment updates. Extending

@@ -4,7 +4,7 @@ from pathlib import Path
 
 BASELINE = None
 GAMMAS = [1e-5, 1e-4, 1e-3, 0.01]
-OUTPUT = "/content/drive/MyDrive/GRIP_results/arxiv005_width_budget_v1"
+OUTPUT = "/content/drive/MyDrive/GRIP_results/arxiv005_width_uniform_budget_v1"
 
 MODULE_SOURCE = r'''
 from pathlib import Path
@@ -44,7 +44,7 @@ def run_arxiv_width_sweep(
     screen_seeds=(0, 1),
     search_seeds=(0, 1, 2),
     final_seeds=tuple(range(100, 110)),
-    student_loss="mass",
+    student_loss="uniform",
     dropout=0.31881090213944857,
     basis=3000,
     teacher_seed=0,
@@ -272,7 +272,7 @@ summary, by_seed, search, root = run_arxiv_width_sweep(
     screen_seeds=[0, 1],
     search_seeds=[0, 1, 2],
     final_seeds=list(range(100, 110)),
-    student_loss="mass",
+    student_loss="uniform",
 )
 display(summary, by_seed)
 print("Results:", root)

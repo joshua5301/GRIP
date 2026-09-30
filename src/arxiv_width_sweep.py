@@ -35,7 +35,7 @@ def run_arxiv_width_sweep(
     screen_seeds=(0, 1),
     search_seeds=(0, 1, 2),
     final_seeds=tuple(range(100, 110)),
-    student_loss="mass",
+    student_loss="uniform",
     dropout=0.31881090213944857,
     basis=3000,
     teacher_seed=0,
