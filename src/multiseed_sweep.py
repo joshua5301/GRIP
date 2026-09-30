@@ -7,8 +7,10 @@ from tqdm.auto import tqdm
 
 from src.data import BUDGET, _prepare_dataset
 from src.evaluation import fit_gcn_diagnostic
-from src.initialization import feature_kmeans
+from src.initialization import cell_means, feature_kmeans
 from src.io import _fingerprint, array_digest, save_json, save_state, write_table
+from src.moments import initial_logits
+from src.prototype_assignment import prototype_logits
 from src.soft_ce_partition import optimize_ce_assignment
 from src.sweep_utils import boundary_profile, grid_rows, representative
 from src.teacher import teacher_logits
@@ -49,9 +51,9 @@ def calibrate_teacher_temperature(logits, labels, bounds=(0.01, 100.0)):
     )
 
 
-def aggregate_search(records, condensation_seeds, student_seeds):
+def aggregate_search(records, condensation_seeds, student_seeds, parameter_keys=("T", "rank", "penalty")):
     frame = pd.DataFrame(records)
-    keys = ["candidate", "T", "rank", "penalty", "step"]
+    keys = ["candidate", *parameter_keys, "step"]
     expected = {(a, b) for a in condensation_seeds for b in student_seeds}
     rows = []
     for key, group in frame.groupby(keys, sort=False):
@@ -91,15 +93,27 @@ def run_cora_multiseed(
     weight_decay=0.0005,
     data_dir="/content/data/",
     device="cuda",
+    method="low_rank",
 ):
-    if ("cora", ratio) not in BUDGET or set(space) != {"T", "rank", "penalty"}:
-        raise ValueError("Use a configured Cora ratio and T/rank/penalty grid")
+    required = {
+        "low_rank": {"T", "rank", "penalty"},
+        "mlp": {"T", "rank", "width", "penalty"},
+        "prototype": {"T", "tau", "penalty"},
+    }
+    if ("cora", ratio) not in BUDGET or method not in required or set(space) != required[method]:
+        raise ValueError("Use a configured Cora ratio and the selected method's grid keys")
     cells = BUDGET[("cora", ratio)]
     candidates = grid_rows(space)
     if any(not np.isfinite(c[k]) or c[k] <= 0 for c in candidates for k in ("T", "penalty")):
         raise ValueError("T and penalty must be positive and finite")
-    if any(not isinstance(c["rank"], int) or not 1 <= c["rank"] <= cells for c in candidates):
+    if method != "prototype" and any(
+        not isinstance(c["rank"], int) or not 1 <= c["rank"] <= cells for c in candidates
+    ):
         raise ValueError("Rank must be an integer no greater than the cell budget")
+    if method == "prototype" and any(not np.isfinite(c["tau"]) or c["tau"] <= 0 for c in candidates):
+        raise ValueError("Assignment temperature must be positive and finite")
+    if method == "mlp" and any(not isinstance(c["width"], int) or c["width"] < 1 for c in candidates):
+        raise ValueError("MLP width must be a positive integer")
     if (
         not gammas
         or any(not np.isfinite(g) or g <= 0 for g in gammas)
@@ -174,6 +188,8 @@ def run_cora_multiseed(
         data_digest=digest,
         version=1,
     )
+    if method != "low_rank":
+        config["method"] = method
     root = Path(output_dir) / f"ratio_{ratio}" / _fingerprint(config)
     root.mkdir(parents=True, exist_ok=True)
     save_json(config, root / "config.json")
@@ -235,6 +251,44 @@ def run_cora_multiseed(
         for seed in condensation_seeds:
             folder = root / f"candidate_{index:04d}" / f"condensation_{seed}"
             folder.mkdir(parents=True, exist_ok=True)
+            if method != "low_rank" and not (folder / "initial_assignment.json").exists():
+                assignment = assignments[seed]
+                centers = cell_means(z, assignment, cells)
+                with torch.no_grad():
+                    initial = (
+                        prototype_logits(z, centers, candidate["tau"])
+                        if method == "prototype"
+                        else initial_logits(assignment, cells).double()
+                    )
+                    probabilities = initial.softmax(1)
+                    mass = probabilities.mean(0)
+                    realized = probabilities.T @ z / probabilities.sum(0)[:, None]
+                    save_json(
+                        dict(
+                            agreement_with_kmeans=float(
+                                (probabilities.argmax(1) == assignment).double().mean()
+                            ),
+                            mean_entropy=float(
+                                -(probabilities * probabilities.clamp_min(1e-300).log()).sum(1).mean()
+                            ),
+                            mass_tv_from_hard=float(
+                                (mass - torch.bincount(assignment, minlength=cells) / len(z)).abs().sum() / 2
+                            ),
+                            feature_rms_from_hard=float((realized - centers).square().sum(1).mean().sqrt()),
+                        ),
+                        folder / "initial_assignment.json",
+                    )
+            options = dict(assignment_rank=candidate.get("rank"))
+            if method == "mlp":
+                options.update(
+                    assignment_input="features", assignment_encoder="mlp", encoder_hidden=candidate["width"]
+                )
+            elif method == "prototype":
+                options.update(
+                    assignment_input="features",
+                    assignment_encoder="prototype",
+                    prototype_temperature=candidate["tau"],
+                )
             if not (folder / "complete.json").exists():
                 resume = folder / "resume.pt"
                 state = (
@@ -247,7 +301,6 @@ def run_cora_multiseed(
                     penalty=candidate["penalty"],
                     lr=assignment_lr,
                     steps=steps,
-                    assignment_rank=candidate["rank"],
                     factor_seed=seed,
                     mixing=0.05,
                     folder=folder,
@@ -255,6 +308,7 @@ def run_cora_multiseed(
                     resume_state=state,
                     save_resume=True,
                     save_assignment=False,
+                    **options,
                     **solver,
                 )
                 save_json(dict(steps=steps), folder / "complete.json")
@@ -262,7 +316,7 @@ def run_cora_multiseed(
             for step in checkpoints:
                 search_records.extend(evaluate(index, seed, step))
         write_table(pd.DataFrame(search_records), root / "search_students.csv")
-        search = aggregate_search(search_records, condensation_seeds, search_seeds)
+        search = aggregate_search(search_records, condensation_seeds, search_seeds, tuple(space))
         write_table(search, root / "search.csv")
     chosen = search.sort_values(["val", "step", "candidate"], ascending=[False, True, True]).iloc[0].to_dict()
     save_json(chosen, root / "selected.json")
@@ -294,7 +348,9 @@ def run_cora_multiseed(
     )
     summary["dataset"], summary["ratio"], summary["nodes"] = "cora", ratio, cells
     summary["gamma"] = gamma
-    for key in ("T", "rank", "penalty"):
+    if method != "low_rank":
+        summary["method"] = method
+    for key in space:
         summary[key] = candidates[index][key]
     summary["step"] = summary.phase.map({"initial": 0, "selected": selected_step})
     summary["search_val"] = summary["step"].map(search[search.candidate == index].set_index("step").val)

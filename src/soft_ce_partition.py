@@ -31,6 +31,7 @@ from src.moments import (
     initial_logits,
     make_material,
 )
+from src.prototype_assignment import initialize_prototypes, prototype_logits
 
 
 def head_gradient(x, labels, mass, theta, penalty):
@@ -516,6 +517,7 @@ def optimize_ce_assignment(
     temperature_lr=0.003,
     outer_targets=None,
     inner_loss_weighting="mass",
+    prototype_temperature=0.1,
 ):
     if feature_control != "joint" or initial_representatives is not None:
         raise ValueError("Only clustering-derived features and labels are supported")
@@ -551,6 +553,22 @@ def optimize_ce_assignment(
             "outer_targets",
         )
     }
+    if assignment_encoder == "prototype":
+        if (
+            assignment_input != "features"
+            or assignment_rank is not None
+            or mass_mode != "free"
+            or node_weighting
+            or temperature_logits is not None
+            or cache_assignment
+            or not np.isfinite(prototype_temperature)
+            or prototype_temperature <= 0
+        ):
+            raise ValueError(
+                "Prototypes require fixed features, free mass and positive assignment temperature"
+            )
+    else:
+        resume_config.pop("prototype_temperature")
     if inner_loss_weighting == "mass":
         resume_config.pop("inner_loss_weighting")
     if outer_targets is not None:
@@ -625,10 +643,10 @@ def optimize_ce_assignment(
     ):
         raise ValueError("Invalid performance settings")
     if assignment_input not in ("node", "features", "features_labels") or (
-        assignment_input != "node" and assignment_rank is None
+        assignment_input != "node" and assignment_rank is None and assignment_encoder != "prototype"
     ):
         raise ValueError("Feature assignment requires assignment_rank and a supported input mode")
-    if assignment_encoder not in ("linear", "mlp") or (
+    if assignment_encoder not in ("linear", "mlp", "prototype") or (
         assignment_input == "node" and assignment_encoder != "linear"
     ):
         raise ValueError("MLP encoder requires feature-conditioned assignments")
@@ -653,7 +671,11 @@ def optimize_ce_assignment(
         raise ValueError("Outer loss requires at least one node")
     full_features = augmented(outer_z)
     clusters = int(assignment.max()) + 1
-    if assignment_rank is None:
+    if assignment_encoder == "prototype":
+        inputs = z.detach()
+        prototypes = initialize_prototypes(inputs, assignment, clusters)
+        parameters = [prototypes]
+    elif assignment_rank is None:
         logits = initial_logits(assignment, clusters, mixing).requires_grad_()
         parameters = [logits]
     elif assignment_input != "node":
@@ -737,7 +759,9 @@ def optimize_ce_assignment(
             if not np.isfinite(temperature) or temperature <= 0:
                 raise FloatingPointError("Nonfinite or nonpositive learned temperature")
             material = make_material(z, temperature_labels(temperature_logits, log_temperature))
-        if assignment_input != "node":
+        if assignment_encoder == "prototype":
+            logits = prototype_logits(inputs, prototypes, prototype_temperature)
+        elif assignment_input != "node":
             u = encode_nodes(inputs, encoder_parameters)
         balance = dict(balance_iterations=0, row_residual=np.nan, column_residual=np.nan)
         if node_weighting:
@@ -1069,8 +1093,15 @@ def optimize_ce_assignment(
         node_weight_penalty=node_weight_penalty,
         assignment_parameters=sum((parameter.numel() for parameter in parameters)),
     )
+    if assignment_encoder == "prototype":
+        result["prototype_temperature"] = prototype_temperature
     if folder is not None and save_assignment:
-        if assignment_rank is None:
+        if assignment_encoder == "prototype":
+            torch.save(
+                dict(prototypes=best_parameters[0].cpu(), temperature=prototype_temperature, step=best_step),
+                folder / "best_assignment_prototypes.pt",
+            )
+        elif assignment_rank is None:
             torch.save(best_parameters[0].cpu(), folder / "best_assignment_logits.pt")
         elif assignment_input != "node":
             saved = dict(

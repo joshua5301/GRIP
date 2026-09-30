@@ -90,3 +90,6 @@ training equivalence must still be verified in Colab.
 `src/risk_reproduction.py` runs the requested fixed-setting Cora replay and a
 2×2 initialization/optimizer comparison, loading pinned source from Git history.
 See [the reproduction protocol](docs/risk_reproduction.md).
+
+Prototype and feature-only MLP sweeps are also supported by `run_cora_multiseed`
+with `method="prototype"` or `method="mlp"`; see the sweep protocol for grid keys.

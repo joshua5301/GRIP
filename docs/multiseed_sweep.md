@@ -40,3 +40,32 @@ cell resumes interrupted work. Changing the grid or configuration creates a new
 run. A rerun skips completed optimization and evaluation; it recomputes aggregation.
 Only selected configurations receive final test evaluation. No local numerical
 tests or training are needed; run the provided tests in Colab.
+
+## Prototype and MLP sessions
+
+`run_cora_multiseed(..., method="prototype")` accepts grid keys `T`, `tau`,
+`penalty`. It learns cell prototypes in fixed RMS-normalized S²X space. Assignment
+probabilities are softmax of negative squared distance divided by `tau`; no
+baseline logits or Lloyd iteration are used. Prototypes start at the same k-means
+cell means used to define the other methods' initialization. Realized condensed
+features and labels remain assignment-weighted means, not the prototypes.
+
+`method="mlp"` accepts `T`, `rank`, `width`, `penalty`. The existing feature-only
+encoder is z -> width -> ReLU -> rank, followed by cell embeddings. It learns a
+rank-scaled logit correction on top of the 0.05-smoothed k-means assignment.
+Its last encoder layer starts at zero, preserving the existing initial assignment.
+This is the previous residual MLP family, not a pure MLP softmax without a baseline.
+
+Teacher T and assignment tau are separate. Both use the same mass-weighted inner
+CE, original-node outer CE, exact Newton-first solver, warm starts and uniform-CE
+GCN evaluation. Shared seeds and initial hard cells do not make their initial soft
+assignments identical. Every candidate/seed saves `initial_assignment.json` with
+hard-assignment agreement, entropy, mass TV and realized-center RMS difference.
+Initial and selected GCN performance are evaluated separately on the final seeds.
+
+Use different output directories for the two sessions. Each selects a common
+checkpoint and configuration using all nine search seed pairs; test labels are
+used only after selection. Identical reruns resume and reuse cached evaluations.
+The original low-rank API and its default run fingerprints remain unchanged.
+Prototype numerical-gradient and resume tests are in `tests/test_prototype_assignment.py`;
+run them in Colab, not locally.
