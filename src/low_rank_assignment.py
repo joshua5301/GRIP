@@ -2,20 +2,20 @@ import math
 
 import torch
 
-from src.soft_ridge_partition import initial_logits
+from src.moments import initial_logits
 
 
 def assignment_inputs(z, q, mode):
-    if mode == 'features':
+    if mode == "features":
         return z.detach().float()
-    if mode == 'features_labels':
+    if mode == "features_labels":
         return torch.cat((z.detach(), q.detach()), dim=1).float()
-    raise ValueError('Encoder input must be features or features_labels')
+    raise ValueError("Encoder input must be features or features_labels")
 
 
 def initialize_encoder(inputs, clusters, rank, seed=0):
     if not isinstance(rank, int) or not 1 <= rank <= min(len(inputs), clusters):
-        raise ValueError('rank must be a positive integer no larger than min(nodes, cells)')
+        raise ValueError("rank must be a positive integer no larger than min(nodes, cells)")
     generator = torch.Generator(device=inputs.device).manual_seed(seed)
     weight = inputs.new_zeros(inputs.shape[1], rank)
     v = torch.randn(clusters, rank, generator=generator, device=inputs.device, dtype=inputs.dtype)
@@ -24,7 +24,7 @@ def initialize_encoder(inputs, clusters, rank, seed=0):
 
 def initialize_factors(assignment, clusters, rank, seed=0):
     if not isinstance(rank, int) or not 1 <= rank <= min(len(assignment), clusters):
-        raise ValueError('rank must be a positive integer no larger than min(nodes, cells)')
+        raise ValueError("rank must be a positive integer no larger than min(nodes, cells)")
     generator = torch.Generator(device=assignment.device).manual_seed(seed)
     u = torch.zeros(len(assignment), rank, device=assignment.device)
     v = torch.randn(clusters, rank, generator=generator, device=assignment.device)
@@ -33,7 +33,7 @@ def initialize_factors(assignment, clusters, rank, seed=0):
 
 def initialize_mlp(inputs, clusters, rank, hidden=64, seed=0):
     if not isinstance(hidden, int) or hidden < 1:
-        raise ValueError('encoder_hidden must be a positive integer')
+        raise ValueError("encoder_hidden must be a positive integer")
     _, v = initialize_encoder(inputs, clusters, rank, seed)
     generator = torch.Generator(device=inputs.device).manual_seed(seed + 1)
     first = inputs.new_empty(inputs.shape[1], hidden)
@@ -50,8 +50,8 @@ def encode_nodes(inputs, parameters):
 
 
 def saved_encoder_nodes(z, q, saved):
-    inputs = assignment_inputs(z, q, saved['assignment_input'])
-    parameters = saved['encoder_parameters'] if 'encoder_parameters' in saved else [saved['weight']]
+    inputs = assignment_inputs(z, q, saved["assignment_input"])
+    parameters = saved["encoder_parameters"] if "encoder_parameters" in saved else [saved["weight"]]
     return encode_nodes(inputs, [p.to(inputs) for p in parameters])
 
 
@@ -91,7 +91,9 @@ class LowRankMoments(torch.autograd.Function):
         result = material.new_zeros(len(v), material.shape[1])
         for start in range(0, len(u), chunk_size):
             end = start + chunk_size
-            probability = logit_block(u[start:end], v, assignment[start:end], mixing).to(material.dtype).softmax(1)
+            probability = (
+                logit_block(u[start:end], v, assignment[start:end], mixing).to(material.dtype).softmax(1)
+            )
             result += probability.T @ material[start:end] / len(u)
         return result
 
@@ -103,11 +105,15 @@ class LowRankMoments(torch.autograd.Function):
         scale = math.sqrt(u.shape[1])
         for start in range(0, len(u), ctx.chunk_size):
             end = start + ctx.chunk_size
-            probability = logit_block(u[start:end], v, assignment[start:end], ctx.mixing).to(material.dtype).softmax(1)
+            probability = (
+                logit_block(u[start:end], v, assignment[start:end], ctx.mixing).to(material.dtype).softmax(1)
+            )
             if dm is not None:
                 dm[start:end] = probability @ gradient / len(u)
             direction = material[start:end] @ gradient.T / len(u)
-            block = (probability * (direction - (probability * direction).sum(1, keepdim=True))).to(u.dtype) / scale
+            block = (probability * (direction - (probability * direction).sum(1, keepdim=True))).to(
+                u.dtype
+            ) / scale
             du[start:end] = block @ v
             dv += block.T @ u[start:end]
         return du, dv, None, dm, None, None
@@ -153,7 +159,9 @@ class WeightedLowRankMoments(torch.autograd.Function):
         result = material.new_zeros(len(v), material.shape[1])
         for start in range(0, len(u), chunk_size):
             end = start + chunk_size
-            probability = logit_block(u[start:end], v, assignment[start:end], mixing).to(material.dtype).softmax(1)
+            probability = (
+                logit_block(u[start:end], v, assignment[start:end], mixing).to(material.dtype).softmax(1)
+            )
             result += probability.T @ (weights[start:end, None] * material[start:end]) / len(u)
         return result
 
@@ -164,7 +172,9 @@ class WeightedLowRankMoments(torch.autograd.Function):
         scale = math.sqrt(u.shape[1])
         for start in range(0, len(u), ctx.chunk_size):
             end = start + ctx.chunk_size
-            probability = logit_block(u[start:end], v, assignment[start:end], ctx.mixing).to(material.dtype).softmax(1)
+            probability = (
+                logit_block(u[start:end], v, assignment[start:end], ctx.mixing).to(material.dtype).softmax(1)
+            )
             direction = material[start:end] @ gradient.T / len(u)
             expectation = (probability * direction).sum(1, keepdim=True)
             dw[start:end] = expectation[:, 0]

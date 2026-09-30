@@ -1,4 +1,7 @@
-from src.module import *
+import torch
+import torch.nn.functional as F
+from torch_geometric.nn import GCNConv
+
 
 class GCN(torch.nn.Module):
     def __init__(self, nin, nhid, nout, nlayers, dropout=0.5):
@@ -8,10 +11,10 @@ class GCN(torch.nn.Module):
         if nlayers == 1:
             self.layers.append(GCNConv(nin, nout))
         else:
-            self.layers.append(GCNConv(nin, nhid)) 
+            self.layers.append(GCNConv(nin, nhid))
             for _ in range(nlayers - 2):
-                self.layers.append(GCNConv(nhid, nhid)) 
-            self.layers.append(GCNConv(nhid, nout))  
+                self.layers.append(GCNConv(nhid, nhid))
+            self.layers.append(GCNConv(nhid, nout))
         self.dropout = dropout
         self.initialize()
 
@@ -27,4 +30,3 @@ class GCN(torch.nn.Module):
             x = F.dropout(x, self.dropout, training=self.training)
         x = self.layers[-1](x, edge_index, edge_attr)
         return F.log_softmax(x, dim=1)
-           
