@@ -14,6 +14,7 @@ using validation only.
 | Module | Purpose |
 | --- | --- |
 | `src/multiseed_sweep.py` | Cora grid search across condensation and student seeds |
+| `src/arxiv_width_sweep.py` | Budgeted Arxiv 0.05% MLP width grid and low-rank comparison |
 | `src/soft_ce_partition.py` | Bilevel CE optimization, implicit solves and resumable checkpoints |
 | `src/low_rank_assignment.py` | Low-rank factors, linear/MLP encoders and optional node weights |
 | `src/moments.py` | Dense soft assignments and weighted cell statistics |
@@ -72,6 +73,7 @@ feature-conditioned assignment optimization remain available through
 `optimize_ce_assignment`. Direct feature controls are rejected explicitly.
 
 See [the sweep protocol](docs/multiseed_sweep.md) for selection and caching details.
+See [the Arxiv width protocol](docs/arxiv_width_sweep.md) for budgeted MLP screening.
 
 ## Verification
 
