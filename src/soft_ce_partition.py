@@ -32,6 +32,7 @@ from src.moments import (
     make_material,
 )
 from src.prototype_assignment import initialize_prototypes, prototype_logits
+from src.sparse_assignment import SparseMoments, initialize_sparse
 
 
 def head_gradient(x, labels, mass, theta, penalty):
@@ -518,6 +519,7 @@ def optimize_ce_assignment(
     outer_targets=None,
     inner_loss_weighting="mass",
     prototype_temperature=0.1,
+    sparse_k=None,
 ):
     if feature_control != "joint" or initial_representatives is not None:
         raise ValueError("Only clustering-derived features and labels are supported")
@@ -553,6 +555,11 @@ def optimize_ce_assignment(
             "outer_targets",
         )
     }
+    if sparse_k is None:
+        resume_config.pop("sparse_k")
+    elif (assignment_rank is not None or assignment_input != "node" or assignment_encoder != "linear"
+          or mass_mode != "free" or node_weighting or temperature_logits is not None or cache_assignment):
+        raise ValueError("Sparse assignments require free mass, fixed labels and direct node logits")
     if assignment_encoder == "prototype":
         if (
             assignment_input != "features"
@@ -671,7 +678,10 @@ def optimize_ce_assignment(
         raise ValueError("Outer loss requires at least one node")
     full_features = augmented(outer_z)
     clusters = int(assignment.max()) + 1
-    if assignment_encoder == "prototype":
+    if sparse_k is not None:
+        candidate_indices, sparse_logits = initialize_sparse(z, assignment, clusters, sparse_k, mixing)
+        parameters = [sparse_logits]
+    elif assignment_encoder == "prototype":
         inputs = z.detach()
         prototypes = initialize_prototypes(inputs, assignment, clusters)
         parameters = [prototypes]
@@ -764,7 +774,9 @@ def optimize_ce_assignment(
         elif assignment_input != "node":
             u = encode_nodes(inputs, encoder_parameters)
         balance = dict(balance_iterations=0, row_residual=np.nan, column_residual=np.nan)
-        if node_weighting:
+        if sparse_k is not None:
+            moments = SparseMoments.apply(sparse_logits, candidate_indices, material, clusters, chunk_size)
+        elif node_weighting:
             node_weights, weight_kl = normalized_node_weights(node_logits)
             moments = WeightedLowRankMoments.apply(
                 u, v, node_weights, assignment, material, mixing, chunk_size
@@ -1095,8 +1107,15 @@ def optimize_ce_assignment(
     )
     if assignment_encoder == "prototype":
         result["prototype_temperature"] = prototype_temperature
+    if sparse_k is not None:
+        result["sparse_k"] = sparse_k
     if folder is not None and save_assignment:
-        if assignment_encoder == "prototype":
+        if sparse_k is not None:
+            torch.save(
+                dict(indices=candidate_indices.cpu(), logits=best_parameters[0].cpu(), step=best_step),
+                folder / "best_sparse_assignment.pt",
+            )
+        elif assignment_encoder == "prototype":
             torch.save(
                 dict(prototypes=best_parameters[0].cpu(), temperature=prototype_temperature, step=best_step),
                 folder / "best_assignment_prototypes.pt",

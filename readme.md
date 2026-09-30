@@ -119,3 +119,16 @@ baseline. Representatives are reconstructed from training-node features; final
 two-layer GCN evaluation still uses uniform CE. There is no temperature grid or
 teacher fitting, and teacher-specific evaluation metrics are omitted. The default
 `label_source="teacher"` preserves the existing protocol and cache fingerprints.
+
+For sparse assignments use `method="sparse"` with grid keys `T`, `k`, `penalty`.
+Each node retains its initial k-means cell plus the nearest k-1 initial centroids
+in RMS-normalized S²X. Candidates remain fixed. Trainable N-by-k logits use row
+softmax; other cells have zero probability. Initial mass is 0.95 on the original
+cell plus 0.05 uniformly over the k candidates. Features, labels and cell masses
+use these probabilities. Sparse moments and their custom backward avoid an N-by-M
+allocation during optimization; initialization uses chunked centroid distances.
+This changes both the support constraint and initial soft assignment relative to
+the dense/low-rank baseline. Rank and assignment temperature are not parameters.
+To tune teacher gamma by condensation performance, call the sweep separately for
+each singleton gamma and select the global winner by search validation only.
+Run `tests/test_sparse_assignment.py` in Colab for gradient and resume checks.

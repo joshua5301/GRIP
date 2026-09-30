@@ -100,6 +100,7 @@ def run_cora_multiseed(
         "low_rank": {"T", "rank", "penalty"},
         "mlp": {"T", "rank", "width", "penalty"},
         "prototype": {"T", "tau", "penalty"},
+        "sparse": {"T", "k", "penalty"},
     }
     if label_source not in ("teacher", "train"):
         raise ValueError("Label source must be teacher or train")
@@ -113,10 +114,12 @@ def run_cora_multiseed(
     candidates = grid_rows(space)
     if any(not np.isfinite(c[k]) or c[k] <= 0 for c in candidates for k in ({"T", "penalty"} & set(space))):
         raise ValueError("T and penalty must be positive and finite")
-    if method != "prototype" and any(
+    if method not in ("prototype", "sparse") and any(
         not isinstance(c["rank"], int) or not 1 <= c["rank"] <= cells for c in candidates
     ):
         raise ValueError("Rank must be an integer no greater than the cell budget")
+    if method == "sparse" and any(not isinstance(c["k"], int) or not 2 <= c["k"] <= cells for c in candidates):
+        raise ValueError("Sparse candidate count must satisfy 2 <= k <= cells")
     if method == "prototype" and any(not np.isfinite(c["tau"]) or c["tau"] <= 0 for c in candidates):
         raise ValueError("Assignment temperature must be positive and finite")
     if method == "mlp" and any(not isinstance(c["width"], int) or c["width"] < 1 for c in candidates):
@@ -273,7 +276,7 @@ def run_cora_multiseed(
         for seed in condensation_seeds:
             folder = root / f"candidate_{index:04d}" / f"condensation_{seed}"
             folder.mkdir(parents=True, exist_ok=True)
-            if method != "low_rank" and not (folder / "initial_assignment.json").exists():
+            if method in ("mlp", "prototype") and not (folder / "initial_assignment.json").exists():
                 assignment = assignments[seed]
                 centers = cell_means(z, assignment, cells)
                 with torch.no_grad():
@@ -301,7 +304,9 @@ def run_cora_multiseed(
                         folder / "initial_assignment.json",
                     )
             options = dict(assignment_rank=candidate.get("rank"))
-            if method == "mlp":
+            if method == "sparse":
+                options["sparse_k"] = candidate["k"]
+            elif method == "mlp":
                 options.update(
                     assignment_input="features", assignment_encoder="mlp", encoder_hidden=candidate["width"]
                 )
