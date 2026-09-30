@@ -58,5 +58,15 @@ under `source_root/mass_replay`; identical reruns reuse completed student fits.
 This is a loss ablation on uniform-selected condensates, not a separately tuned
 mass-CE sweep. Test results do not change either family's candidate/checkpoint.
 
+`src.arxiv_transfer_plot.plot_arxiv_transfer(source_root)` evaluates the saved
+inner linear heads on validation nodes using the saved normalized S²X inputs.
+It compares these trajectories with cached full-budget uniform-CE GCN search
+validation scores on original X/adjacency. GCN student seeds are averaged within
+each condensation seed first. Bands are sample SD across condensation seeds,
+not confidence intervals. A second plot pairs outer teacher CE with GCN validation.
+No new fitting or test scoring runs. CSV, PNG and PDF outputs are saved under
+`source_root/transfer_diagnostic`. The classifiers and evaluation representations
+differ, so their accuracy gap is a diagnostic rather than a controlled causal test.
+
 Local verification is syntax/static checks only. Training and numerical tests
 belong on Colab; local training remains disabled.
