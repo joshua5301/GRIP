@@ -104,3 +104,12 @@ singletons to `run_cora_multiseed` for each density. Selection grids are cached 
 resumable; use separate output folders for concurrent sessions. Test labels are
 not used in selection. This selects over the supplied finite temperature grid,
 not continuous temperature optimization or cross-validation.
+
+For a teacher-free control, call `run_cora_multiseed(label_source="train",
+gammas=[], space={"rank": [8], "penalty": [...]}, ...)`. Only training nodes and
+their one-hot labels enter condensation and its inner/outer objectives. S²X and
+its RMS transform still use the full transductive graph, matching the teacher
+baseline. Representatives are reconstructed from training-node features; final
+two-layer GCN evaluation still uses uniform CE. There is no temperature grid or
+teacher fitting, and teacher-specific evaluation metrics are omitted. The default
+`label_source="teacher"` preserves the existing protocol and cache fingerprints.

@@ -94,17 +94,24 @@ def run_cora_multiseed(
     data_dir="/content/data/",
     device="cuda",
     method="low_rank",
+    label_source="teacher",
 ):
     required = {
         "low_rank": {"T", "rank", "penalty"},
         "mlp": {"T", "rank", "width", "penalty"},
         "prototype": {"T", "tau", "penalty"},
     }
+    if label_source not in ("teacher", "train"):
+        raise ValueError("Label source must be teacher or train")
+    if label_source == "train":
+        required = {key: value - {"T"} for key, value in required.items()}
+        if gammas:
+            raise ValueError("Train-only condensation requires an empty gamma list")
     if ("cora", ratio) not in BUDGET or method not in required or set(space) != required[method]:
         raise ValueError("Use a configured Cora ratio and the selected method's grid keys")
     cells = BUDGET[("cora", ratio)]
     candidates = grid_rows(space)
-    if any(not np.isfinite(c[k]) or c[k] <= 0 for c in candidates for k in ("T", "penalty")):
+    if any(not np.isfinite(c[k]) or c[k] <= 0 for c in candidates for k in ({"T", "penalty"} & set(space))):
         raise ValueError("T and penalty must be positive and finite")
     if method != "prototype" and any(
         not isinstance(c["rank"], int) or not 1 <= c["rank"] <= cells for c in candidates
@@ -115,7 +122,7 @@ def run_cora_multiseed(
     if method == "mlp" and any(not isinstance(c["width"], int) or c["width"] < 1 for c in candidates):
         raise ValueError("MLP width must be a positive integer")
     if (
-        not gammas
+        (label_source == "teacher" and not gammas)
         or any(not np.isfinite(g) or g <= 0 for g in gammas)
         or not search_seeds
         or not final_seeds
@@ -130,6 +137,8 @@ def run_cora_multiseed(
     torch.backends.cuda.matmul.allow_tf32 = False
     torch.backends.cudnn.allow_tf32 = False
     graph, train, validation, testing, h = _prepare_dataset("cora", data_dir, device)
+    if label_source == "train" and cells > int(train.sum()):
+        raise ValueError("Cell budget exceeds the number of training nodes")
     adj = graph["adj"]
     digest = array_digest(
         *(
@@ -190,18 +199,28 @@ def run_cora_multiseed(
     )
     if method != "low_rank":
         config["method"] = method
+    if label_source == "train":
+        config["label_source"] = "train"
+        config["feature_normalization"] = "full_graph_rms"
     root = Path(output_dir) / f"ratio_{ratio}" / _fingerprint(config)
     root.mkdir(parents=True, exist_ok=True)
     save_json(config, root / "config.json")
-    logits, gamma = teacher_logits(
-        h, graph, train, validation, "relu", list(gammas), basis, teacher_seed, root
-    )
-    save_json(
-        dict(gamma=gamma, teacher_seed=teacher_seed, logits_digest=array_digest(logits.cpu().numpy())),
-        root / "selected_teacher.json",
-    )
-    calibration = calibrate_teacher_temperature(logits[validation[1]], graph["y"][validation[1]])
-    save_json(dict(gamma=gamma, **calibration), root / "teacher_calibration.json")
+    gamma = None
+    if label_source == "teacher":
+        logits, gamma = teacher_logits(
+            h, graph, train, validation, "relu", list(gammas), basis, teacher_seed, root
+        )
+        save_json(
+            dict(gamma=gamma, teacher_seed=teacher_seed, logits_digest=array_digest(logits.cpu().numpy())),
+            root / "selected_teacher.json",
+        )
+        calibration = calibrate_teacher_temperature(logits[validation[1]], graph["y"][validation[1]])
+        save_json(dict(gamma=gamma, **calibration), root / "teacher_calibration.json")
+    else:
+        train_q = torch.nn.functional.one_hot(graph["y"][train]).double()
+
+    def targets(candidate):
+        return train_q if label_source == "train" else (logits / candidate["T"]).softmax(1).double()
     inputs = root / "inputs.pt"
     if inputs.exists():
         saved = torch.load(inputs, map_location=device, weights_only=False)
@@ -210,7 +229,10 @@ def run_cora_multiseed(
         del saved
     else:
         z, transform = fit_transform(h.double(), kind="rms")
-        assignments = {s: feature_kmeans(h.cpu(), cells, s).to(device) for s in condensation_seeds}
+        material_h = h
+        if label_source == "train":
+            z, material_h = z[train], h[train]
+        assignments = {s: feature_kmeans(material_h.cpu(), cells, s).to(device) for s in condensation_seeds}
         save_state(dict(z=z, assignments=assignments, transform=vars(transform)), inputs)
     masks = dict(train=train, val=validation[1], test=testing[1])
 
@@ -223,7 +245,7 @@ def run_cora_multiseed(
         x, y, mass = representative(snapshot["moments"], transform, z.shape[1], device)
         weights = torch.full_like(mass, 1 / len(mass))
         cache = folder / ("final" if final else "search") / f"step_{step:06d}"
-        q = (logits / candidate["T"]).softmax(1).double()
+        q = None if label_source == "train" else targets(candidate)
         return [
             dict(
                 candidate=index,
@@ -247,7 +269,7 @@ def run_cora_multiseed(
 
     search_records = []
     for index, candidate in enumerate(tqdm(candidates, desc=f"Cora {ratio}: joint seed grid")):
-        q = (logits / candidate["T"]).softmax(1).double()
+        q = targets(candidate)
         for seed in condensation_seeds:
             folder = root / f"candidate_{index:04d}" / f"condensation_{seed}"
             folder.mkdir(parents=True, exist_ok=True)
@@ -348,6 +370,9 @@ def run_cora_multiseed(
     )
     summary["dataset"], summary["ratio"], summary["nodes"] = "cora", ratio, cells
     summary["gamma"] = gamma
+    if label_source == "train":
+        summary["label_source"] = "train"
+        summary["source_nodes"] = int(train.sum())
     if method != "low_rank":
         summary["method"] = method
     for key in space:

@@ -23,12 +23,13 @@ def _forward(model, x, adjacency=None):
 
 @torch.no_grad()
 def split_metrics(log_probability, y, q, masks):
-    values = dict(full_teacher_ce=float(-(q * log_probability).sum(1).mean()))
+    values = {} if q is None else dict(full_teacher_ce=float(-(q * log_probability).sum(1).mean()))
     for name, mask in masks.items():
         prediction = log_probability[mask]
         values[f"{name}_acc"] = 100 * float((prediction.argmax(1) == y[mask]).double().mean())
         values[f"{name}_ce"] = float(F.nll_loss(prediction, y[mask]))
-        values[f"{name}_teacher_ce"] = float(-(q[mask] * prediction).sum(1).mean())
+        if q is not None:
+            values[f"{name}_teacher_ce"] = float(-(q[mask] * prediction).sum(1).mean())
     values["val_minus_train_ce"] = values["val_ce"] - values["train_ce"]
     values["train_minus_val_acc"] = values["train_acc"] - values["val_acc"]
     return values
