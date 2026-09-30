@@ -3,7 +3,7 @@
 Learn a soft assignment from graph nodes to condensed cells. Features and labels
 are assignment-weighted means; the condensed graph uses identity adjacency.
 
-The current protocol uses S²X features, a kernel teacher, cell-mass-weighted inner
+The current protocol uses S짼X features, a kernel teacher, cell-mass-weighted inner
 CE and full-node outer CE. A linear inner student is solved with Newton-first
 optimization and implicit differentiation. Final evaluation uses a two-layer GCN
 with uniform CE. Teacher gamma, condensation settings and checkpoints are selected
@@ -56,7 +56,7 @@ display(summary, by_seed)
 ```
 
 Each setting/checkpoint is scored by nine validation evaluations (three
-condensation seeds × three student seeds). Final evaluation uses ten student seeds
+condensation seeds 횞 three student seeds). Final evaluation uses ten student seeds
 per condensation seed. The three condensation-seed means, their sample standard
 deviation, and within-condensation student variability are reported separately.
 
@@ -84,3 +84,9 @@ Run numerical tests in Colab, not on the local workstation:
 
 Local refactoring checks cover syntax, static imports and lint only. Numerical
 training equivalence must still be verified in Colab.
+
+## Historical comparison
+
+`src/risk_reproduction.py` runs the requested fixed-setting Cora replay and a
+2×2 initialization/optimizer comparison, loading pinned source from Git history.
+See [the reproduction protocol](docs/risk_reproduction.md).
