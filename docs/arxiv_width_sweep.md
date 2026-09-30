@@ -68,5 +68,27 @@ No new fitting or test scoring runs. CSV, PNG and PDF outputs are saved under
 `source_root/transfer_diagnostic`. The classifiers and evaluation representations
 differ, so their accuracy gap is a diagnostic rather than a controlled causal test.
 
+`src.arxiv_dual_evaluation.run_arxiv_dual_evaluation(source_root)` freezes the
+selected low-rank/MLP condensates and refits the same 2-layer student with uniform
+CE on identity synthetic adjacency. Each fitted model is evaluated both as an
+MLP on saved inverse-transformed S²X and as a GCN on original X/adjacency.
+Normalization inversion is performed only for the source RMS transform.
+
+`gcn_epoch` compares both routes at the GCN validation-selected epoch, with
+identical model weights. `route_epochs` reports each route at its own
+validation-selected epoch on the same training trajectory; these rows can use
+different weights. Ties retain the first evaluated epoch. Test never selects an
+epoch or a condensate. The first comparison favors the GCN's epoch criterion,
+so both summaries are useful. This diagnostic changes both evaluation features
+and graph propagation; it does not isolate a single layer or operation.
+
+Default cost is 60 student fits, not 120: two assignment families × three
+condensation seeds × ten final student seeds, each fitted once for 1000 epochs.
+No condensation or teacher fitting runs. Results and per-epoch curves are cached
+under `source_root/dual_evaluation`; interrupted student fits restart, completed
+ones are reused. `gcn_replay_check.csv` compares the GCN route with the prior
+uniform-CE evaluation to expose environment/numerical differences. Student and
+condensation variation are reported separately. Local checks remain static only.
+
 Local verification is syntax/static checks only. Training and numerical tests
 belong on Colab; local training remains disabled.
