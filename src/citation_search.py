@@ -90,6 +90,29 @@ def _candidate_nystrom_mass(candidate):
     return candidate
 
 
+
+def _candidate_surrogate(candidate):
+    keys = {"surrogate_kernel", "surrogate_schema", "surrogate_source_digest", "kernel", "teacher_kernel"}
+    if not set(candidate) & keys and not any(key.startswith("ntk_") for key in candidate):
+        return candidate
+    from src.relu_ntk import candidate_controls
+    return candidate_controls(candidate)
+
+
+def _cached_ntk_inputs(root, candidate, seed, device):
+    """Read current frozen H/Q/assignment before any selected_test mutation."""
+    path = root / "propagated_H.pt"
+    teacher = root / "teacher.pt"
+    if not path.exists() or not teacher.exists():
+        raise ValueError("Cached NTK condensate lacks its frozen H/teacher inputs")
+    config = json.loads((root / "config.json").read_text())
+    state = torch.load(path, map_location=device, weights_only=True)
+    h = fixed_propagated_features(state["h"], config, root)
+    logits = torch.load(teacher, map_location=device, weights_only=False)["logits"]
+    q = (logits / candidate["T"]).softmax(1).double()
+    assignment = _cached_initial_assignment(root, candidate, seed, device)
+    return h, q, assignment
+
 def _cached_initial_assignment(root, candidate, seed, device):
     """Read the current source initializer, never trust a target's own metadata."""
     if candidate.get("initialization", "feature") == "feature":
@@ -150,6 +173,17 @@ def _check_nystrom_assignment(candidate, saved, resume=False, *, root=None,
                 assignment_digest=_content_digest(assignment))
     function(saved, candidate.get("mass_mode", "free"), candidate.get("balance_steps", 300),
              candidate.get("balance_tol", 1e-8), candidate.get("balance_backend", "chunked"), **options)
+    if candidate.get("surrogate_kernel") is not None:
+        from src.relu_ntk import validate_cached
+        if root is None or condensation_seed is None:
+            raise ValueError("Cached NTK endpoint requires its current source root/seed")
+        existing = root / _fingerprint(candidate) / f"condensation_{condensation_seed}"
+        if not resume and not (existing / "resume.pt").exists():
+            raise ValueError("Cached NTK endpoint requires a verifiable resume state")
+        if h is None or q is None or assignment is None:
+            h, q, assignment = _cached_ntk_inputs(root, candidate, condensation_seed, device)
+        validate_cached(saved, candidate, h, q, assignment, root, condensation_seed, resume=resume)
+
 
 
 def _candidate_background_mixing(candidate):
@@ -257,7 +291,7 @@ def run_screen(dataset, ratio, output_dir, candidates, steps=50,
         raise ValueError("Use a configured Cora/Citeseer budget")
     # Check every requested prior before loading a dataset or fitting a teacher.
     # Explicit .05 removes the field so legacy identities/protocols are retained.
-    candidates = [_candidate_nystrom_mass(_candidate_temperature(_candidate_background_mixing(candidate)[0]))
+    candidates = [_candidate_surrogate(_candidate_nystrom_mass(_candidate_temperature(_candidate_background_mixing(candidate)[0])))
                   for candidate in candidates]
     for candidate in candidates:
         if candidate.get("method", "low_rank") == "nystrom":
@@ -320,11 +354,11 @@ def run_screen(dataset, ratio, output_dir, candidates, steps=50,
         if identity["method"] == "nystrom" and state is not None:
             current_q = (training_refined_targets(logits, identity["T"], graph["y"], train,
                                                  identity.get("train_target_mix", 0.0))
-                         if mass_mode == "initial" else None)
+                         if mass_mode == "initial" or identity.get("surrogate_kernel") is not None else None)
             _check_nystrom_assignment(identity, state, resume=True, root=root,
                                      condensation_seed=condensation_seed, device=device,
-                                     h=h if mass_mode == "initial" else None, q=current_q)
-        if mass_mode == "initial":
+                                     h=h if mass_mode == "initial" or identity.get("surrogate_kernel") is not None else None, q=current_q)
+        if mass_mode == "initial" or identity.get("surrogate_kernel") is not None:
             current_q = training_refined_targets(logits, identity["T"], graph["y"], train,
                                                 identity.get("train_target_mix", 0.0))
             for cached_path in sorted(folder.glob("step_*.pt")):
@@ -375,8 +409,12 @@ def run_screen(dataset, ratio, output_dir, candidates, steps=50,
                 if mass_mode != "free":
                     nystrom_options.update(mass_mode=mass_mode, balance_steps=identity["balance_steps"],
                                            balance_tol=identity["balance_tol"], balance_backend=identity["balance_backend"])
-                feature_map = get_shared_map(h, root / "nystrom_map_schema3.pt", basis=3000, seed=0)
-                phi = cache_features(h, feature_map, root / "nystrom_phi_schema3.npy", stop=stop)
+                if identity.get("surrogate_kernel") is not None:
+                    from src.relu_ntk import prepare_features
+                    feature_map, phi = prepare_features(h, root, stop=stop)
+                else:
+                    feature_map = get_shared_map(h, root / "nystrom_map_schema3.pt", basis=3000, seed=0)
+                    phi = cache_features(h, feature_map, root / "nystrom_phi_schema3.npy", stop=stop)
                 optimize(h.double(), q, assignment, feature_map, phi, folder, steps,
                          penalty=identity["penalty"], lr=identity["lr"], rank=identity["rank"],
                          seed=condensation_seed, checkpoint_every=25, mixing=mixing, stop=stop,
@@ -427,8 +465,8 @@ def run_screen(dataset, ratio, output_dir, candidates, steps=50,
             if identity["method"] == "nystrom":
                 _check_nystrom_assignment(identity, snapshot, assignment=assignment,
                                            condensation_seed=condensation_seed, device=device, root=root,
-                                           h=h if mass_mode == "initial" else None,
-                                           q=q if mass_mode == "initial" else None)
+                                           h=h if mass_mode == "initial" or identity.get("surrogate_kernel") is not None else None,
+                                           q=q if mass_mode == "initial" or identity.get("surrogate_kernel") is not None else None)
             temperature_diagnostic = (_temperature_diagnostics(snapshot, state, step)
                                       if identity.get("learn_temperature", False) else {})
             if identity["method"] == "coarsening":
@@ -479,7 +517,8 @@ def run_screen(dataset, ratio, output_dir, candidates, steps=50,
     keys = ["method", "width", "lr", "T", "rank", "penalty", "step", "candidate_path"]
     keys += [key for key in ("initialization", "alpha", "inner_loss_weighting", "mass_mode", "mass_scaling",
                             "metric_input", "metric_alpha", "strength", "train_target_mix", "mixing",
-                            "learn_temperature", "temperature_lr", "balance_steps", "balance_tol", "balance_backend", "initial_mass_schema") if key in frame.columns]
+                            "learn_temperature", "temperature_lr", "balance_steps", "balance_tol", "balance_backend", "initial_mass_schema", "surrogate_kernel", "surrogate_schema", "surrogate_source_digest",
+                            "ntk_angle_guard", "ntk_norm_guard", "ntk_jitter") if key in frame.columns]
     keys += ["dropout", "input_scale", "epochs", "student_recipe"]
     grouped = frame.groupby(keys, dropna=False)
     if report_routes or "learn_temperature" in frame.columns:
@@ -507,6 +546,17 @@ def selected_test(root, choice, condensation_seeds=(0, 1, 2), student_seeds=(100
                   stop=lambda: False, report_routes=True, student_settings=None):
     """Test only a fixed configuration and checkpoint, with fresh student seeds."""
     root = Path(root)
+    # Mixed ranking tables have NaN NTK columns on legitimate legacy rows.
+    # Validate every supplied non-null kernel control before the row whitelist.
+    raw = {key: value for key, value in choice.items() if pd.notna(value)}
+    _candidate_surrogate(raw)
+    recorded = None
+    if "candidate_path" in raw:
+        path = Path(raw["candidate_path"]) / "candidate.json"
+        if path.exists():
+            recorded = json.loads(path.read_text())
+            if recorded.get("surrogate_kernel") is not None and raw.get("surrogate_kernel") != recorded["surrogate_kernel"]:
+                raise ValueError("Selected row lost its recorded NTK kernel identity")
     candidate = {key: choice[key] for key in ("method", "width", "lr", "T", "rank", "penalty")}
     candidate["rank"], candidate["width"] = int(candidate["rank"]), int(candidate["width"])
     if candidate["method"] == "nystrom" and isinstance(choice.get("mass_mode"), str) and choice["mass_mode"] in ("uniform", "initial"):
@@ -517,11 +567,16 @@ def selected_test(root, choice, condensation_seeds=(0, 1, 2), student_seeds=(100
         schema = choice.get("initial_mass_schema")
         if isinstance(schema, bool) or not isinstance(schema, Real) or not math.isfinite(schema) or schema != 1:
             raise ValueError("Selected initial_mass_schema must be present and equal one")
+    if isinstance(choice.get("surrogate_kernel"), str) and choice["surrogate_kernel"] != "relu":
+        for key in ("surrogate_schema", "surrogate_source_digest", "ntk_angle_guard", "ntk_norm_guard", "ntk_jitter"):
+            if key not in choice or pd.isna(choice[key]):
+                raise ValueError("Selected NTK surrogate controls must be present and fixed")
     if candidate["method"] == "nystrom":
         candidate["nystrom_schema"] = 3
     candidate.update({key: choice[key] for key in ("initialization", "alpha", "inner_loss_weighting", "mass_mode", "mass_scaling",
                                                   "metric_input", "metric_alpha", "strength", "train_target_mix",
-                                                  "balance_steps", "balance_tol", "balance_backend", "initial_mass_schema") if key in choice
+                                                  "balance_steps", "balance_tol", "balance_backend", "initial_mass_schema", "surrogate_kernel", "surrogate_schema", "surrogate_source_digest",
+                                                  "ntk_angle_guard", "ntk_norm_guard", "ntk_jitter") if key in choice
                       and pd.notna(choice[key])})
     if "mixing" in choice:
         candidate["mixing"] = choice["mixing"]
@@ -535,7 +590,11 @@ def selected_test(root, choice, condensation_seeds=(0, 1, 2), student_seeds=(100
         if isinstance(value, bool) or not isinstance(value, Real) or not math.isfinite(value) or int(value) != value:
             raise ValueError("Selected balance_steps must be an integer")
         candidate["balance_steps"] = int(value)
-    candidate = _candidate_nystrom_mass(candidate)
+    candidate = _candidate_surrogate(_candidate_nystrom_mass(candidate))
+    if candidate.get("surrogate_kernel") is not None and "candidate_path" in raw:
+        expected = root / _fingerprint(candidate)
+        if Path(raw["candidate_path"]).resolve() != expected.resolve() or recorded != candidate:
+            raise ValueError("Selected NTK row differs from its recorded candidate identity")
     for key in ("lr", "T", "penalty"):
         candidate[key] = float(candidate[key])
     _assignment_mass_mode(candidate)
@@ -566,13 +625,13 @@ def selected_test(root, choice, condensation_seeds=(0, 1, 2), student_seeds=(100
     if dataset_digest(graph, train, validation, testing) != config["data_digest"]:
         raise ValueError("Graph or splits differ from the selected source screen")
     h = fixed_propagated_features(h, config, root)
-    if candidate.get("mass_mode") != "initial":
+    if candidate.get("mass_mode") != "initial" and candidate.get("surrogate_kernel") is None:
         save_json(selection, root / "selected.json")
         save_json(selection, root / f"selected_{selection_key}.json")
     logits = torch.load(root / "teacher.pt", map_location=device, weights_only=False)["logits"]
     q = training_refined_targets(logits, candidate["T"], graph["y"], train,
                                  candidate.get("train_target_mix", 0.0))
-    if candidate.get("mass_mode") == "initial":
+    if candidate.get("mass_mode") == "initial" or candidate.get("surrogate_kernel") is not None:
         for cond_seed in condensation_seeds:
             existing = root / _fingerprint(candidate) / f"condensation_{cond_seed}"
             for filename, is_resume in (("resume.pt", True), (f"step_{step:06d}.pt", False)):
@@ -605,8 +664,8 @@ def selected_test(root, choice, condensation_seeds=(0, 1, 2), student_seeds=(100
             raise ValueError("Nyström checkpoint inner weighting differs from the selection")
         if candidate["method"] == "nystrom":
             _check_nystrom_assignment(candidate, snapshot, root=root, condensation_seed=cond_seed, device=device,
-                                      h=h if candidate.get("mass_mode") == "initial" else None,
-                                      q=q if candidate.get("mass_mode") == "initial" else None)
+                                      h=h if candidate.get("mass_mode") == "initial" or candidate.get("surrogate_kernel") is not None else None,
+                                      q=q if candidate.get("mass_mode") == "initial" or candidate.get("surrogate_kernel") is not None else None)
         if candidate["method"] == "coarsening":
             from src.coarsening_ce import gcn_inputs
             x, y, mass, training_adj = gcn_inputs(snapshot, device)
