@@ -56,7 +56,7 @@ def test_uniform_mass_mode_and_stop_are_forwarded_and_ranked(tmp_path, screen, m
     assert set(ranking["mass_mode"]) == {"uniform"}
 
 
-@pytest.mark.parametrize("method", ["distance", "nystrom", "coarsening"])
+@pytest.mark.parametrize("method", ["distance", "coarsening"])
 def test_unsupported_assignments_reject_explicit_mass_mode(tmp_path, screen, method):
     with pytest.raises(ValueError, match="supported only"):
         search.run_screen(
