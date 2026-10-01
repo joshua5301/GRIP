@@ -2,7 +2,10 @@
 import hashlib
 import inspect
 import json
+import math
 import time
+from collections.abc import Mapping
+from numbers import Real
 from pathlib import Path
 
 import pandas as pd
@@ -44,6 +47,23 @@ def _assignment_mass_mode(identity):
     return mode
 
 
+def _candidate_background_mixing(candidate):
+    """Canonicalize a per-candidate prior without changing legacy defaults."""
+    if not isinstance(candidate, Mapping):
+        raise ValueError("Candidates must be mappings")
+    candidate = dict(candidate)
+    mixing = candidate.get("mixing", 0.05)
+    if (isinstance(mixing, bool) or not isinstance(mixing, Real)
+            or not math.isfinite(mixing) or not 0 < mixing < 1):
+        raise ValueError("mixing must be finite and lie strictly in (0, 1)")
+    mixing = float(mixing)
+    if mixing == 0.05:
+        candidate.pop("mixing", None)
+    else:
+        candidate["mixing"] = mixing
+    return candidate, mixing
+
+
 def _student_settings(dropout, epochs, overrides):
     settings = dict(epochs=epochs, eval_every=10, hidden=256, dropout=dropout,
                     lr=0.01, weight_decay=0.0005)
@@ -63,9 +83,15 @@ def _student_settings(dropout, epochs, overrides):
 def run_screen(dataset, ratio, output_dir, candidates, steps=50,
                student_seeds=(0, 1), condensation_seed=0, dropout=0.9,
                epochs=500, data_dir="data", device="cuda", checkpoints=None, input_scale=1.0,
-               citation_features="default", stop=lambda: False, student_settings=None):
+               citation_features="default", stop=lambda: False, student_settings=None,
+               report_routes=False):
     if dataset not in ("cora", "citeseer") or (dataset, ratio) not in BUDGET:
         raise ValueError("Use a configured Cora/Citeseer budget")
+    # Check every requested prior before loading a dataset or fitting a teacher.
+    # Explicit .05 removes the field so legacy identities/protocols are retained.
+    candidates = [_candidate_background_mixing(candidate)[0] for candidate in candidates]
+    if not isinstance(report_routes, bool):
+        raise ValueError("report_routes must be a boolean")
     settings = _student_settings(dropout, epochs, student_settings)
     torch.set_num_threads(4)
     torch.backends.cuda.matmul.allow_tf32 = False
@@ -99,6 +125,8 @@ def run_screen(dataset, ratio, output_dir, candidates, steps=50,
     save_json(recipe, root / f"student_recipe_{recipe_key}.json")
     screen_protocol = dict(candidates=candidates, steps=steps, checkpoints=checkpoints,
                            condensation_seed=condensation_seed, student_seeds=list(student_seeds), recipe=recipe)
+    if report_routes:
+        screen_protocol["report_routes"] = True
     screen_key = _fingerprint(screen_protocol)
     save_json(screen_protocol, root / f"screen_protocol_{screen_key}.json")
     evaluation_graph = dict(graph, x=graph["x"] * input_scale)
@@ -109,6 +137,7 @@ def run_screen(dataset, ratio, output_dir, candidates, steps=50,
         if stop():
             raise InterruptedError("Citation screen stopped between candidates")
         identity = {"method": "low_rank", "width": 0, "lr": 0.01, **candidate}
+        mixing = identity.get("mixing", config["mixing"])
         mass_mode = _assignment_mass_mode(identity)
         if identity["method"] == "nystrom":
             # Keep legacy, unverified resume files separate from hardened inputs.
@@ -149,6 +178,7 @@ def run_screen(dataset, ratio, output_dir, candidates, steps=50,
                                  if metric_mode == "teacher_joint" else None)
                 optimize_distance_ce(z, q, assignment, metric_inputs=metric_inputs,
                     penalty=identity["penalty"], steps=steps, lr=identity["lr"],
+                    mixing=mixing,
                     strength=identity.get("strength", 3.0),
                     inner_loss_weighting=identity.get("inner_loss_weighting", "mass"),
                     folder=folder, checkpoint_steps=checks, resume_state=state, stop=stop)
@@ -160,12 +190,13 @@ def run_screen(dataset, ratio, output_dir, candidates, steps=50,
                 phi = cache_features(h, feature_map, root / "nystrom_phi_schema3.npy", stop=stop)
                 optimize(h.double(), q, assignment, feature_map, phi, folder, steps,
                          penalty=identity["penalty"], lr=identity["lr"], rank=identity["rank"],
-                         seed=condensation_seed, checkpoint_every=25, stop=stop)
+                         seed=condensation_seed, checkpoint_every=25, mixing=mixing, stop=stop)
                 del feature_map, phi
             elif identity["method"] == "coarsening":
                 from src.coarsening_ce import optimize_coarsening_ce
                 optimize_coarsening_ce(graph["x"], q, assignment, graph["adj"], h=h, transform=transform,
                     penalty=identity["penalty"], steps=steps, lr=identity["lr"], rank=identity["rank"],
+                    mixing=mixing,
                     seed=condensation_seed, mass_scaling=identity.get("mass_scaling", False),
                     inner_loss_weighting=identity.get("inner_loss_weighting", "mass"),
                     folder=folder, checkpoint_steps=checks, resume_state=state, stop=stop)
@@ -173,6 +204,7 @@ def run_screen(dataset, ratio, output_dir, candidates, steps=50,
                 if identity["method"] not in ("low_rank", "mlp"):
                     raise ValueError("Unknown assignment method")
                 optimize_ce_assignment(z, q, assignment, penalty=identity["penalty"], steps=steps,
+                    mixing=mixing,
                     lr=identity["lr"], assignment_rank=identity["rank"], factor_seed=condensation_seed,
                     assignment_input="features" if identity["method"] == "mlp" else "node",
                     assignment_encoder="mlp" if identity["method"] == "mlp" else "linear",
@@ -206,6 +238,21 @@ def run_screen(dataset, ratio, output_dir, candidates, steps=50,
                 result = fit_gcn_diagnostic(x * input_scale, y, torch.full_like(mass, 1 / len(mass)), evaluation_graph, q,
                     dict(train=train, val=validation[1]), seed, folder=folder / "validation"
                     / f"step_{step}_{recipe_key}", training_adjacency=training_adj, stop=stop, **settings)
+                if report_routes:
+                    from src.student_routes import replay_routes
+                    evaluation_folder = folder / "validation" / f"step_{step}_{recipe_key}"
+                    if any("test_" in key for key in result):
+                        raise ValueError("Validation-only student unexpectedly returned test metrics")
+                    routes = replay_routes(
+                        evaluation_folder / f"seed_{seed}_selected.pt", evaluation_graph,
+                        h.float() * input_scale, dict(val=validation[1]), settings,
+                        evaluation_folder / f"seed_{seed}_validation_routes_v1.json", seed=seed, stop=stop)
+                    if (any("test_" in key for key in routes) or routes["epoch"] != result["epoch"]
+                            or not math.isclose(routes["gcn_val_acc"], result["val_acc"], abs_tol=1e-8, rel_tol=0)
+                            or not math.isclose(routes["gcn_val_ce"], result["val_ce"], abs_tol=1e-6, rel_tol=1e-6)):
+                        raise ValueError("Validation route replay differs from the selected student")
+                    result = dict(result, **{key: value for key, value in routes.items()
+                                            if key.startswith(("gcn_", "mlp_"))})
                 records.append(dict(**identity, condensation_seed=condensation_seed, step=step,
                                     **result, dropout=dropout, input_scale=input_scale, epochs=epochs,
                                     student_recipe=recipe_key,
@@ -213,11 +260,22 @@ def run_screen(dataset, ratio, output_dir, candidates, steps=50,
         print("CANDIDATE_DONE", dataset, identity, "seconds", round(time.monotonic() - started, 2), flush=True)
         write_table(pd.DataFrame(records), root / f"screen_{condensation_seed}_{steps}_{recipe_key}_{screen_key}.csv")
     frame = pd.DataFrame(records)
+    if "mixing" in frame.columns:
+        # A selected default row must carry .05, not an ambiguous NaN value.
+        frame["mixing"] = frame["mixing"].fillna(config["mixing"])
     keys = ["method", "width", "lr", "T", "rank", "penalty", "step", "candidate_path"]
     keys += [key for key in ("initialization", "alpha", "inner_loss_weighting", "mass_mode", "mass_scaling",
-                            "metric_input", "metric_alpha", "strength", "train_target_mix") if key in frame.columns]
+                            "metric_input", "metric_alpha", "strength", "train_target_mix", "mixing") if key in frame.columns]
     keys += ["dropout", "input_scale", "epochs", "student_recipe"]
-    summary = frame.groupby(keys, dropna=False).val_acc.agg(["mean", "std", "count"]).reset_index()
+    grouped = frame.groupby(keys, dropna=False)
+    if report_routes:
+        aggregates = dict(mean=("val_acc", "mean"), std=("val_acc", "std"), count=("val_acc", "count"))
+        aggregates.update({f"{metric}_{stat}": (metric, stat)
+                           for metric in ("gcn_val_acc", "mlp_val_acc", "gcn_val_ce", "mlp_val_ce")
+                           for stat in ("mean", "std")})
+        summary = grouped.agg(**aggregates).reset_index()
+    else:
+        summary = grouped.val_acc.agg(["mean", "std", "count"]).reset_index()
     summary = summary.sort_values("mean", ascending=False)
     write_table(summary, root / f"ranking_{condensation_seed}_{steps}_{recipe_key}_{screen_key}.csv")
     print("VALIDATION_RANKING", dataset, "\n", summary.head(8).to_string(index=False), flush=True)
@@ -229,7 +287,6 @@ def selected_test(root, choice, condensation_seeds=(0, 1, 2), student_seeds=(100
                   stop=lambda: False, report_routes=True, student_settings=None):
     """Test only a fixed configuration and checkpoint, with fresh student seeds."""
     root = Path(root)
-    config = json.loads((root / "config.json").read_text())
     candidate = {key: choice[key] for key in ("method", "width", "lr", "T", "rank", "penalty")}
     candidate["rank"], candidate["width"] = int(candidate["rank"]), int(candidate["width"])
     for key in ("lr", "T", "penalty"):
@@ -239,7 +296,11 @@ def selected_test(root, choice, condensation_seeds=(0, 1, 2), student_seeds=(100
     candidate.update({key: choice[key] for key in ("initialization", "alpha", "inner_loss_weighting", "mass_mode", "mass_scaling",
                                                   "metric_input", "metric_alpha", "strength", "train_target_mix") if key in choice
                       and pd.notna(choice[key])})
+    if "mixing" in choice:
+        candidate["mixing"] = choice["mixing"]
+    candidate, _ = _candidate_background_mixing(candidate)
     _assignment_mass_mode(candidate)
+    config = json.loads((root / "config.json").read_text())
     step = int(choice["step"])
     selection = dict(candidate=candidate, step=step, selection="validation_only",
                      student=dict(dropout=dropout, input_scale=input_scale, epochs=epochs),
