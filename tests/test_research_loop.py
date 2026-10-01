@@ -70,7 +70,7 @@ def test_stop_file_prevents_dispatch_and_worker_lock_prevents_second_worker(tmp_
     assert run_plan(path, dispatch_fn=lambda *_: pytest.fail("must not launch"))["phase"] == "stopped"
 
 
-@pytest.mark.parametrize("kind", ["large_pilot", "large_final"])
+@pytest.mark.parametrize("kind", ["large_pilot", "large_final", "large_quotient"])
 def test_pilot_deadline_is_recorded_as_incomplete_without_blind_retries(tmp_path, kind):
     spec = dict(job(), kind=kind)
     path = prepare(tmp_path, [spec])
@@ -109,3 +109,19 @@ def test_failed_final_is_not_counted_as_completed(tmp_path):
     ledger = json.loads((tmp_path / "jobs.json").read_text())
     assert outcome["completed"] == 0
     assert ledger["first"]["phase"] == "failed"
+
+
+def test_quotient_dispatch_is_validation_only_and_preserves_stop(tmp_path, monkeypatch):
+    callback = lambda: False
+    calls = []
+
+    def quotient(**options):
+        calls.append(options)
+        return dict(status="complete", rows=[]), tmp_path
+
+    monkeypatch.setattr("src.large_quotient_pilot.run_quotient_pilot", quotient)
+    options = dict(source_manifest_path="frozen.json", source_manifest_sha256="fixed")
+    result = dispatch(dict(kind="large_quotient", options=options), callback)
+    assert calls == [dict(options, stop=callback)]
+    assert result == dict(report=dict(status="complete", rows=[]), root=str(tmp_path.resolve()),
+                         validation_only=True)

@@ -55,6 +55,10 @@ def dispatch(job, stop):
         report, root = run_final(**options, stop=stop)
         return dict(report=report, root=str(Path(root).resolve()),
                     validation_only=False, fixed_configuration_test=True)
+    if job["kind"] == "large_quotient":
+        from src.large_quotient_pilot import run_quotient_pilot
+        report, root = run_quotient_pilot(**options, stop=stop)
+        return dict(report=report, root=str(Path(root).resolve()), validation_only=True)
     raise ValueError(f"Unknown research job kind: {job['kind']}")
 
 
@@ -132,7 +136,7 @@ def run_plan(path, max_seconds=1800, dispatch_fn=dispatch):
             try:
                 record["result"] = dispatch_fn(job, stop)
                 record["phase"] = "completed"
-                if job["kind"] in ("large_pilot", "large_final"):
+                if job["kind"] in ("large_pilot", "large_final", "large_quotient"):
                     report = record["result"].get("report", record["result"])
                     if report.get("status") != "complete":
                         record["phase"] = "pilot_stopped" if report.get("status") == "stopped" else "failed"
