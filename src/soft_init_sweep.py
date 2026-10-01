@@ -36,6 +36,13 @@ def run_distance_cost_sweep(output_dir, gammas, temperatures, assignment_tempera
     )
 
 
+def random_cost_base(nodes, cells, seed, temperature, device, dtype):
+    generator = torch.Generator().manual_seed(seed)
+    cost = torch.randn(nodes, cells, generator=generator, dtype=dtype).to(device)
+    cost = cost - cost.mean(1, keepdim=True)
+    return -cost / cost.square().mean().sqrt().clamp_min(1e-12) / temperature
+
+
 def run_soft_init_sweep(
     output_dir, gammas, temperatures, taus, penalties, ratio=0.013, rank=8,
     steps=1000, checkpoint_steps=(0, 25, 100, 300, 500, 750, 1000),
@@ -44,7 +51,12 @@ def run_soft_init_sweep(
     hidden=256, dropout=0.9, student_lr=0.01, weight_decay=0.0005,
     data_dir="/content/data/", device="cuda",
     finetune_temperatures=None,
+    initialization="kmeans",
 ):
+    if initialization not in ("kmeans", "random"):
+        raise ValueError("Unknown initialization")
+    if initialization == "random" and finetune_temperatures is None:
+        raise ValueError("Random costs require the normalized cost sweep")
     values = [*gammas, *temperatures, *taus, *penalties, *(finetune_temperatures or ())]
     if any(not v for v in (gammas, temperatures, taus, penalties)) or any(
         not np.isfinite(v) or v <= 0 for v in values
@@ -65,6 +77,8 @@ def run_soft_init_sweep(
     config = {k: v for k, v in locals().copy().items() if k not in ("output_dir", "device", "values")}
     if finetune_temperatures is None:
         config.pop("finetune_temperatures")
+    if initialization == "kmeans":
+        config.pop("initialization")
     normalized = finetune_temperatures is not None
     torch.backends.cuda.matmul.allow_tf32 = False
     torch.backends.cudnn.allow_tf32 = False
@@ -85,7 +99,11 @@ def run_soft_init_sweep(
         transform = FeatureTransform(**saved["transform"])
     else:
         z, transform = fit_transform(h.double(), kind="rms")
-        assignments = {s: feature_kmeans(h.cpu(), cells, s).to(device) for s in condensation_seeds}
+        assignments = {
+            s: feature_kmeans(h.cpu(), cells, s).to(device) if initialization == "kmeans"
+            else torch.arange(len(z), device=device) % cells
+            for s in condensation_seeds
+        }
         save_state(dict(z=z, assignments=assignments, transform=vars(transform)), root / "inputs.pt")
     settings = dict(epochs=epochs, eval_every=eval_every, hidden=hidden, dropout=dropout,
                     lr=student_lr, weight_decay=weight_decay)
@@ -100,7 +118,9 @@ def run_soft_init_sweep(
         ) for seed in (final_seeds if final else search_seeds)]
 
     def initial_state(seed, tau, q):
-        base = distance_base(z, assignments[seed], tau, normalized=normalized)
+        base = (distance_base(z, assignments[seed], tau, normalized=normalized)
+                if initialization == "kmeans"
+                else random_cost_base(len(z), cells, seed, tau, device, z.dtype))
         u, v = initialize_factors(assignments[seed], cells, rank, seed)
         with torch.no_grad():
             moments = LowRankMoments.apply(u, v, base, make_material(z, q), 0.05, 8192)
@@ -117,7 +137,8 @@ def run_soft_init_sweep(
             probability = base.softmax(1)
             save_json(dict(
                 entropy=float(-(probability * probability.clamp_min(1e-300).log()).sum(1).mean()),
-                agreement=float((probability.argmax(1) == assignments[seed]).double().mean()),
+                agreement=(float((probability.argmax(1) == assignments[seed]).double().mean())
+                           if initialization == "kmeans" else None),
                 min_mass=float(moments[:, 0].min()),
             ), folder / "assignment.json")
             records.extend(dict(candidate=index, **params, step=0, condensation_seed=seed, **row)
@@ -164,7 +185,8 @@ def run_soft_init_sweep(
                         save_json(dict(
                             t=t,
                             entropy=float(-(probability * probability.clamp_min(1e-300).log()).sum(1).mean()),
-                            agreement=float((probability.argmax(1) == assignments[seed]).double().mean()),
+                            agreement=(float((probability.argmax(1) == assignments[seed]).double().mean())
+                                       if initialization == "kmeans" else None),
                             min_mass=float(initial[:, 0].min()),
                         ), cache.parent / "assignment.json")
                 else:
@@ -214,6 +236,7 @@ def run_soft_init_sweep(
         summary["t"] = summary.phase.map(dict(selection_initial=chosen["tau"], initial=selected["t"], selected=selected["t"]))
         summary["step"] = summary.phase.map(dict(selection_initial=0, initial=0, selected=int(selected["step"])))
         summary["search_val"] = summary.phase.map(dict(selection_initial=chosen["val"], initial=initial_score, selected=selected["val"]))
+    summary["initialization"] = initialization
     for name, table in (("summary", summary), ("by_seed", by_seed), ("final_students", final)):
         write_table(table, root / f"{name}.csv")
     return summary, by_seed, initial_grid, search, root

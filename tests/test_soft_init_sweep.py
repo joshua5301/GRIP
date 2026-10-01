@@ -3,7 +3,7 @@ import torch
 
 from src.low_rank_assignment import CachedLowRankMoments, LowRankMoments
 from src.soft_ce_partition import optimize_ce_assignment
-from src.soft_init_sweep import distance_base
+from src.soft_init_sweep import distance_base, random_cost_base
 
 
 def problem():
@@ -11,6 +11,16 @@ def problem():
     z = torch.randn(12, 3, dtype=torch.double, generator=generator)
     q = torch.randn(12, 2, dtype=torch.double, generator=generator).softmax(1)
     return z, q, torch.arange(12) % 3
+
+
+def test_random_cost_initialization():
+    state = torch.random.get_rng_state()
+    base = random_cost_base(100, 5, 7, 0.3, "cpu", torch.double)
+    torch.testing.assert_close(torch.random.get_rng_state(), state)
+    torch.testing.assert_close(base, random_cost_base(100, 5, 7, 0.3, "cpu", torch.double))
+    assert not torch.equal(base, random_cost_base(100, 5, 8, 0.3, "cpu", torch.double))
+    torch.testing.assert_close(base.mean(1), torch.zeros(100, dtype=torch.double), atol=1e-12, rtol=0)
+    torch.testing.assert_close((base * 0.3).square().mean(), torch.ones((), dtype=torch.double))
 
 
 def test_distance_probabilities():

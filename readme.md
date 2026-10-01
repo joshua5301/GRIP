@@ -167,3 +167,15 @@ for compatibility; the fine-tuning grid and summary call it `t`. This sequential
 selection does not jointly optimize gamma, T and t. Reusing the same configuration
 resumes optimization and cached student evaluations. The old unnormalized sweep
 retains its original formula and cache identity.
+
+For the matched random-prior ablation, set `initialization="random"` in
+`run_distance_cost_sweep`. No k-means is called. A seeded N-by-M Gaussian cost
+matrix, independent of features and labels, replaces D; identical row centering
+and RMS scaling apply. U=0, Gaussian V, rank, temperature and all training rules
+remain unchanged. The dummy assignment only specifies the number of cells; it
+does not define probabilities, representatives or labels. The random base remains
+fixed during optimization, so this ablates the geometric prior as well as the
+starting assignment, not solely an initial value in a shared parameterization.
+For Cora 1.3%, compare both priors at gamma=0.0001, T=2, t=0.3, penalty=0.003,
+rank=8 and lr=0.01, with the same checkpoints and seeds. This is a matched-setting
+ablation, not a separately tuned performance comparison.
