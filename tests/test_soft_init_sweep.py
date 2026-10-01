@@ -86,6 +86,35 @@ def test_dual_feature_mlp_preserves_initial_moments(tmp_path):
     torch.testing.assert_close(recovered, result["best_moments"])
 
 
+def test_dual_feature_mlp_probability_floor(tmp_path):
+    z, q, assignment = problem()
+    inputs = z.float() * z.shape[1]**0.5
+    node_parameters, cell_parameters, anchors = initialize_dual_mlp(inputs, 3, 2, 6, 7)
+    u = encode_nodes(inputs, node_parameters)
+    v = encode_nodes(inputs[anchors], cell_parameters)
+    base = z.new_zeros(len(z), 3)
+    material = torch.cat((torch.ones(12, 1, dtype=z.dtype), z, q), 1)
+    floor = 0.01
+    actual = LowRankMoments.apply(u, -v / 0.3, base, material, 0.05, 5, floor)
+    probability = (base + u @ (-v / 0.3).T / 2**0.5).softmax(1)
+    probability = probability * (1 - floor) + floor / 3
+    expected = probability.T @ material / 12
+    torch.testing.assert_close(actual, expected)
+    parameters = [*node_parameters, *cell_parameters]
+    gradients = torch.autograd.grad(actual.square().sum(), parameters, retain_graph=True)
+    reference = torch.autograd.grad(expected.square().sum(), parameters)
+    for gradient, target in zip(gradients, reference, strict=True):
+        torch.testing.assert_close(gradient, target)
+    result = optimize_ce_assignment(
+        z, q, assignment, assignment_rank=2, assignment_input="features",
+        assignment_encoder="dual_mlp", encoder_hidden=6, factor_seed=7,
+        base_logits=base, correction_scale=-1 / 0.3, probability_floor=floor,
+        penalty=0.2, inner_method="newton_first", inner_tol=1e-8,
+        steps=1, checkpoint_steps=(0, 1), folder=tmp_path,
+    )
+    torch.testing.assert_close(result["checkpoints"][0]["moments"], expected)
+
+
 def test_distance_probabilities():
     z, _, assignment = problem()
     centers = torch.stack([z[assignment == i].mean(0) for i in range(3)])

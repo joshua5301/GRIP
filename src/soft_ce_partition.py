@@ -524,6 +524,7 @@ def optimize_ce_assignment(
     base_logits=None,
     correction_scale=1.0,
     factor_initial_std=0.0,
+    probability_floor=0.0,
 ):
     if feature_control != "joint" or initial_representatives is not None:
         raise ValueError("Only clustering-derived features and labels are supported")
@@ -580,6 +581,12 @@ def optimize_ce_assignment(
     elif (assignment_rank is None or assignment_input != "node" or not np.isfinite(factor_initial_std)
           or factor_initial_std < 0):
         raise ValueError("Random factor initialization requires node-level low-rank assignment")
+    if not 0 <= probability_floor < 1 or (probability_floor and (
+        assignment_encoder != "dual_mlp" or mass_mode != "free" or cache_assignment
+    )):
+        raise ValueError("Probability floor requires dual feature MLP assignments")
+    if probability_floor == 0:
+        resume_config.pop("probability_floor")
     if sparse_k is None:
         resume_config.pop("sparse_k")
     elif (assignment_rank is not None or assignment_input != "node" or assignment_encoder != "linear"
@@ -842,9 +849,13 @@ def optimize_ce_assignment(
             )
         elif assignment_rank is not None:
             operation = CachedLowRankMoments if cache_assignment else LowRankMoments
-            moments = operation.apply(
+            arguments = (
                 u, v if correction_scale == 1.0 else v * correction_scale,
-                assignment if base_logits is None else base_logits, material, mixing, chunk_size
+                assignment if base_logits is None else base_logits, material, mixing, chunk_size,
+            )
+            moments = (
+                operation.apply(*arguments, probability_floor)
+                if probability_floor else operation.apply(*arguments)
             )
         else:
             moments = AssignmentMoments.apply(logits, material, chunk_size)

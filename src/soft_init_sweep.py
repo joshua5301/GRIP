@@ -46,7 +46,8 @@ def run_distance_cost_sweep(output_dir, gammas, temperatures, assignment_tempera
 def run_dual_mlp_width_sweep(output_dir, widths, gammas, temperatures, t, penalty, **options):
     return run_soft_init_sweep(
         output_dir, gammas, temperatures, [1.0], [penalty],
-        finetune_temperatures=[t], initialization="none", assignment_widths=widths, **options,
+        finetune_temperatures=[t], initialization="none", assignment_widths=widths,
+        assignment_floor=0.01, **options,
     )
 
 
@@ -69,6 +70,7 @@ def run_soft_init_sweep(
     resume_from=None,
     shared_features_path=None,
     assignment_widths=None,
+    assignment_floor=0.0,
 ):
     if initialization not in ("kmeans", "random", "none"):
         raise ValueError("Unknown initialization")
@@ -79,6 +81,8 @@ def run_soft_init_sweep(
         or any(not isinstance(width, int) or width < 1 for width in assignment_widths)
     ):
         raise ValueError("Dual MLP widths require positive integers and no fixed cost")
+    if not 0 <= assignment_floor < 1 or (assignment_floor and assignment_widths is None):
+        raise ValueError("Assignment floor requires dual feature MLP widths")
     values = [*gammas, *temperatures, *taus, *penalties, *(finetune_temperatures or ())]
     if any(not v for v in (gammas, temperatures, taus, penalties)) or any(
         not np.isfinite(v) or v <= 0 for v in values
@@ -105,6 +109,8 @@ def run_soft_init_sweep(
         config.pop("shared_features_path")
     if assignment_widths is None:
         config.pop("assignment_widths")
+    if assignment_floor == 0:
+        config.pop("assignment_floor")
     normalized = finetune_temperatures is not None
     torch.backends.cuda.matmul.allow_tf32 = False
     torch.backends.cudnn.allow_tf32 = False
@@ -200,9 +206,15 @@ def run_soft_init_sweep(
             u, v = initialize_factors(assignments[seed], cells, rank, seed, u_std)
         correction_scale = -1 / tau if normalized else 1.0
         with torch.no_grad():
-            moments = LowRankMoments.apply(u, v * correction_scale, base, make_material(z, q), 0.05, 8192)
+            arguments = (u, v * correction_scale, base, make_material(z, q), 0.05, 8192)
+            moments = (
+                LowRankMoments.apply(*arguments, assignment_floor)
+                if assignment_floor else LowRankMoments.apply(*arguments)
+            )
             logits = base + u @ (v * correction_scale).T / rank**0.5
             probability = logits.softmax(1)
+            if assignment_floor:
+                probability = probability * (1 - assignment_floor) + assignment_floor / cells
         return base, moments, probability
 
     grid = grid_rows(dict(gamma=list(gammas), T=list(temperatures), tau=list(taus)))
@@ -251,6 +263,7 @@ def run_soft_init_sweep(
                     assignment_input="features" if width is not None else "node",
                     assignment_encoder="dual_mlp" if width is not None else "linear",
                     encoder_hidden=width or 64,
+                    probability_floor=assignment_floor,
                     checkpoint_steps=checkpoints, folder=folder, resume_state=state,
                     save_resume=True, save_assignment=False, inner_method="newton_first",
                     implicit_warm_start=True, inner_loss_weighting="mass", cg_max_iter=512,

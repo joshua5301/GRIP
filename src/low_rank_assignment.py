@@ -119,15 +119,18 @@ class LowRankLogits(torch.autograd.Function):
 
 class LowRankMoments(torch.autograd.Function):
     @staticmethod
-    def forward(ctx, u, v, assignment, material, mixing, chunk_size):
+    def forward(ctx, u, v, assignment, material, mixing, chunk_size, probability_floor=0.0):
         ctx.save_for_backward(u, v, assignment, material)
-        ctx.mixing, ctx.chunk_size = mixing, chunk_size
+        ctx.mixing, ctx.chunk_size, ctx.probability_floor = mixing, chunk_size, probability_floor
+        ctx.has_floor = len(ctx.needs_input_grad) == 7
         result = material.new_zeros(len(v), material.shape[1])
         for start in range(0, len(u), chunk_size):
             end = start + chunk_size
             probability = (
                 logit_block(u[start:end], v, assignment[start:end], mixing).to(material.dtype).softmax(1)
             )
+            if probability_floor:
+                probability = probability * (1 - probability_floor) + probability_floor / len(v)
             result += probability.T @ material[start:end] / len(u)
         return result
 
@@ -143,14 +146,16 @@ class LowRankMoments(torch.autograd.Function):
                 logit_block(u[start:end], v, assignment[start:end], ctx.mixing).to(material.dtype).softmax(1)
             )
             if dm is not None:
-                dm[start:end] = probability @ gradient / len(u)
+                mixture = probability * (1 - ctx.probability_floor) + ctx.probability_floor / len(v)
+                dm[start:end] = mixture @ gradient / len(u)
             direction = material[start:end] @ gradient.T / len(u)
             block = (probability * (direction - (probability * direction).sum(1, keepdim=True))).to(
                 u.dtype
-            ) / scale
+            ) * ((1 - ctx.probability_floor) / scale)
             du[start:end] = block @ v
             dv += block.T @ u[start:end]
-        return du, dv, None, dm, None, None
+        result = du, dv, None, dm, None, None
+        return result + (None,) if ctx.has_floor else result
 
 
 class CachedLowRankMoments(torch.autograd.Function):
