@@ -209,3 +209,12 @@ softmax(-UVᵀ/(sqrt(rank)*t)). The sweep selects width and checkpoint by mean
 GCN validation over the same condensation/student seed pairs, then evaluates
 only the selected setting on independent student seeds. `t` and inner penalty
 are fixed by the caller. The complete grid and optimizer states are resumable.
+
+`run_distance_cost_sweep` also supports inductive Reddit with `dataset="reddit"`
+and ratio `0.001` (153 representatives). Teacher gamma can be selected once by
+inductive validation accuracy with `teacher_selection="accuracy"`; subsequent
+initial and fine-tuning settings use uniform-CE two-layer GCN validation on the
+separate validation graph. Final test evaluation uses the separate test graph
+only after selection. The no-fixed-cost low-rank option remains
+`initialization="none"`. Keep the same configuration and output directory to
+resume candidates and cached evaluations.

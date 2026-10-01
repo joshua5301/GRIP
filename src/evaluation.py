@@ -35,6 +35,27 @@ def split_metrics(log_probability, y, q, masks):
     return values
 
 
+def inductive_metrics(model, graph, q, masks):
+    predictions = {}
+    values = {}
+    for name, (split_graph, mask) in masks.items():
+        key = id(split_graph)
+        if key not in predictions:
+            predictions[key] = _forward(model, split_graph["x"], split_graph["adj"])
+        prediction = predictions[key] if mask is None else predictions[key][mask]
+        labels = split_graph["y"] if mask is None else split_graph["y"][mask]
+        values[f"{name}_acc"] = 100 * float((prediction.argmax(1) == labels).double().mean())
+        values[f"{name}_ce"] = float(F.nll_loss(prediction, labels))
+        if split_graph is graph and q is not None:
+            targets = q if mask is None else q[mask]
+            values[f"{name}_teacher_ce"] = float(-(targets * prediction).sum(1).mean())
+    if q is not None:
+        values["full_teacher_ce"] = float(-(q * predictions[id(graph)]).sum(1).mean())
+    values["val_minus_train_ce"] = values["val_ce"] - values["train_ce"]
+    values["train_minus_val_acc"] = values["train_acc"] - values["val_acc"]
+    return values
+
+
 def fit_gcn_diagnostic(
     cx,
     cy,
@@ -73,10 +94,14 @@ def fit_gcn_diagnostic(
             continue
         model.eval()
         with torch.no_grad():
-            log_probability = _forward(model, graph["x"], graph["adj"])
+            metrics = (
+                inductive_metrics(model, graph, q, masks)
+                if isinstance(masks["val"], tuple)
+                else split_metrics(_forward(model, graph["x"], graph["adj"]), graph["y"], q, masks)
+            )
             row = dict(
                 epoch=epoch,
-                **split_metrics(log_probability, graph["y"], q, masks),
+                **metrics,
                 condensed_ce=float(-(weights[:, None] * cy * _forward(model, cx, training_adjacency)).sum()),
             )
         history.append(row)

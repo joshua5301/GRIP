@@ -71,6 +71,9 @@ def run_soft_init_sweep(
     shared_features_path=None,
     assignment_widths=None,
     assignment_floor=0.0,
+    dataset="cora",
+    teacher_kernel="relu",
+    teacher_selection="condensation",
 ):
     if initialization not in ("kmeans", "random", "none"):
         raise ValueError("Unknown initialization")
@@ -83,6 +86,8 @@ def run_soft_init_sweep(
         raise ValueError("Dual MLP widths require positive integers and no fixed cost")
     if not 0 <= assignment_floor < 1 or (assignment_floor and assignment_widths is None):
         raise ValueError("Assignment floor requires dual feature MLP widths")
+    if teacher_selection not in ("condensation", "accuracy"):
+        raise ValueError("Unknown teacher selection")
     values = [*gammas, *temperatures, *taus, *penalties, *(finetune_temperatures or ())]
     if any(not v for v in (gammas, temperatures, taus, penalties)) or any(
         not np.isfinite(v) or v <= 0 for v in values
@@ -90,7 +95,7 @@ def run_soft_init_sweep(
         raise ValueError("All grids must be nonempty with positive finite values")
     if finetune_temperatures is not None and not finetune_temperatures:
         raise ValueError("Fine-tuning temperature grid must be nonempty")
-    cells = BUDGET[("cora", ratio)]
+    cells = BUDGET[(dataset, ratio)]
     if not isinstance(rank, int) or not 1 <= rank <= cells or steps < 1:
         raise ValueError("Invalid rank or optimization budget")
     if (len(condensation_seeds) < 2 or not search_seeds or not final_seeds
@@ -111,15 +116,26 @@ def run_soft_init_sweep(
         config.pop("assignment_widths")
     if assignment_floor == 0:
         config.pop("assignment_floor")
+    if dataset == "cora":
+        config.pop("dataset")
+    if teacher_kernel == "relu":
+        config.pop("teacher_kernel")
+    if teacher_selection == "condensation":
+        config.pop("teacher_selection")
     normalized = finetune_temperatures is not None
     torch.backends.cuda.matmul.allow_tf32 = False
     torch.backends.cudnn.allow_tf32 = False
-    graph, train, validation, testing, h = _prepare_dataset("cora", data_dir, device)
+    graph, train, validation, testing, h = _prepare_dataset(dataset, data_dir, device)
+    split_parts = (
+        [validation[0]["x"], validation[0]["y"], testing[0]["x"], testing[0]["y"]]
+        if validation[1] is None else [validation[1], testing[1]]
+    )
+    split_parts = [part.cpu().numpy() for part in split_parts]
     if shared_features_path is not None:
         shared = Path(shared_features_path)
         raw_digest = array_digest(
             graph["x"].cpu().numpy(), graph["y"].cpu().numpy(), train.cpu().numpy(),
-            validation[1].cpu().numpy(), testing[1].cpu().numpy(),
+            *split_parts,
         )
         if shared.exists():
             cached = torch.load(shared, map_location="cpu", weights_only=False)
@@ -131,7 +147,7 @@ def run_soft_init_sweep(
             save_state(dict(h=h, raw_digest=raw_digest), shared)
     config.update(version=1, data_digest=array_digest(
         h.cpu().numpy(), graph["y"].cpu().numpy(), train.cpu().numpy(),
-        validation[1].cpu().numpy(), testing[1].cpu().numpy(),
+        *split_parts,
     ))
     root = Path(output_dir) / _fingerprint(config)
     root.mkdir(parents=True, exist_ok=True)
@@ -161,8 +177,13 @@ def run_soft_init_sweep(
             save_json(dict(path=str(previous), steps=old["steps"]), root / "continued_from.json")
     save_json(config, root / "config.json")
     teachers = teacher_logits(
-        h, graph, train, validation, "relu", list(gammas), basis, teacher_seed, root, return_all=True
+        h, graph, train, validation, teacher_kernel, list(gammas), basis, teacher_seed, root, return_all=True
     )
+    if teacher_selection == "accuracy":
+        teacher_grid = pd.read_csv(root / "teacher_grid.csv")
+        selected_gamma = teacher_grid.sort_values(["val", "gamma"], ascending=[False, True]).iloc[0]["gamma"]
+        gammas = [min(teachers, key=lambda candidate: abs(candidate - selected_gamma))]
+        save_json(dict(gamma=gammas[0], selection="validation_accuracy"), root / "selected_teacher.json")
     if (root / "inputs.pt").exists():
         saved = torch.load(root / "inputs.pt", map_location=device, weights_only=False)
         z, assignments = saved["z"], saved["assignments"]
@@ -177,7 +198,10 @@ def run_soft_init_sweep(
         save_state(dict(z=z, assignments=assignments, transform=vars(transform)), root / "inputs.pt")
     settings = dict(epochs=epochs, eval_every=eval_every, hidden=hidden, dropout=dropout,
                     lr=student_lr, weight_decay=weight_decay)
-    masks = dict(train=train, val=validation[1], test=testing[1])
+    masks = (
+        dict(train=(graph, train), val=validation, test=testing)
+        if validation[1] is None else dict(train=train, val=validation[1], test=testing[1])
+    )
 
     def evaluate(moments, q, folder, final=False):
         x, y, mass = representative(moments, transform, z.shape[1], device)
