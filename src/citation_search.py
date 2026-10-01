@@ -47,6 +47,14 @@ def _assignment_mass_mode(identity):
     return mode
 
 
+def _nystrom_inner_weighting(identity):
+    """Validate the surrogate loss without changing candidate identities."""
+    weighting = identity.get("inner_loss_weighting", "mass")
+    if weighting not in ("mass", "uniform"):
+        raise ValueError("Nyström inner_loss_weighting must be mass or uniform")
+    return weighting
+
+
 def _candidate_background_mixing(candidate):
     """Canonicalize a per-candidate prior without changing legacy defaults."""
     if not isinstance(candidate, Mapping):
@@ -154,6 +162,9 @@ def run_screen(dataset, ratio, output_dir, candidates, steps=50,
     # Explicit .05 removes the field so legacy identities/protocols are retained.
     candidates = [_candidate_temperature(_candidate_background_mixing(candidate)[0])
                   for candidate in candidates]
+    for candidate in candidates:
+        if candidate.get("method", "low_rank") == "nystrom":
+            _nystrom_inner_weighting(candidate)
     if not isinstance(report_routes, bool):
         raise ValueError("report_routes must be a boolean")
     settings = _student_settings(dropout, epochs, student_settings)
@@ -248,13 +259,14 @@ def run_screen(dataset, ratio, output_dir, candidates, steps=50,
                     folder=folder, checkpoint_steps=checks, resume_state=state, stop=stop)
             elif identity["method"] == "nystrom":
                 from src.nystrom_ce import cache_features, optimize
-                if identity.get("inner_loss_weighting", "mass") != "mass":
-                    raise ValueError("Nyström screen currently uses mass inner CE")
+                nystrom_options = (dict(inner_loss_weighting="uniform")
+                                   if _nystrom_inner_weighting(identity) == "uniform" else {})
                 feature_map = get_shared_map(h, root / "nystrom_map_schema3.pt", basis=3000, seed=0)
                 phi = cache_features(h, feature_map, root / "nystrom_phi_schema3.npy", stop=stop)
                 optimize(h.double(), q, assignment, feature_map, phi, folder, steps,
                          penalty=identity["penalty"], lr=identity["lr"], rank=identity["rank"],
-                         seed=condensation_seed, checkpoint_every=25, mixing=mixing, stop=stop)
+                         seed=condensation_seed, checkpoint_every=25, mixing=mixing, stop=stop,
+                         **nystrom_options)
                 del feature_map, phi
             elif identity["method"] == "coarsening":
                 from src.coarsening_ce import optimize_coarsening_ce
@@ -295,6 +307,9 @@ def run_screen(dataset, ratio, output_dir, candidates, steps=50,
             if not snapshot_path.exists():
                 continue
             snapshot = torch.load(snapshot_path, map_location=device, weights_only=False)
+            if (identity["method"] == "nystrom"
+                    and snapshot.get("inner_loss_weighting", "mass") != _nystrom_inner_weighting(identity)):
+                raise ValueError("Nyström checkpoint inner weighting differs from the candidate")
             temperature_diagnostic = (_temperature_diagnostics(snapshot, state, step)
                                       if identity.get("learn_temperature", False) else {})
             if identity["method"] == "coarsening":
@@ -390,6 +405,8 @@ def selected_test(root, choice, condensation_seeds=(0, 1, 2), student_seeds=(100
     for key in ("lr", "T", "penalty"):
         candidate[key] = float(candidate[key])
     _assignment_mass_mode(candidate)
+    if candidate["method"] == "nystrom":
+        _nystrom_inner_weighting(candidate)
     config = json.loads((root / "config.json").read_text())
     step = int(choice["step"])
     selection = dict(candidate=candidate, step=step, selection="validation_only",
@@ -429,6 +446,9 @@ def selected_test(root, choice, condensation_seeds=(0, 1, 2), student_seeds=(100
         snapshot_path = (folder / f"step_{step:06d}.pt" if candidate["method"] == "nystrom"
                          else folder / "checkpoints" / f"step_{step:06d}.pt")
         snapshot = torch.load(snapshot_path, map_location=device, weights_only=False)
+        if (candidate["method"] == "nystrom"
+                and snapshot.get("inner_loss_weighting", "mass") != _nystrom_inner_weighting(candidate)):
+            raise ValueError("Nyström checkpoint inner weighting differs from the selection")
         if candidate["method"] == "coarsening":
             from src.coarsening_ce import gcn_inputs
             x, y, mass, training_adj = gcn_inputs(snapshot, device)

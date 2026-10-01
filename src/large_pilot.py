@@ -209,7 +209,8 @@ def run_pilot(
     inner_loss_weighting controls only the convex surrogate; final students
     always use uniform CE. Extend steps (e.g. 20 -> 50) to resume the same candidate.
     surrogate='nystrom' applies the shared teacher map after P-weighted raw-H
-    means and evaluates outer CE on verified CPU phi; it requires mass inner CE.
+    means and evaluates outer CE on verified CPU phi. Its inner CE may use
+    mass or uniform weights; uniform matches the final student loss weighting.
     teacher_gamma defaults to .01 with its exact legacy cache identity. Other
     values have separate teacher/condensation/student folders, while original H,
     map, phi and validation-route H reuse the legacy geometry folder unchanged.
@@ -263,8 +264,6 @@ def run_pilot(
         raise ValueError("inner_loss_weighting must be mass or uniform")
     if surrogate not in ("linear", "nystrom"):
         raise ValueError("surrogate must be linear or nystrom")
-    if surrogate == "nystrom" and inner_loss_weighting != "mass":
-        raise ValueError("The Nyström surrogate supports mass inner CE only")
     if (
         isinstance(mixing, bool)
         or not isinstance(mixing, Real)
@@ -525,6 +524,8 @@ def run_pilot(
             stage("condensing", resume_step=state["step"] if state is not None else 0)
             if not endpoint.exists():
                 if surrogate == "nystrom":
+                    nystrom_options = (dict(inner_loss_weighting="uniform")
+                                       if inner_loss_weighting == "uniform" else {})
                     optimize_nystrom(
                         h,
                         q,
@@ -541,6 +542,7 @@ def run_pilot(
                         stop=stopped,
                         checkpoint_every=5,
                         mixing=mixing,
+                        **nystrom_options,
                     )
                 else:
                     optimize_ce_assignment(
@@ -570,6 +572,8 @@ def run_pilot(
             guard()
             snapshot = torch.load(endpoint, map_location=device, weights_only=False)
             if surrogate == "nystrom":
+                if snapshot.get("inner_loss_weighting", "mass") != inner_loss_weighting:
+                    raise ValueError("Nyström checkpoint inner weighting differs from the candidate")
                 report.update(completed_steps=steps, outer_ce=float(snapshot["outer_ce"]))
                 cx, cy, mass = decode_moments(snapshot["moments"], h.shape[1])
                 cx, cy = cx.float(), cy.float()

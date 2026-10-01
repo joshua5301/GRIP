@@ -348,9 +348,9 @@ def test_nystrom_resumes_internally_and_reuses_existing_endpoint(tmp_path, mocke
 
 
 @pytest.mark.parametrize(
-    "changed", [dict(surrogate="unknown"), dict(surrogate="nystrom", inner_loss_weighting="uniform")]
+    "changed", [dict(surrogate="unknown"), dict(surrogate="nystrom", inner_loss_weighting="mse")]
 )
-def test_invalid_surrogate_or_uniform_nystrom_is_rejected_before_loading(tmp_path, mocked_pipeline, changed):
+def test_invalid_surrogate_or_nystrom_weighting_is_rejected_before_loading(tmp_path, mocked_pipeline, changed):
     with pytest.raises(ValueError):
         pilot.run_pilot("arxiv", 0.0005, tmp_path, device="cpu", basis=2, rank=2, **changed)
     assert mocked_pipeline["data"] == 0

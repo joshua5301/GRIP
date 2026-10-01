@@ -315,22 +315,38 @@ def fit_streaming_teacher(phi, labels, mask, gamma=0.01, chunk=2048,
     return logits, weight.detach()
 
 
-def moment_gradient(moments, dimension, feature_map, theta, vector, penalty):
+def _inner_weights(mass, inner_loss_weighting):
+    """Head-loss weights, separate from P-derived centroid denominators.
+
+    Uniform weights are constant in the moments. Decoding centers and targets
+    still divides their P-weighted sums by the actual cluster masses.
+    """
+    if not isinstance(inner_loss_weighting, str) or inner_loss_weighting not in ("mass", "uniform"):
+        raise ValueError("Inner loss weighting must be mass or uniform")
+    return mass if inner_loss_weighting == "mass" else torch.full_like(mass, 1 / len(mass))
+
+
+def moment_gradient(moments, dimension, feature_map, theta, vector, penalty,
+                    inner_loss_weighting="mass"):
     variable = moments.detach().requires_grad_()
     centers, labels, mass = decode_moments(variable, dimension)
-    gradient = head_gradient(augmented(feature_map(centers)), labels, mass,
+    weights = _inner_weights(mass, inner_loss_weighting)
+    gradient = head_gradient(augmented(feature_map(centers)), labels, weights,
                              theta.detach(), penalty)
     return torch.autograd.grad(-(gradient * vector.detach()).sum(), variable)[0]
 
 
 def optimize(h, q, assignment, feature_map, phi, folder, steps, penalty=1e-4,
              lr=0.01, rank=16, seed=0, chunk=2048, stop=lambda: False,
-             progress=lambda row: None, checkpoint_every=25, mixing=0.05):
+             progress=lambda row: None, checkpoint_every=25, mixing=0.05,
+             inner_loss_weighting="mass"):
     from numbers import Real
 
     if (isinstance(mixing, bool) or not isinstance(mixing, Real)
             or not np.isfinite(mixing) or not 0 < mixing < 1):
         raise ValueError("mixing must be finite and lie strictly in (0, 1)")
+    if not isinstance(inner_loss_weighting, str) or inner_loss_weighting not in ("mass", "uniform"):
+        raise ValueError("Inner loss weighting must be mass or uniform")
     mixing = float(mixing)
     folder = Path(folder)
     folder.mkdir(parents=True, exist_ok=True)
@@ -350,6 +366,8 @@ def optimize(h, q, assignment, feature_map, phi, folder, steps, penalty=1e-4,
     # Default .05 remains implicit for compatibility with verified old resumes.
     if mixing != 0.05:
         config["mixing"] = mixing
+    if inner_loss_weighting != "mass":
+        config["inner_loss_weighting"] = inner_loss_weighting
     u, v = initialize_factors(assignment, config["cells"], rank, seed)
     optimizer = torch.optim.Adam([u, v], lr=lr)
     material = make_material(h.double(), q.double())
@@ -386,8 +404,9 @@ def optimize(h, q, assignment, feature_map, phi, folder, steps, penalty=1e-4,
         started = time.monotonic()
         moments = LowRankMoments.apply(u, v, assignment, material, mixing, chunk)
         centers, labels, mass = decode_moments(moments.detach(), h.shape[1])
+        weights = _inner_weights(mass, inner_loss_weighting)
         mapped = feature_map(centers).detach()
-        inner = solve_inner_newton_first(mapped, labels, mass, penalty, initial=theta)
+        inner = solve_inner_newton_first(mapped, labels, weights, penalty, initial=theta)
         theta = inner["theta"]
         if not inner["inner_converged"]:
             persist(step)
@@ -396,20 +415,23 @@ def optimize(h, q, assignment, feature_map, phi, folder, steps, penalty=1e-4,
         row = dict(step=step, outer_ce=value, inner_grad=inner["inner_grad_max"])
         history = [r for r in history if r["step"] < step] + [row]
         if step % checkpoint_every == 0 or step == steps:
-            save_state(dict(step=step, moments=moments, theta=theta, outer_ce=value,
-                            input_fingerprint=input_fingerprint),
-                       folder / f"step_{step:06d}.pt")
+            snapshot = dict(step=step, moments=moments, theta=theta, outer_ce=value,
+                            input_fingerprint=input_fingerprint)
+            if inner_loss_weighting != "mass":
+                snapshot["inner_loss_weighting"] = inner_loss_weighting
+            save_state(snapshot, folder / f"step_{step:06d}.pt")
             persist(step)
             save_json(history, folder / "history.json")
         if step == steps:
             progress(dict(**row, seconds=time.monotonic() - started))
             return folder / f"step_{step:06d}.pt"
-        vector, diagnostic = solve_head_system(augmented(mapped), labels, mass, theta,
+        vector, diagnostic = solve_head_system(augmented(mapped), labels, weights, theta,
                                                penalty, rhs, initial=vector)
         if not diagnostic["cg_converged"]:
             persist(step)
             raise RuntimeError("Implicit Hessian solve did not converge")
-        derivative = moment_gradient(moments, h.shape[1], feature_map, theta, vector, penalty)
+        derivative = moment_gradient(moments, h.shape[1], feature_map, theta, vector, penalty,
+                                     inner_loss_weighting)
         optimizer.zero_grad(set_to_none=True)
         moments.backward(derivative)
         if not all(torch.isfinite(p.grad).all() for p in (u, v)):
