@@ -222,3 +222,6 @@ To extend a completed run, pass its fingerprinted directory as `resume_from`,
 increase `steps`, retain old checkpoints, and append new penalty values after
 the old penalty list. Existing candidate indices and optimizer states are
 preserved; appended penalty candidates start fresh.
+For rank comparisons, pass the completed run directory as `shared_teacher_path`.
+The runner verifies the graph digest, teacher basis, seed, gamma grid and kernel
+before reusing its teacher logits and validation grid.

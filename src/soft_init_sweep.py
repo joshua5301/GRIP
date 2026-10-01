@@ -74,6 +74,7 @@ def run_soft_init_sweep(
     initialization="kmeans",
     resume_from=None,
     shared_features_path=None,
+    shared_teacher_path=None,
     assignment_widths=None,
     assignment_floor=0.0,
     dataset="cora",
@@ -117,6 +118,8 @@ def run_soft_init_sweep(
         config.pop("initialization")
     if shared_features_path is None:
         config.pop("shared_features_path")
+    if shared_teacher_path is None:
+        config.pop("shared_teacher_path")
     if assignment_widths is None:
         config.pop("assignment_widths")
     if assignment_floor == 0:
@@ -187,6 +190,16 @@ def run_soft_init_sweep(
             shutil.copytree(previous, root, dirs_exist_ok=True)
             save_json(dict(path=str(previous), steps=old["steps"]), root / "continued_from.json")
     save_json(config, root / "config.json")
+    if shared_teacher_path is not None and not (root / "teachers.pt").exists():
+        source = Path(shared_teacher_path)
+        source_config = json.loads((source / "config.json").read_text(encoding="utf-8"))
+        keys = ("data_digest", "basis", "teacher_seed", "gammas")
+        if any(source_config.get(key) != config.get(key) for key in keys) or (
+            source_config.get("teacher_kernel", "relu") != teacher_kernel
+        ):
+            raise ValueError("Shared teacher differs from this experiment")
+        shutil.copy2(source / "teachers.pt", root / "teachers.pt")
+        shutil.copy2(source / "teacher_grid.csv", root / "teacher_grid.csv")
     teachers = teacher_logits(
         h, graph, train, validation, teacher_kernel, list(gammas), basis, teacher_seed, root, return_all=True
     )
