@@ -508,7 +508,7 @@ def expected_resume_config(candidate, z, q, assignment, seed):
                   assignment_rank=candidate["rank"], factor_seed=seed, assignment_input="node",
                   assignment_encoder="linear", encoder_hidden=64, solver_mode="exact", inner_method="newton_first",
                   implicit_warm_start=True, mass_mode="free", inner_loss_weighting="uniform", inner_max_iter=2000,
-                  inner_tol=1e-7, cg_max_iter=512, cg_rtol=1e-6, cache_assignment=False)
+                  inner_tol=1e-7, cg_max_iter=512, cg_rtol=1e-6, cache_assignment=False, save_assignment=False)
     excluded = {"steps", "folder", "checkpoint_steps", "resume_state", "save_resume", "log_every",
                 "initial_representatives", "outer_indices", "implicit_solver", "inner_solver", "temperature_logits",
                 "outer_targets", "stop", "temperature_initial", "temperature_lr", "cg_check_interval", "cache_assignment",

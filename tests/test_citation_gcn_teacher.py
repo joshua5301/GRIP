@@ -439,3 +439,22 @@ def test_fixed_pilot_budget_and_native_precision_preload_guard(toy, case):
                               initialization_source=toy['pin'], steps=50 if case == 'steps' else 25,
                               checkpoints=[2] if case == 'checkpoint' else None, device='cpu')
     assert files(toy['output']) == before and toy['calls']['data'] == 0
+
+
+@pytest.mark.parametrize("steps", [0, 25])
+def test_real_core_resume_and_cached_endpoint_acceptance(toy, monkeypatch, steps):
+    # The real core records its controls independently of the wrapper guard.
+    from src.soft_ce_partition import optimize_ce_assignment
+    monkeypatch.setattr(search, "optimize_ce_assignment", optimize_ce_assignment)
+    root = Path(prepare(toy)["root"])
+    options = dict(dataset="cora", ratio=.013, output_dir=toy["output"], candidates=[toy["candidate"]],
+                   steps=steps, checkpoints=[0], student_seeds=(2600,), dropout=0, epochs=1, device="cpu",
+                   teacher_backend=teacher.BACKEND, initialization_source=toy["pin"])
+    first, produced = search.run_screen(**options)
+    resume = root / _fingerprint(toy["candidate"]) / "condensation_0" / "resume.pt"
+    before = hashlib.sha256(resume.read_bytes()).hexdigest()
+    second, reused = search.run_screen(**options)
+    assert produced == reused == root
+    assert hashlib.sha256(resume.read_bytes()).hexdigest() == before
+    assert set(first.step) == set(second.step) == {0, steps}
+    assert load(resume)["config"]["save_assignment"] is False
