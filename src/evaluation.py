@@ -6,6 +6,7 @@ Test metrics use the selected model once and never appear in epoch histories.
 
 import hashlib
 import json
+import math
 from pathlib import Path
 
 import pandas as pd
@@ -91,6 +92,28 @@ def _input_digest(cx, cy, mass, graph, q, masks, training_adjacency, stop):
     return digest.hexdigest()
 
 
+@torch.no_grad()
+def _initialize_geom_uniform(model, seed):
+    """Match GEOM GraphConvolution's CPU [in, out] weight/bias draw order.
+
+    GEOM commit 3cc01601633a14fc8829fe2e62f2d78fe83ca9a3 initializes each
+    GraphConvolution once, in its constructor: weight then bias, both uniform
+    within +/- 1/sqrt(in_features). Its evaluation path does not call initialize
+    again. Reset the seed after PyG construction discards its different draws.
+    """
+    torch.manual_seed(seed)
+    for layer in model.layers:
+        out_features, in_features = layer.lin.weight.shape
+        bound = 1 / math.sqrt(in_features)
+        weight = torch.empty(in_features, out_features, dtype=layer.lin.weight.dtype, device="cpu")
+        weight.uniform_(-bound, bound)
+        layer.lin.weight.copy_(weight.T)
+        if layer.bias is not None:
+            bias = torch.empty(out_features, dtype=layer.bias.dtype, device="cpu")
+            bias.uniform_(-bound, bound)
+            layer.bias.copy_(bias)
+
+
 def fit_gcn_diagnostic(
     cx,
     cy,
@@ -108,6 +131,8 @@ def fit_gcn_diagnostic(
     folder,
     training_adjacency=None,
     stop=lambda: False,
+    lr_schedule="half_reset",
+    initialization="pyg",
 ):
     """Return scores for the first maximum-validation epoch of one student.
 
@@ -116,9 +141,22 @@ def fit_gcn_diagnostic(
     archived after the new fit succeeds. Optional test metrics are evaluated
     only after restoring validation-selected weights; ``last_test_*`` values
     are intentionally absent. ``stop`` interrupts without writing a new cache.
+    lr_schedule is half_reset (the original Adam reset to lr/10 halfway) or
+    constant. initialization is pyg (the original Glorot/zero-bias draws) or
+    geom_uniform (GEOM's seeded CPU fan-in uniform weights and biases). Default
+    calls retain their original numerical trajectory and recipe fingerprint.
     """
+    if lr_schedule not in ("half_reset", "constant"):
+        raise ValueError("lr_schedule must be half_reset or constant")
+    if initialization not in ("pyg", "geom_uniform"):
+        raise ValueError("initialization must be pyg or geom_uniform")
     settings = dict(epochs=epochs, eval_every=eval_every, hidden=hidden, dropout=dropout,
                     lr=lr, weight_decay=weight_decay)
+    # Preserve existing cache identities when the optional policies are default.
+    if lr_schedule != "half_reset":
+        settings["lr_schedule"] = lr_schedule
+    if initialization != "pyg":
+        settings["initialization"] = initialization
     if any(not isinstance(settings[key], int) or settings[key] < 1 for key in ("epochs", "eval_every", "hidden")):
         raise ValueError("epochs, eval_every and hidden must be positive integers")
     if not 0 <= dropout < 1 or lr <= 0 or weight_decay < 0:
@@ -131,7 +169,8 @@ def fit_gcn_diagnostic(
         raise ValueError("mass must be nonnegative, finite and have positive total")
     recipe = dict(
         version=2, seed=seed, settings=settings, layers=2,
-        optimizer="Adam; reset to lr/10 at epochs//2", weighting="normalized supplied mass",
+        optimizer="Adam; reset to lr/10 at epochs//2" if lr_schedule == "half_reset" else "Adam; constant lr",
+        weighting="normalized supplied mass",
         selection="first maximum validation accuracy", test_enabled="test" in masks,
         test_evaluation="selected weights once", torch_version=torch.__version__,
         input_digest=_input_digest(cx, cy, mass, graph, q, masks, training_adjacency, stop),
@@ -151,7 +190,10 @@ def fit_gcn_diagnostic(
     if stop():
         raise InterruptedError("Student evaluation interrupted before training")
     seed_everything(seed)
-    model = GCN(cx.shape[1], hidden, cy.shape[1], 2, dropout).to(cx.device)
+    model = GCN(cx.shape[1], hidden, cy.shape[1], 2, dropout)
+    if initialization == "geom_uniform":
+        _initialize_geom_uniform(model, seed)
+    model = model.to(cx.device)
     optimizer = torch.optim.Adam(model.parameters(), lr=lr, weight_decay=weight_decay)
     weights = (mass / mass.sum()).to(cx)
     search_masks = {name: masks[name] for name in ("train", "val")}
@@ -159,7 +201,7 @@ def fit_gcn_diagnostic(
     for epoch in range(1, epochs + 1):
         if stop():
             raise InterruptedError("Student evaluation interrupted")
-        if epoch == epochs // 2:
+        if lr_schedule == "half_reset" and epoch == epochs // 2:
             optimizer = torch.optim.Adam(model.parameters(), lr=lr * 0.1, weight_decay=weight_decay)
         model.train()
         optimizer.zero_grad(set_to_none=True)

@@ -113,3 +113,42 @@ def test_selected_final_keeps_uniform_mass_mode_in_candidate_and_recreated_scree
 def test_invalid_mass_mode_is_rejected():
     with pytest.raises(ValueError, match="free or uniform"):
         search._assignment_mass_mode(dict(method="low_rank", mass_mode="unknown"))
+
+
+def test_student_overrides_keep_condensate_and_separate_evaluation_recipe(tmp_path, screen, monkeypatch):
+    seen = []
+
+    def evaluate(*args, **kwargs):
+        seen.append(kwargs)
+        return dict(epoch=1, val_acc=50.0)
+
+    monkeypatch.setattr(search, "fit_gcn_diagnostic", evaluate)
+    defaults, root = search.run_screen("cora", .026, tmp_path, [candidate()], steps=1,
+        epochs=2, student_seeds=(0,), device="cpu")
+    overrides = dict(lr=.001, weight_decay=.001, eval_every=1,
+                     lr_schedule="constant", initialization="geom_uniform")
+    changed, changed_root = search.run_screen("cora", .026, tmp_path, [candidate()], steps=1,
+        epochs=2, dropout=0., student_seeds=(0,), device="cpu", student_settings=overrides)
+    assert root == changed_root
+    assert set(defaults.candidate_path) == set(changed.candidate_path)
+    assert set(defaults.student_recipe).isdisjoint(set(changed.student_recipe))
+    assert seen[0]["lr"] == .01
+    assert seen[-1]["lr_schedule"] == "constant"
+    assert seen[-1]["initialization"] == "geom_uniform"
+    assert seen[-1]["eval_every"] == 1
+
+    search.selected_test(root, changed.iloc[0].to_dict(), condensation_seeds=(0,),
+        student_seeds=(100,), epochs=2, dropout=0., device="cpu", report_routes=False,
+        student_settings=overrides)
+    assert seen[-1]["lr"] == .001
+    assert seen[-1]["lr_schedule"] == "constant"
+    assert seen[-1]["initialization"] == "geom_uniform"
+    selected = json.loads((root / "selected.json").read_text())
+    assert selected["student"]["overrides"] == overrides
+
+
+def test_explicit_student_defaults_preserve_historical_recipe():
+    default = search._student_settings(.9, 1000, None)
+    assert search._student_settings(.9, 1000, dict(lr_schedule="half_reset", initialization="pyg")) == default
+    with pytest.raises(ValueError, match="Unknown student setting"):
+        search._student_settings(.9, 1000, dict(epochs=600))

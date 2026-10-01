@@ -109,3 +109,16 @@ record a source manifest and Git revision for their jobs.
 Low-rank/MLP optimization also checks the worker stop request between solver calls;
 checkpoint files are replaced atomically so an interrupted write cannot masquerade
 as a completed endpoint.
+
+`student_settings` on `run_screen` and `selected_test` can override `lr`,
+`weight_decay`, `eval_every`, `hidden`, `lr_schedule`, and `initialization`.
+The historical default is PyG initialization and Adam reset to lr/10 halfway
+through training; omitting overrides preserves existing cache identifiers.
+`lr_schedule="constant"` and `initialization="geom_uniform"` reproduce GEOM's
+constant learning rate and its uniform fan-in initialization, including biases.
+Validation still selects the epoch and test is scored only after selection.
+GEOM Cora-70 uses row-normalized features, 600 epochs, dropout 0, lr .001,
+weight decay .001, and validation every epoch. Record those choices together;
+changing only the evaluator on a raw-feature condensate does not reproduce the
+row-normalized source protocol. These controls align student settings, while
+our assignment-derived soft labels remain part of the condensation method.

@@ -44,12 +44,29 @@ def _assignment_mass_mode(identity):
     return mode
 
 
+def _student_settings(dropout, epochs, overrides):
+    settings = dict(epochs=epochs, eval_every=10, hidden=256, dropout=dropout,
+                    lr=0.01, weight_decay=0.0005)
+    if overrides is None:
+        return settings
+    allowed = {"eval_every", "hidden", "lr", "weight_decay", "lr_schedule", "initialization"}
+    if not isinstance(overrides, dict) or set(overrides) - allowed:
+        raise ValueError("Unknown student setting; use epochs/dropout arguments for those fields")
+    settings.update(overrides)
+    # Explicit defaults also reuse the historical recipe and evaluation folders.
+    for key, default in (("lr_schedule", "half_reset"), ("initialization", "pyg")):
+        if settings.get(key) == default:
+            del settings[key]
+    return settings
+
+
 def run_screen(dataset, ratio, output_dir, candidates, steps=50,
                student_seeds=(0, 1), condensation_seed=0, dropout=0.9,
                epochs=500, data_dir="data", device="cuda", checkpoints=None, input_scale=1.0,
-               citation_features="default", stop=lambda: False):
+               citation_features="default", stop=lambda: False, student_settings=None):
     if dataset not in ("cora", "citeseer") or (dataset, ratio) not in BUDGET:
         raise ValueError("Use a configured Cora/Citeseer budget")
+    settings = _student_settings(dropout, epochs, student_settings)
     torch.set_num_threads(4)
     torch.backends.cuda.matmul.allow_tf32 = False
     torch.backends.cudnn.allow_tf32 = False
@@ -77,8 +94,6 @@ def run_screen(dataset, ratio, output_dir, candidates, steps=50,
         z, transform = fit_transform(h.double())
         assignment = feature_kmeans(h.cpu(), BUDGET[(dataset, ratio)], condensation_seed).to(device)
         save_state(dict(z=z, assignment=assignment, transform=vars(transform)), inputs_path)
-    settings = dict(epochs=epochs, eval_every=10, hidden=256, dropout=dropout,
-                    lr=0.01, weight_decay=0.0005)
     recipe = dict(**settings, input_scale=input_scale)
     recipe_key = _fingerprint(recipe)
     save_json(recipe, root / f"student_recipe_{recipe_key}.json")
@@ -193,6 +208,7 @@ def run_screen(dataset, ratio, output_dir, candidates, steps=50,
                     / f"step_{step}_{recipe_key}", training_adjacency=training_adj, stop=stop, **settings)
                 records.append(dict(**identity, condensation_seed=condensation_seed, step=step,
                                     **result, dropout=dropout, input_scale=input_scale, epochs=epochs,
+                                    student_recipe=recipe_key,
                                     candidate_path=str(folder.parent.resolve())))
         print("CANDIDATE_DONE", dataset, identity, "seconds", round(time.monotonic() - started, 2), flush=True)
         write_table(pd.DataFrame(records), root / f"screen_{condensation_seed}_{steps}_{recipe_key}_{screen_key}.csv")
@@ -200,7 +216,7 @@ def run_screen(dataset, ratio, output_dir, candidates, steps=50,
     keys = ["method", "width", "lr", "T", "rank", "penalty", "step", "candidate_path"]
     keys += [key for key in ("initialization", "alpha", "inner_loss_weighting", "mass_mode", "mass_scaling",
                             "metric_input", "metric_alpha", "strength", "train_target_mix") if key in frame.columns]
-    keys += ["dropout", "input_scale", "epochs"]
+    keys += ["dropout", "input_scale", "epochs", "student_recipe"]
     summary = frame.groupby(keys, dropna=False).val_acc.agg(["mean", "std", "count"]).reset_index()
     summary = summary.sort_values("mean", ascending=False)
     write_table(summary, root / f"ranking_{condensation_seed}_{steps}_{recipe_key}_{screen_key}.csv")
@@ -210,7 +226,7 @@ def run_screen(dataset, ratio, output_dir, candidates, steps=50,
 
 def selected_test(root, choice, condensation_seeds=(0, 1, 2), student_seeds=(100, 101, 102, 103, 104),
                   dropout=0.9, epochs=1000, data_dir="data", device="cuda", input_scale=1.0,
-                  stop=lambda: False, report_routes=True):
+                  stop=lambda: False, report_routes=True, student_settings=None):
     """Test only a fixed configuration and checkpoint, with fresh student seeds."""
     root = Path(root)
     config = json.loads((root / "config.json").read_text())
@@ -228,6 +244,9 @@ def selected_test(root, choice, condensation_seeds=(0, 1, 2), student_seeds=(100
     selection = dict(candidate=candidate, step=step, selection="validation_only",
                      student=dict(dropout=dropout, input_scale=input_scale, epochs=epochs),
                      condensation_seeds=list(condensation_seeds), student_seeds=list(student_seeds))
+    settings = _student_settings(dropout, epochs, student_settings)
+    if student_settings:
+        selection["student"]["overrides"] = student_settings
     if report_routes:
         selection["serving_comparison"] = "MLP/GCN, same GCN validation-selected weights"
     selection_key = _fingerprint(selection)
@@ -242,7 +261,6 @@ def selected_test(root, choice, condensation_seeds=(0, 1, 2), student_seeds=(100
     q = training_refined_targets(logits, candidate["T"], graph["y"], train,
                                  candidate.get("train_target_mix", 0.0))
     records = []
-    settings = dict(epochs=epochs, eval_every=10, hidden=256, dropout=dropout, lr=0.01, weight_decay=0.0005)
     recipe_key = _fingerprint(dict(**settings, input_scale=input_scale))
     evaluation_graph = dict(graph, x=graph["x"] * input_scale)
     for cond_seed in condensation_seeds:
@@ -250,7 +268,8 @@ def selected_test(root, choice, condensation_seeds=(0, 1, 2), student_seeds=(100
         _, generated_root = run_screen(config["dataset"], config["ratio"], root.parents[2], [candidate], steps=step,
                    student_seeds=(0,), condensation_seed=cond_seed, dropout=dropout, epochs=epochs,
                    data_dir=data_dir, device=device, input_scale=input_scale,
-                   citation_features=config.get("citation_features", "default"), stop=stop)
+                   citation_features=config.get("citation_features", "default"), stop=stop,
+                   student_settings=student_settings)
         if generated_root.resolve() != root.resolve():
             raise ValueError("Generated condensate belongs to a different source screen")
         folder = root / _fingerprint(candidate) / f"condensation_{cond_seed}"
