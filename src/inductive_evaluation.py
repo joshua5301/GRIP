@@ -45,16 +45,21 @@ def _update_tensor_digest(digest, name, tensor, chunk_size=1_048_576):
         digest.update(block.tobytes())
 
 
-def _input_digest(cx, cy, mass, training_adjacency, train_graph, validation, testing):
+def _input_digest(cx, cy, mass, training_adjacency, train_graph, validation, testing, train_mask=None):
     digest = hashlib.sha256()
     for name, value in (("cx", cx), ("cy", cy), ("mass", mass), ("training_adjacency", training_adjacency)):
         _update_tensor_digest(digest, name, value)
-    splits = [("train", (train_graph, None)), ("validation", validation)]
+    splits = [("train", (train_graph, train_mask)), ("validation", validation)]
     if testing is not None:
         splits.append(("testing", testing))
     for name, (graph, mask) in splits:
         for key in ("x", "y", "adj"):
-            _update_tensor_digest(digest, name + "." + key, graph[key])
+            value = graph[key]
+            # Explicit transductive masks exclude held-out labels from both
+            # diagnostics and cache identity. Preserve legacy None-mask hashes.
+            if key == "y" and train_mask is not None and mask is not None:
+                value = value[mask]
+            _update_tensor_digest(digest, name + "." + key, value)
         _update_tensor_digest(digest, name + ".mask", mask)
     return digest.hexdigest()
 
@@ -92,6 +97,7 @@ def fit_inductive_gcn(
     training_adjacency=None,
     stop=lambda: False,
     weighting="uniform",
+    train_mask=None,
 ):
     """Fit one fresh student and evaluate the validation-selected weights.
 
@@ -99,6 +105,9 @@ def fit_inductive_gcn(
     dictionaries contain x, y and adj.  Supply already normalized adjacencies, and
     use None for synthetic adjacency to train the existing identity-graph student.
     Uniform condensed CE is the default; weighting='mass' uses normalized masses.
+    For transductive graphs, supply train_mask to restrict train diagnostics to
+    training nodes. Explicit masks also keep excluded labels out of cache hashes.
+    train_mask=None preserves the previous whole-train-graph behavior and cache.
 
     settings must contain epochs, eval_every, hidden, dropout, lr and weight_decay.
     The first epoch attaining maximum validation accuracy is selected.  History
@@ -137,7 +146,9 @@ def fit_inductive_gcn(
         selection="first maximum validation accuracy",
         test_enabled=testing is not None,
         torch_version=torch.__version__,
-        input_digest=_input_digest(cx, cy, mass, training_adjacency, train_graph, validation, testing),
+        input_digest=_input_digest(
+            cx, cy, mass, training_adjacency, train_graph, validation, testing, train_mask=train_mask
+        ),
     )
     fingerprint = _fingerprint(recipe)
     folder = Path(folder)
@@ -184,7 +195,7 @@ def fit_inductive_gcn(
     result = dict(
         seed=seed, weighting=weighting, **best, **{f"last_{key}": value for key, value in history[-1].items()}
     )
-    train_metrics = graph_metrics(model, train_graph)
+    train_metrics = graph_metrics(model, train_graph, train_mask)
     result.update({f"train_{key}": value for key, value in train_metrics.items()})
     if testing is not None:
         test_metrics = graph_metrics(model, *testing)

@@ -464,6 +464,22 @@ def temperature_labels(logits, log_temperature):
     return (logits.detach() / log_temperature.exp().to(logits.dtype)).softmax(1).double()
 
 
+def _check_assignment_stop(stop):
+    if stop():
+        raise InterruptedError("CE assignment optimization interrupted")
+
+
+def _save_checkpoint_atomic(snapshot, path):
+    # A hidden temporary file also stays outside load_ce_snapshots' step_*.pt glob
+    # if a hard process kill prevents cleanup.
+    temporary = path.with_name(f".{path.name}.tmp")
+    try:
+        torch.save(snapshot, temporary)
+        temporary.replace(path)
+    finally:
+        temporary.unlink(missing_ok=True)
+
+
 def optimize_ce_assignment(
     z,
     q,
@@ -516,7 +532,11 @@ def optimize_ce_assignment(
     temperature_lr=0.003,
     outer_targets=None,
     inner_loss_weighting="mass",
+    stop=lambda: False,
 ):
+    if not callable(stop):
+        raise ValueError("stop must be callable")
+    _check_assignment_stop(stop)
     if feature_control != "joint" or initial_representatives is not None:
         raise ValueError("Only clustering-derived features and labels are supported")
     if inner_loss_weighting not in ("mass", "uniform"):
@@ -549,6 +569,7 @@ def optimize_ce_assignment(
             "inner_solver",
             "temperature_logits",
             "outer_targets",
+            "stop",
         )
     }
     if inner_loss_weighting == "mass":
@@ -645,6 +666,7 @@ def optimize_ce_assignment(
     if checkpoints:
         checkpoints.update((0, steps))
     snapshots = {}
+    _check_assignment_stop(stop)
     material = make_material(z, q)
     outer_z = z if outer_indices is None else z[outer_indices]
     outer_q = q if outer_targets is None else outer_targets.detach().to(q)
@@ -730,6 +752,7 @@ def optimize_ce_assignment(
         return time.perf_counter()
 
     for step in trange(start_step, steps + 1, desc="CE inner + CE outer"):
+        _check_assignment_stop(stop)
         tick = timestamp()
         optimizer.zero_grad(set_to_none=True)
         if temperature_logits is not None:
@@ -787,6 +810,7 @@ def optimize_ce_assignment(
             or (step % tracking_refresh == 0)
         )
         head_fallback = False
+        _check_assignment_stop(stop)
         if refresh:
             fitted = solve_student(
                 centers,
@@ -809,6 +833,7 @@ def optimize_ce_assignment(
                 tracking_cg_steps,
                 inner_tol,
             )
+            _check_assignment_stop(stop)
             head_fallback = fitted.pop("tracking_failed")
             if head_fallback:
                 refresh = True
@@ -822,9 +847,11 @@ def optimize_ce_assignment(
                     inner_tol,
                     cg_max_iter=cg_max_iter,
                 )
+        _check_assignment_stop(stop)
         theta = fitted.pop("theta")
         after_inner = timestamp()
         value, outer_gradient = outer_value_gradient(outer_z, outer_q, theta, outer_chunk_size, full_features)
+        _check_assignment_stop(stop)
         after_outer = timestamp()
         row = dict(
             step=step,
@@ -886,6 +913,7 @@ def optimize_ce_assignment(
                     best_parameters = [parameter.detach().clone() for parameter in parameters]
                     best_dual = dual.clone() if dual is not None else None
             if step < steps:
+                _check_assignment_stop(stop)
                 implicit_start = timestamp()
                 if refresh:
                     if implicit_solver is not None:
@@ -926,6 +954,7 @@ def optimize_ce_assignment(
                         initial=vector,
                         check_interval=cg_check_interval,
                     )
+                    _check_assignment_stop(stop)
                     diagnostic.update(hessian_solver="tracking_pcg", hessian_reduced_dimension=0)
                     if not bool(torch.isfinite(vector).all()) or not np.isfinite(diagnostic["cg_residual"]):
                         row["implicit_fallback"] = True
@@ -940,6 +969,7 @@ def optimize_ce_assignment(
                             max_iter=cg_max_iter,
                             cg_check_interval=cg_check_interval,
                         )
+                _check_assignment_stop(stop)
                 row.update(diagnostic)
                 row["implicit_seconds"] = timestamp() - implicit_start
                 if "benchmark_cold_seconds" in diagnostic:
@@ -986,7 +1016,7 @@ def optimize_ce_assignment(
             if folder is not None:
                 checkpoint_dir = folder / "checkpoints"
                 checkpoint_dir.mkdir(exist_ok=True)
-                torch.save(snapshot, checkpoint_dir / f"step_{step:06d}.pt")
+                _save_checkpoint_atomic(snapshot, checkpoint_dir / f"step_{step:06d}.pt")
         if save_resume and (step in checkpoints or step == steps):
             state = cpu_state(
                 dict(
@@ -1014,8 +1044,10 @@ def optimize_ce_assignment(
             if folder is not None:
                 torch.save(state, folder / "resume.tmp.pt")
                 (folder / "resume.tmp.pt").replace(folder / "resume.pt")
+        _check_assignment_stop(stop)
         if step == steps:
             break
+        _check_assignment_stop(stop)
         backward_start = timestamp()
         direction = implicit_moment_gradient(
             moments, z.shape[1], theta, vector, penalty, inner_loss_weighting
@@ -1040,6 +1072,7 @@ def optimize_ce_assignment(
             if log_temperature.grad is None or not bool(torch.isfinite(log_temperature.grad)):
                 raise FloatingPointError("Missing or nonfinite temperature gradient")
             row["log_temperature_gradient"] = float(log_temperature.grad)
+        _check_assignment_stop(stop)
         optimizer.step()
         row["backward_seconds"] = timestamp() - backward_start
         row["seconds"] = elapsed + time.perf_counter() - started

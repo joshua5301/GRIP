@@ -1,3 +1,4 @@
+import hashlib
 import json
 
 import pytest
@@ -109,3 +110,67 @@ def test_cache_rejects_mismatched_recipe_inputs_and_graph_splits(tmp_path, chang
         kwargs["weighting"] = "mass"
     with pytest.raises(ValueError, match="Cached student differs"):
         evaluation.fit_inductive_gcn(cx, cy, mass, train, validation, **kwargs)
+
+
+def test_transductive_train_mask_excludes_nontrain_labels_from_diagnostics_selection_and_cache(tmp_path):
+    cx, cy, mass, shared_graph, _ = inputs()
+    train_mask = torch.tensor([True, True, False, False, False])
+    val_mask = torch.tensor([False, False, True, True, False])
+    shared_graph["y"][4] = 999  # Outside the class vocabulary; it must never enter CE.
+    first = evaluation.fit_inductive_gcn(
+        cx,
+        cy,
+        mass,
+        shared_graph,
+        (shared_graph, val_mask),
+        train_mask=train_mask,
+        settings=recipe(),
+        folder=tmp_path / "first",
+    )
+    assert first["train_nodes"] == first["val_nodes"] == 2
+    changed = dict(shared_graph, y=shared_graph["y"].clone())
+    changed["y"][4] = 888
+    second = evaluation.fit_inductive_gcn(
+        cx,
+        cy,
+        mass,
+        changed,
+        (changed, val_mask),
+        train_mask=train_mask,
+        settings=recipe(),
+        folder=tmp_path / "second",
+    )
+    assert first == second
+    assert first == evaluation.fit_inductive_gcn(
+        cx,
+        cy,
+        mass,
+        changed,
+        (changed, val_mask),
+        train_mask=train_mask,
+        settings=recipe(),
+        folder=tmp_path / "first",
+    )
+    with pytest.raises(ValueError, match="Cached student differs"):
+        evaluation.fit_inductive_gcn(
+            cx,
+            cy,
+            mass,
+            shared_graph,
+            (shared_graph, val_mask),
+            train_mask=torch.tensor([True, True, True, False, False]),
+            settings=recipe(),
+            folder=tmp_path / "first",
+        )
+
+
+def test_none_train_mask_preserves_legacy_cache_digest():
+    cx, cy, mass, training, validation = inputs()
+    legacy = hashlib.sha256()
+    for name, value in (("cx", cx), ("cy", cy), ("mass", mass), ("training_adjacency", None)):
+        evaluation._update_tensor_digest(legacy, name, value)
+    for name, (supplied, mask) in (("train", (training, None)), ("validation", validation)):
+        for key in ("x", "y", "adj"):
+            evaluation._update_tensor_digest(legacy, name + "." + key, supplied[key])
+        evaluation._update_tensor_digest(legacy, name + ".mask", mask)
+    assert evaluation._input_digest(cx, cy, mass, None, training, validation, None) == legacy.hexdigest()

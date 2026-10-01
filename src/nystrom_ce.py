@@ -3,7 +3,12 @@
 Representatives are averages in SGC input space; the nonlinear map is applied
 AFTER averaging. Original-node feature blocks live in a CPU memory map.
 """
+import hashlib
+import inspect
+import json
+import marshal
 import time
+import types
 from pathlib import Path
 
 import numpy as np
@@ -35,24 +40,149 @@ class NystromMap:
         return get_kernel_values(h.double(), self.anchors, self.kernel) @ self.mapping
 
 
+def _check_stop(stop):
+    if stop():
+        raise InterruptedError("Nyström input validation interrupted")
+
+
+def _content_digest(value, chunk=2048, stop=lambda: False, canonical_double=False):
+    """Hash rows without materializing a potentially multi-gigabyte memmap."""
+    shape = tuple(value.shape)
+    dtype = "float64" if canonical_double else str(value.dtype)
+    digest = hashlib.sha256(json.dumps(dict(shape=shape, dtype=dtype), sort_keys=True).encode())
+    matrix = value if shape else value.reshape(1)
+    for start in range(0, len(matrix), chunk):
+        _check_stop(stop)
+        block = matrix[start:start + chunk]
+        if torch.is_tensor(block):
+            block = block.detach().cpu()
+            # NumPy cannot directly expose bfloat16; retain original dtype in header.
+            if canonical_double or block.dtype == torch.bfloat16:
+                block = block.double()
+            block = block.numpy()
+        block = np.ascontiguousarray(block, dtype=np.float64 if canonical_double else None)
+        digest.update(memoryview(block).cast("B"))
+    return digest.hexdigest()
+
+
+def _map_token(value, chunk, stop, active=None):
+    """Deterministic callable state, including closures such as FeatureTransform."""
+    _check_stop(stop)
+    active = set() if active is None else active
+    if value is None or isinstance(value, (str, int, float, bool)):
+        return value
+    if isinstance(value, np.generic):
+        return value.item()
+    if torch.is_tensor(value) or isinstance(value, np.ndarray):
+        return dict(array=_content_digest(value, chunk, stop))
+    if isinstance(value, (torch.dtype, torch.device, Path)):
+        return str(value)
+    if isinstance(value, types.ModuleType):
+        return dict(module=value.__name__)
+    if id(value) in active:
+        return dict(recursive_type=f"{type(value).__module__}.{type(value).__qualname__}")
+    active = active | {id(value)}
+    convert = lambda item: _map_token(item, chunk, stop, active)
+    if isinstance(value, dict):
+        return {str(key): convert(item) for key, item in sorted(value.items(), key=lambda pair: str(pair[0]))}
+    if isinstance(value, (list, tuple)):
+        return [convert(item) for item in value]
+    if isinstance(value, (set, frozenset)):
+        return sorted((convert(item) for item in value), key=lambda item: json.dumps(item, sort_keys=True))
+    if inspect.ismethod(value):
+        return dict(function=convert(value.__func__), owner=convert(value.__self__))
+    if inspect.isfunction(value):
+        closure = inspect.getclosurevars(value)
+        return dict(
+            function=f"{value.__module__}.{value.__qualname__}",
+            code=hashlib.sha256(marshal.dumps(value.__code__)).hexdigest(),
+            defaults=convert(value.__defaults__), kwdefaults=convert(value.__kwdefaults__),
+            nonlocals=convert(closure.nonlocals), globals=convert(closure.globals),
+        )
+    if inspect.isbuiltin(value):
+        return dict(builtin=f"{value.__module__}.{value.__qualname__}")
+    if isinstance(value, torch.nn.Module):
+        return dict(module_type=f"{type(value).__module__}.{type(value).__qualname__}",
+                    state=convert(value.state_dict()), attributes=convert(vars(value)),
+                    forward=convert(type(value).forward))
+    if hasattr(value, "__dict__"):
+        result = dict(type=f"{type(value).__module__}.{type(value).__qualname__}", state=convert(vars(value)))
+        if callable(value):
+            result["call"] = convert(type(value).__call__)
+        return result
+    raise ValueError(f"Cannot safely fingerprint feature-map state of type {type(value).__qualname__}")
+
+
+def _cache_identity(h, feature_map, shape, chunk, stop):
+    token = _map_token(feature_map, chunk, stop)
+    return dict(
+        schema=1, h_digest=_content_digest(h, chunk, stop, canonical_double=True),
+        map_digest=hashlib.sha256(json.dumps(token, sort_keys=True).encode()).hexdigest(),
+        shape=list(shape), dtype="float64",
+    )
+
+
+def _metadata_path(path):
+    return Path(path).with_suffix(".meta.json")
+
+
+def _validate_phi(h, feature_map, phi, identity, chunk, stop):
+    """A valid sidecar permits reuse; legacy/untracked arrays need full verification."""
+    if tuple(phi.shape) != tuple(identity["shape"]) or np.dtype(phi.dtype) != np.float64:
+        raise ValueError("Incompatible feature cache shape or dtype")
+    filename = getattr(phi, "filename", None)
+    sidecar = _metadata_path(filename) if filename is not None else None
+    phi_digest = _content_digest(phi, chunk, stop)
+    if sidecar is not None and sidecar.exists():
+        try:
+            saved = json.loads(sidecar.read_text())
+        except (OSError, ValueError) as exc:
+            raise ValueError("Invalid feature cache metadata") from exc
+        if saved != dict(**identity, phi_digest=phi_digest):
+            raise ValueError("Feature cache fingerprint differs in H, map, coordinates or cached content")
+        return phi_digest
+    # Shape agreement alone cannot identify the input/map of a legacy feature file.
+    for start in range(0, len(h), chunk):
+        _check_stop(stop)
+        expected = feature_map(h[start:start + chunk]).detach().double().cpu().numpy()
+        actual = np.asarray(phi[start:start + chunk])
+        if not np.isfinite(expected).all() or not np.isfinite(actual).all() or not np.allclose(
+            expected, actual, atol=1e-10, rtol=1e-8
+        ):
+            raise ValueError("Feature cache does not match current H/map; preserve it and use a new cache path")
+    if sidecar is not None:
+        save_json(dict(**identity, phi_digest=phi_digest), sidecar)
+    return phi_digest
+
+
 @torch.no_grad()
 def cache_features(h, feature_map, path, chunk=2048, stop=lambda: False):
     path = Path(path)
+    if chunk < 1 or not isinstance(chunk, int):
+        raise ValueError("Feature cache chunk must be a positive integer")
+    _check_stop(stop)
+    width = feature_map(h[:1]).shape[1]
+    identity = _cache_identity(h, feature_map, (len(h), width), chunk, stop)
     if path.exists():
         phi = np.load(path, mmap_mode="r")
-        if phi.shape != (len(h), len(feature_map.anchors)) or phi.dtype != np.float64:
-            raise ValueError("Incompatible feature cache")
+        _validate_phi(h, feature_map, phi, identity, chunk, stop)
         return phi
+    path.parent.mkdir(parents=True, exist_ok=True)
     temporary = path.with_suffix(".partial.npy")
     phi = np.lib.format.open_memmap(temporary, mode="w+", dtype=np.float64,
-                                  shape=(len(h), len(feature_map.anchors)))
+                                  shape=(len(h), width))
     for start in range(0, len(h), chunk):
         if stop():
             raise InterruptedError("Feature preparation interrupted")
-        phi[start:start + chunk] = feature_map(h[start:start + chunk]).cpu().numpy()
+        block = feature_map(h[start:start + chunk]).double().cpu().numpy()
+        if not np.isfinite(block).all():
+            raise ValueError("Nonfinite mapped features cannot be cached")
+        phi[start:start + chunk] = block
     phi.flush()
+    phi_digest = _content_digest(phi, chunk, stop)
     del phi
     temporary.replace(path)
+    save_json(dict(**identity, phi_digest=phi_digest), _metadata_path(path))
     return np.load(path, mmap_mode="r")
 
 
@@ -76,13 +206,83 @@ def outer_gradient(phi, q, theta, chunk=2048):
 
 
 def fit_streaming_teacher(phi, labels, mask, gamma=0.01, chunk=2048,
-                          max_iter=1000, stop=lambda: False):
-    """Same no-bias logistic objective as teacher.fit_logistic, streamed."""
+                          max_iter=1000, stop=lambda: False, resident_training=False):
+    """Same no-bias teacher CE, optionally keeping only training phi resident.
+
+    resident_training=True transfers selected training rows once, in chunks.
+    On CUDA it first releases unused allocator cache and permits this route
+    only when training bytes plus working allowance fit inside 75% of current
+    free device memory. Insufficient memory or allocation OOM falls back to the
+    original streamed closure. All-node phi stays on CPU; prediction is streamed.
+    Callers still supply training-only labels (zero outside mask) when they need
+    a class vocabulary inferred exclusively from the training split.
+    """
+    if stop():
+        raise InterruptedError("Teacher fitting interrupted")
+    if chunk < 1 or not isinstance(chunk, int) or mask.shape != (len(phi),) or mask.dtype != torch.bool:
+        raise ValueError("Require a positive chunk and a node-aligned boolean training mask")
     n = int(mask.sum())
+    if n < 1:
+        raise ValueError("Teacher fitting requires at least one training node")
     classes = int(labels.max()) + 1
     weight = torch.zeros(phi.shape[1], classes, dtype=torch.double,
                          device=labels.device, requires_grad=True)
+    resident_x, resident_y = None, None
+    required = n * phi.shape[1] * weight.element_size()
+    # Covers full training logits/errors, LBFGS history, matmul and transfer work.
+    allowance = max(256 * 1024**2, 3 * n * classes * weight.element_size()
+                    + 232 * weight.numel() * weight.element_size()
+                    + 2 * chunk * phi.shape[1] * weight.element_size())
+    route = dict(requested="resident" if resident_training else "streaming", actual="streaming",
+                 train_rows=n, feature_width=phi.shape[1], resident_bytes=required,
+                 working_allowance_bytes=allowance)
+    if resident_training:
+        allowed = True
+        if weight.device.type == "cuda":
+            torch.cuda.empty_cache()
+            free, _ = torch.cuda.mem_get_info(weight.device)
+            route["free_gpu_bytes"] = int(free)
+            allowed = required + allowance <= 0.75 * free
+            if not allowed:
+                route["fallback"] = "free_memory_budget"
+        if allowed:
+            try:
+                if stop():
+                    raise InterruptedError("Resident teacher preparation interrupted")
+                resident_x = torch.empty(n, phi.shape[1], dtype=weight.dtype, device=weight.device)
+                cpu_mask = mask.detach().cpu().numpy()
+                cursor = 0
+                for start in range(0, len(phi), chunk):
+                    if stop():
+                        raise InterruptedError("Resident teacher transfer interrupted")
+                    chosen = cpu_mask[start:start + chunk]
+                    count = int(chosen.sum())
+                    if not count:
+                        continue
+                    # Select on CPU before transferring; excluded rows never go resident.
+                    block = np.array(phi[start:start + chunk][chosen], copy=True)
+                    resident_x[cursor:cursor + count].copy_(torch.from_numpy(block).to(weight))
+                    cursor += count
+                resident_y = labels[mask]
+                route["actual"] = "resident"
+            except torch.cuda.OutOfMemoryError:
+                resident_x, resident_y = None, None
+                torch.cuda.empty_cache()
+                route["fallback"] = "allocation_oom"
+    fit_streaming_teacher.last_route = dict(route)
+    print("TEACHER_FEATURE_ROUTE", json.dumps(route), flush=True)
     optimizer = torch.optim.LBFGS([weight], max_iter=max_iter, line_search_fn="strong_wolfe")
+
+    def training_blocks():
+        if resident_x is not None:
+            yield resident_x, resident_y
+        else:
+            for start, block in blocks(phi, weight.device, chunk):
+                if stop():
+                    raise InterruptedError("Teacher fitting interrupted during streaming")
+                chosen = mask[start:start + len(block)]
+                if bool(chosen.any()):
+                    yield block[chosen], labels[start:start + len(block)][chosen]
 
     def closure():
         if stop():
@@ -90,12 +290,7 @@ def fit_streaming_teacher(phi, labels, mask, gamma=0.01, chunk=2048,
         value = weight.new_zeros(())
         gradient = torch.zeros_like(weight)
         with torch.no_grad():
-            for start, block in blocks(phi, weight.device, chunk):
-                chosen = mask[start:start + len(block)]
-                x = block[chosen]
-                if not len(x):
-                    continue
-                y = labels[start:start + len(block)][chosen]
+            for x, y in training_blocks():
                 lp = (x @ weight).log_softmax(1)
                 value -= lp[torch.arange(len(y), device=y.device), y].sum() / n
                 error = lp.exp()
@@ -111,7 +306,12 @@ def fit_streaming_teacher(phi, labels, mask, gamma=0.01, chunk=2048,
     if not torch.isfinite(weight).all() or float(weight.grad.abs().max()) > 1e-5:
         raise RuntimeError("Teacher logistic fit did not converge")
     with torch.no_grad():
-        logits = torch.cat([x @ weight for _, x in blocks(phi, weight.device, chunk)])
+        prediction = []
+        for _, x in blocks(phi, weight.device, chunk):
+            if stop():
+                raise InterruptedError("Teacher prediction interrupted")
+            prediction.append(x @ weight)
+        logits = torch.cat(prediction)
     return logits, weight.detach()
 
 
@@ -128,7 +328,18 @@ def optimize(h, q, assignment, feature_map, phi, folder, steps, penalty=1e-4,
              progress=lambda row: None, checkpoint_every=25):
     folder = Path(folder)
     folder.mkdir(parents=True, exist_ok=True)
-    config = dict(steps_schema=1, penalty=penalty, lr=lr, rank=rank, seed=seed,
+    if chunk < 1 or not isinstance(chunk, int):
+        raise ValueError("Optimization chunk must be a positive integer")
+    _check_stop(stop)
+    width = feature_map(h[:1]).shape[1]
+    identity = _cache_identity(h, feature_map, (len(h), width), chunk, stop)
+    phi_digest = _validate_phi(h, feature_map, phi, identity, chunk, stop)
+    input_fingerprint = dict(
+        **identity, phi_digest=phi_digest,
+        q_digest=_content_digest(q, chunk, stop, canonical_double=True),
+        assignment_digest=_content_digest(assignment, chunk, stop),
+    )
+    config = dict(steps_schema=2, penalty=penalty, lr=lr, rank=rank, seed=seed,
                   cells=int(assignment.max()) + 1, chunk=chunk)
     u, v = initialize_factors(assignment, config["cells"], rank, seed)
     optimizer = torch.optim.Adam([u, v], lr=lr)
@@ -137,6 +348,13 @@ def optimize(h, q, assignment, feature_map, phi, folder, steps, penalty=1e-4,
     resume = folder / "resume.pt"
     if resume.exists():
         saved = torch.load(resume, map_location=h.device, weights_only=False)
+        if "input_fingerprint" not in saved:
+            raise ValueError(
+                "Legacy resume lacks verifiable H/Q/assignment/map/phi fingerprints; "
+                "preserve existing results and restart in a new folder"
+            )
+        if saved["input_fingerprint"] != input_fingerprint:
+            raise ValueError("Resume input fingerprint differs in H/Q/assignment/map/phi")
         if saved["config"] != config:
             raise ValueError("Resume configuration differs")
         with torch.no_grad():
@@ -149,7 +367,8 @@ def optimize(h, q, assignment, feature_map, phi, folder, steps, penalty=1e-4,
 
     def persist(step):
         save_state(dict(config=config, step=step, u=u, v=v, optimizer=optimizer.state_dict(),
-                        theta=theta, vector=vector, history=history), resume)
+                        theta=theta, vector=vector, history=history,
+                        input_fingerprint=input_fingerprint), resume)
 
     for step in range(start, steps + 1):
         if stop():
@@ -168,7 +387,8 @@ def optimize(h, q, assignment, feature_map, phi, folder, steps, penalty=1e-4,
         row = dict(step=step, outer_ce=value, inner_grad=inner["inner_grad_max"])
         history = [r for r in history if r["step"] < step] + [row]
         if step % checkpoint_every == 0 or step == steps:
-            save_state(dict(step=step, moments=moments, theta=theta, outer_ce=value),
+            save_state(dict(step=step, moments=moments, theta=theta, outer_ce=value,
+                            input_fingerprint=input_fingerprint),
                        folder / f"step_{step:06d}.pt")
             persist(step)
             save_json(history, folder / "history.json")
