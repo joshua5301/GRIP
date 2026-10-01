@@ -50,6 +50,11 @@ def dispatch(job, stop):
             report, root = result
             return dict(report=report, root=str(Path(root).resolve()), validation_only=True)
         return result
+    if job["kind"] == "large_final":
+        from src.large_final import run_final
+        report, root = run_final(**options, stop=stop)
+        return dict(report=report, root=str(Path(root).resolve()),
+                    validation_only=False, fixed_configuration_test=True)
     raise ValueError(f"Unknown research job kind: {job['kind']}")
 
 
@@ -127,7 +132,7 @@ def run_plan(path, max_seconds=1800, dispatch_fn=dispatch):
             try:
                 record["result"] = dispatch_fn(job, stop)
                 record["phase"] = "completed"
-                if job["kind"] == "large_pilot":
+                if job["kind"] in ("large_pilot", "large_final"):
                     report = record["result"].get("report", record["result"])
                     if report.get("status") != "complete":
                         record["phase"] = "pilot_stopped" if report.get("status") == "stopped" else "failed"

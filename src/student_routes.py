@@ -19,7 +19,7 @@ SELECTION = "same weights at GCN validation-selected epoch"
 
 
 def replay_routes(selected_path, graph, propagated, masks, settings, output_path, seed=0,
-                  stop=lambda: False):
+                  stop=lambda: False, test_only=False):
     """Return paired MLP/GCN scores and save a fingerprinted JSON cache.
 
     ``selected_path`` is seed_*_selected.pt from fit_gcn_diagnostic. ``masks``
@@ -31,11 +31,18 @@ def replay_routes(selected_path, graph, propagated, masks, settings, output_path
 
     Epoch selection is inherited from the checkpoint, even if MLP validation
     accuracy is lower. Reusing an output path with changed inputs, weights,
-    selected epoch or settings raises ValueError.
+    selected epoch or settings raises ValueError. ``test_only=True`` instead
+    requires exactly one explicit test mask and reads/hashes only its labels;
+    the saved weights determine the class count. It records a distinct recipe
+    flag without changing default replay identities or epoch selection.
     """
     if stop():
         raise InterruptedError("Student route replay interrupted")
-    if set(masks) not in ({"val"}, {"val", "test"}):
+    if not isinstance(test_only, bool):
+        raise ValueError("test_only must be a boolean")
+    if test_only and set(masks) != {"test"}:
+        raise ValueError("test_only requires exactly a test mask")
+    if not test_only and set(masks) not in ({"val"}, {"val", "test"}):
         raise ValueError("masks must contain val and optionally test")
     settings = dict(settings)
     if not {"hidden", "dropout"} <= settings.keys() or settings.get("layers", 2) != 2:
@@ -89,6 +96,8 @@ def replay_routes(selected_path, graph, propagated, masks, settings, output_path
         selection=SELECTION, routes=dict(gcn="original X and normalized adjacency", mlp="supplied S²X; no adjacency"),
         test_enabled="test" in masks, input_digest=digest.hexdigest(), torch_version=torch.__version__,
     )
+    if test_only:
+        recipe["test_only"] = True
     fingerprint = _fingerprint(recipe)
     output_path = Path(output_path)
     if output_path.exists():

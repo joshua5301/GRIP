@@ -4,7 +4,7 @@ import json
 import pytest
 
 from src.io import save_json
-from src.research_loop import run_plan
+from src.research_loop import dispatch, run_plan
 
 
 def prepare(tmp_path, jobs):
@@ -70,8 +70,9 @@ def test_stop_file_prevents_dispatch_and_worker_lock_prevents_second_worker(tmp_
     assert run_plan(path, dispatch_fn=lambda *_: pytest.fail("must not launch"))["phase"] == "stopped"
 
 
-def test_pilot_deadline_is_recorded_as_incomplete_without_blind_retries(tmp_path):
-    spec = dict(job(), kind="large_pilot")
+@pytest.mark.parametrize("kind", ["large_pilot", "large_final"])
+def test_pilot_deadline_is_recorded_as_incomplete_without_blind_retries(tmp_path, kind):
+    spec = dict(job(), kind=kind)
     path = prepare(tmp_path, [spec])
     calls = []
 
@@ -84,3 +85,27 @@ def test_pilot_deadline_is_recorded_as_incomplete_without_blind_retries(tmp_path
     assert calls == ["first"]
     assert saved["phase"] == "pilot_stopped"
     assert result["completed"] == 0
+
+
+def test_final_dispatch_records_fixed_test_and_preserves_stop(tmp_path, monkeypatch):
+    callback = lambda: False
+    calls = []
+
+    def final(**options):
+        calls.append(options)
+        return dict(status="complete", rows=[]), tmp_path
+
+    monkeypatch.setattr("src.large_final.run_final", final)
+    spec = dict(kind="large_final", options=dict(selection_path="fixed.json", condensation_seed=2))
+    result = dispatch(spec, callback)
+    assert calls == [dict(selection_path="fixed.json", condensation_seed=2, stop=callback)]
+    assert result == dict(report=dict(status="complete", rows=[]), root=str(tmp_path.resolve()),
+                          validation_only=False, fixed_configuration_test=True)
+
+
+def test_failed_final_is_not_counted_as_completed(tmp_path):
+    path = prepare(tmp_path, [dict(job(), kind="large_final")])
+    outcome = run_plan(path, dispatch_fn=lambda *_: dict(report=dict(status="failed", reason="changed source")))
+    ledger = json.loads((tmp_path / "jobs.json").read_text())
+    assert outcome["completed"] == 0
+    assert ledger["first"]["phase"] == "failed"
