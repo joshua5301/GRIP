@@ -339,27 +339,116 @@ def moment_gradient(moments, dimension, feature_map, theta, vector, penalty,
 def _mass_controls(mass_mode, balance_steps, balance_tol, balance_backend="chunked"):
     from numbers import Integral, Real
 
-    if not isinstance(mass_mode, str) or mass_mode not in ("free", "uniform"):
-        raise ValueError("mass_mode must be free or uniform")
+    if not isinstance(mass_mode, str) or mass_mode not in ("free", "uniform", "initial"):
+        raise ValueError("mass_mode must be free, uniform or initial")
     if isinstance(balance_steps, bool) or not isinstance(balance_steps, Integral) or balance_steps < 1:
         raise ValueError("balance_steps must be a positive integer")
     if (isinstance(balance_tol, bool) or not isinstance(balance_tol, Real)
             or not np.isfinite(balance_tol) or not 0 < balance_tol < 1):
         raise ValueError("balance_tol must be finite and lie strictly in (0, 1)")
     if mass_mode == "free" and (balance_steps != 300 or balance_tol != 1e-8):
-        raise ValueError("Nondefault balancing controls require mass_mode='uniform'")
+        raise ValueError("Nondefault balancing controls require a constrained mass_mode")
     if balance_backend != "chunked":
         raise ValueError("Nyström balancing currently supports only balance_backend=chunked")
     return int(balance_steps), float(balance_tol)
 
 
-def validate_assignment_resume(saved, mass_mode="free", balance_steps=300, balance_tol=1e-8, balance_backend="chunked"):
+
+def _initial_mass_source_digest():
+    """Source changes cannot silently reuse a fixed-target trajectory."""
+    names = ("nystrom_ce.py", "fixed_mass_assignment.py", "balanced_assignment.py",
+             "low_rank_assignment.py", "moments.py", "soft_ce_partition.py",
+             "head.py", "teacher.py", "shared_features.py", "partition_initialization.py")
+    files = {name: hashlib.sha256((Path(__file__).parent / name).read_bytes()).hexdigest()
+             for name in names}
+    return hashlib.sha256(json.dumps(files, sort_keys=True).encode()).hexdigest()
+
+
+@torch.no_grad()
+def initial_mass_context(assignment, cells, rank, seed, mixing, chunk):
+    """Replay the actual original float32 U0/V0 logits, then float64 softmax.
+
+    Never infer targets from hard counts: doing so can change rounding relative
+    to LowRankMoments. The returned target is detached and cannot be supplied to
+    optimize by a caller as a tunable vector.
+    """
+    from src.fixed_mass_assignment import validate_mass_target
+    from src.low_rank_assignment import logit_block
+    if (not torch.is_tensor(assignment) or assignment.ndim != 1 or len(assignment) < 1
+            or assignment.dtype != torch.long or cells != int(assignment.max()) + 1
+            or bool((assignment < 0).any()) or not isinstance(chunk, int) or chunk < 1):
+        raise ValueError("Invalid original assignment context")
+    u0, v0 = initialize_factors(assignment, cells, rank, seed)
+    target = torch.zeros(cells, device=assignment.device, dtype=torch.float64)
+    for start in range(0, len(assignment), chunk):
+        probability = logit_block(u0[start:start + chunk], v0, assignment[start:start + chunk], mixing).double().softmax(1)
+        target += probability.sum(0) / len(assignment)
+    target = target.detach()
+    validate_mass_target(target, cells)
+    provenance = dict(schema=1, origin="original_unbalanced_P0", cells=cells, rank=rank,
+                      seed=seed, mixing=float(mixing), chunk=chunk, factor_dtype=str(u0.dtype),
+                      factor_device=str(u0.device), assignment_digest=_content_digest(assignment, chunk),
+                      u0_digest=_content_digest(u0, chunk), v0_digest=_content_digest(v0, chunk),
+                      target_digest=_content_digest(target, chunk, canonical_double=True),
+                      source_digest=_initial_mass_source_digest())
+    return dict(target=target, provenance=provenance)
+
+
+
+def initial_mass_config(penalty, lr, rank, seed, cells, chunk, mixing, inner_loss_weighting,
+                        balance_steps, balance_tol, balance_backend, context):
+    config = dict(steps_schema=2, penalty=penalty, lr=lr, rank=rank, seed=seed, cells=cells, chunk=chunk)
+    if mixing != 0.05:
+        config["mixing"] = mixing
+    if inner_loss_weighting != "mass":
+        config["inner_loss_weighting"] = inner_loss_weighting
+    config.update(mass_mode="initial", balance_steps=balance_steps, balance_tol=balance_tol,
+                  balance_backend=balance_backend, initial_mass_provenance=context["provenance"])
+    return config
+
+def _validate_initial_mass(saved, initial_context, input_fingerprint=None, config=None):
+    from src.fixed_mass_assignment import validate_mass_target
+    if not isinstance(initial_context, dict) or set(initial_context) != {"target", "provenance"}:
+        raise ValueError("Initial-mass validation requires the current source-derived assignment context")
+    target, provenance = saved.get("mass_target"), saved.get("initial_mass_provenance")
+    validate_mass_target(target)
+    validate_mass_target(initial_context["target"], len(target))
+    expected = initial_context["provenance"]
+    if isinstance(provenance, dict) and provenance.get("factor_device") != expected.get("factor_device"):
+        raise ValueError("Cross-device initial-mass resume/cache reuse is unsupported; preserve it and use a new folder")
+    if (not isinstance(provenance, dict) or provenance != expected
+            or provenance.get("source_digest") != _initial_mass_source_digest()
+            or provenance.get("target_digest") != _content_digest(target, provenance.get("chunk", 2048), canonical_double=True)
+            or not torch.equal(target.detach().cpu(), initial_context["target"].detach().cpu())):
+        raise ValueError("Initial-mass target or current source/initializer context differs")
+    fingerprint = saved.get("input_fingerprint")
+    if (not isinstance(fingerprint, dict)
+            or fingerprint.get("assignment_digest") != provenance["assignment_digest"]
+            or (input_fingerprint is not None and fingerprint != input_fingerprint)):
+        raise ValueError("Initial-mass input fingerprint differs")
+    if config is not None and config.get("initial_mass_provenance") != provenance:
+        raise ValueError("Initial-mass resume configuration provenance differs")
+    return target
+
+
+def _validate_initial_config(actual, expected, provenance):
+    if (not isinstance(actual, dict) or not isinstance(expected, dict)
+            or actual.get("initial_mass_provenance") != provenance
+            or {key: value for key, value in actual.items() if key != "initial_mass_provenance"}
+            != {key: value for key, value in expected.items() if key != "initial_mass_provenance"}):
+        raise ValueError("Initial-mass configuration differs")
+
+def validate_assignment_resume(saved, mass_mode="free", balance_steps=300, balance_tol=1e-8, balance_backend="chunked",
+                               initial_context=None, input_fingerprint=None, initial_config=None):
     """Validate assignment mode before parameter copying or any cache mutation."""
     balance_steps, balance_tol = _mass_controls(mass_mode, balance_steps, balance_tol, balance_backend)
     config = saved.get("config", {})
     if config.get("mass_mode", "free") != mass_mode:
         raise ValueError("Resume mass_mode differs")
-    if mass_mode == "uniform":
+    if mass_mode == "initial":
+        _validate_initial_mass(saved, initial_context, input_fingerprint, config)
+        _validate_initial_config(config, initial_config, saved["initial_mass_provenance"])
+    if mass_mode != "free":
         if config.get("balance_steps") != balance_steps or config.get("balance_tol") != balance_tol or config.get("balance_backend") != balance_backend:
             raise ValueError("Resume balancing controls differ")
         dual = saved.get("dual")
@@ -370,9 +459,12 @@ def validate_assignment_resume(saved, mass_mode="free", balance_steps=300, balan
             raise ValueError("Resume balancing dual is invalid")
         if dual is not None and abs(float(dual.mean())) > 1e-10:
             raise ValueError("Resume balancing dual gauge is invalid")
+        if mass_mode == "initial" and dual is not None and dual.shape != initial_context["target"].shape:
+            raise ValueError("Initial-mass resume balancing dual has wrong cell count")
 
 
-def validate_assignment_snapshot(saved, mass_mode="free", balance_steps=300, balance_tol=1e-8, balance_backend="chunked"):
+def validate_assignment_snapshot(saved, mass_mode="free", balance_steps=300, balance_tol=1e-8, balance_backend="chunked",
+                                 initial_context=None, input_fingerprint=None, initial_config=None):
     """Protect cached endpoint bypasses, including selected_test recreation."""
     balance_steps, balance_tol = _mass_controls(mass_mode, balance_steps, balance_tol, balance_backend)
     if saved.get("mass_mode", "free") != mass_mode:
@@ -387,7 +479,16 @@ def validate_assignment_snapshot(saved, mass_mode="free", balance_steps=300, bal
             or not torch.is_tensor(dual) or dual.shape != (len(moments),)
             or not bool(torch.isfinite(dual).all()) or not isinstance(diagnostic, dict)):
         raise ValueError("Nyström balanced checkpoint lacks valid moments/dual/diagnostics")
-    if abs(float(dual.mean())) > 1e-10 or float((len(moments) * moments.detach()[:, 0] - 1).abs().max()) > balance_tol:
+    if mass_mode == "initial":
+        target = _validate_initial_mass(saved, initial_context, input_fingerprint)
+        if len(moments) != len(target) or len(target) != saved["initial_mass_provenance"]["cells"]:
+            raise ValueError("Initial-mass checkpoint has wrong cell count")
+        _validate_initial_config(saved.get("initial_assignment_config"), initial_config,
+                                 saved["initial_mass_provenance"])
+        mass_error = float((moments.detach()[:, 0] / target.to(moments) - 1).abs().max())
+    else:
+        mass_error = float((len(moments) * moments.detach()[:, 0] - 1).abs().max())
+    if abs(float(dual.mean())) > 1e-10 or mass_error > balance_tol:
         raise ValueError("Nyström checkpoint mass/gauge constraint failed")
     for key in ("row_residual", "column_residual"):
         value = diagnostic.get(key)
@@ -419,10 +520,38 @@ def optimize(h, q, assignment, feature_map, phi, folder, steps, penalty=1e-4,
     balance_steps, balance_tol = _mass_controls(mass_mode, balance_steps, balance_tol, balance_backend)
     mixing = float(mixing)
     folder = Path(folder)
+    initial_context, initial_fingerprint, initial_config = None, None, None
+    if mass_mode == "initial":
+        if chunk < 1 or not isinstance(chunk, int):
+            raise ValueError("Optimization chunk must be a positive integer")
+        _check_stop(stop)
+        initial_context = initial_mass_context(assignment, int(assignment.max()) + 1, rank, seed, mixing, chunk)
+        initial_config = initial_mass_config(penalty, lr, rank, seed, int(assignment.max()) + 1,
+                                             chunk, mixing, inner_loss_weighting, balance_steps,
+                                             balance_tol, balance_backend, initial_context)
+        width = feature_map(h[:1]).shape[1]
+        identity = _cache_identity(h, feature_map, (len(h), width), chunk, stop)
+        initial_fingerprint = dict(**identity, phi_digest=_content_digest(phi, chunk, stop),
+                                   q_digest=_content_digest(q, chunk, stop, canonical_double=True),
+                                   assignment_digest=_content_digest(assignment, chunk, stop))
+        # Read-only checks must finish before creating a folder/phi sidecar.
+        if list(folder.glob("step_*.pt")) and not (folder / "resume.pt").exists():
+            raise ValueError("Initial-mass cached endpoints require a verifiable resume state")
+        for existing in sorted(folder.glob("step_*.pt")):
+            cached = torch.load(existing, map_location="cpu", weights_only=False)
+            validate_assignment_snapshot(cached, mass_mode, balance_steps, balance_tol, balance_backend,
+                                         initial_context=initial_context, input_fingerprint=initial_fingerprint,
+                                         initial_config=initial_config)
     # Cross-mode resumes must reject before even creating a phi sidecar.
     if (folder / "resume.pt").exists():
         preflight = torch.load(folder / "resume.pt", map_location="cpu", weights_only=False)
-        validate_assignment_resume(preflight, mass_mode, balance_steps, balance_tol, balance_backend)
+        validate_assignment_resume(preflight, mass_mode, balance_steps, balance_tol, balance_backend,
+                                   initial_context=initial_context, input_fingerprint=initial_fingerprint,
+                                   initial_config=initial_config)
+        if mass_mode == "initial":
+            # Keep the original exact target rather than recomputing/retargeting.
+            initial_context = dict(target=preflight["mass_target"].to(h.device),
+                                   provenance=preflight["initial_mass_provenance"])
         del preflight
     folder.mkdir(parents=True, exist_ok=True)
     if chunk < 1 or not isinstance(chunk, int):
@@ -443,9 +572,11 @@ def optimize(h, q, assignment, feature_map, phi, folder, steps, penalty=1e-4,
         config["mixing"] = mixing
     if inner_loss_weighting != "mass":
         config["inner_loss_weighting"] = inner_loss_weighting
-    if mass_mode == "uniform":
+    if mass_mode != "free":
         config.update(mass_mode=mass_mode, balance_steps=balance_steps, balance_tol=balance_tol,
                       balance_backend=balance_backend)
+    if mass_mode == "initial":
+        config["initial_mass_provenance"] = initial_context["provenance"]
     u, v = initialize_factors(assignment, config["cells"], rank, seed)
     optimizer = torch.optim.Adam([u, v], lr=lr)
     material = make_material(h.double(), q.double())
@@ -462,7 +593,7 @@ def optimize(h, q, assignment, feature_map, phi, folder, steps, penalty=1e-4,
             raise ValueError("Resume input fingerprint differs in H/Q/assignment/map/phi")
         if saved["config"] != config:
             raise ValueError("Resume configuration differs")
-        if mass_mode == "uniform":
+        if mass_mode != "free":
             dual = saved.get("dual")
             if dual is not None and dual.shape != (config["cells"],):
                 raise ValueError("Resume balancing dual has wrong cell count")
@@ -478,8 +609,11 @@ def optimize(h, q, assignment, feature_map, phi, folder, steps, penalty=1e-4,
         state = dict(config=config, step=step, u=u, v=v, optimizer=optimizer.state_dict(),
                      theta=theta, vector=vector, history=history,
                      input_fingerprint=input_fingerprint)
-        if mass_mode == "uniform":
+        if mass_mode != "free":
             state["dual"] = dual
+        if mass_mode == "initial":
+            state.update(mass_target=initial_context["target"],
+                         initial_mass_provenance=initial_context["provenance"])
         save_state(state, resume)
 
     def check_balanced_stop(step):
@@ -492,7 +626,7 @@ def optimize(h, q, assignment, feature_map, phi, folder, steps, penalty=1e-4,
             persist(step)
             raise InterruptedError("Condensation stopped with resumable state")
         started = time.monotonic()
-        if mass_mode == "uniform":
+        if mass_mode != "free":
             # The custom backward differentiates the solved column dual implicitly;
             # initial_dual is only a solver warm start, never a detached free-softmax path.
             from src.balanced_assignment import BalancedMoments
@@ -500,10 +634,18 @@ def optimize(h, q, assignment, feature_map, phi, folder, steps, penalty=1e-4,
             check_balanced_stop(step)
             logits = LowRankLogits.apply(u, v, assignment, mixing, chunk)
             logits.retain_grad()
-            moments, dual, balancing = BalancedMoments.apply(
-                logits, material, chunk, balance_steps, balance_tol, dual)
+            if mass_mode == "initial":
+                from src.fixed_mass_assignment import FixedMassMoments
+                target = initial_context["target"]
+                moments, dual, balancing = FixedMassMoments.apply(
+                    logits, material, target, chunk, balance_steps, balance_tol, dual)
+                mass_error = float((moments.detach()[:, 0] / target - 1).abs().max())
+            else:
+                moments, dual, balancing = BalancedMoments.apply(
+                    logits, material, chunk, balance_steps, balance_tol, dual)
+                mass_error = float((config["cells"] * moments.detach()[:, 0] - 1).abs().max())
             if (not bool(torch.isfinite(moments).all()) or bool((moments[:, 0] <= 0).any())
-                    or float((config["cells"] * moments.detach()[:, 0] - 1).abs().max()) > balance_tol
+                    or mass_error > balance_tol
                     or float(balancing[1:3].max()) > balance_tol):
                 raise FloatingPointError("Balanced assignment marginal validation failed")
             check_balanced_stop(step)
@@ -520,7 +662,7 @@ def optimize(h, q, assignment, feature_map, phi, folder, steps, penalty=1e-4,
             raise RuntimeError("Inner CE fit did not converge; refusing inexact update")
         value, rhs = outer_gradient(phi, q, theta, chunk)
         row = dict(step=step, outer_ce=value, inner_grad=inner["inner_grad_max"])
-        if mass_mode == "uniform":
+        if mass_mode != "free":
             # Validate the complete constrained derivative even at the final endpoint.
             check_balanced_stop(step)
             vector, diagnostic = solve_head_system(augmented(mapped), labels, weights, theta,
@@ -548,18 +690,24 @@ def optimize(h, q, assignment, feature_map, phi, folder, steps, penalty=1e-4,
                             input_fingerprint=input_fingerprint)
             if inner_loss_weighting != "mass":
                 snapshot["inner_loss_weighting"] = inner_loss_weighting
-            if mass_mode == "uniform":
+            if mass_mode != "free":
                 snapshot.update(mass_mode=mass_mode, balance_steps=balance_steps, balance_tol=balance_tol,
                                 balance_backend=balance_backend,
                                 dual=dual, balance=balance)
-                validate_assignment_snapshot(snapshot, mass_mode, balance_steps, balance_tol, balance_backend)
+                if mass_mode == "initial":
+                    snapshot.update(mass_target=initial_context["target"],
+                                    initial_mass_provenance=initial_context["provenance"],
+                                    initial_assignment_config=config)
+                validate_assignment_snapshot(snapshot, mass_mode, balance_steps, balance_tol, balance_backend,
+                                             initial_context=initial_context, input_fingerprint=initial_fingerprint,
+                                         initial_config=initial_config)
             save_state(snapshot, folder / f"step_{step:06d}.pt")
             persist(step)
             save_json(history, folder / "history.json")
         if step == steps:
             progress(dict(**row, seconds=time.monotonic() - started))
             return folder / f"step_{step:06d}.pt"
-        if mass_mode == "uniform":
+        if mass_mode != "free":
             optimizer.step()
             progress(dict(**row, seconds=time.monotonic() - started))
             continue

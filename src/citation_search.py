@@ -42,8 +42,10 @@ def _assignment_mass_mode(identity):
     if "mass_mode" in identity and identity["method"] not in ("low_rank", "mlp", "nystrom"):
         raise ValueError("mass_mode is supported only by low_rank, mlp and nystrom assignments")
     mode = identity.get("mass_mode", "free")
+    if identity["method"] == "nystrom" and mode == "initial":
+        return mode
     if mode not in ("free", "uniform"):
-        raise ValueError("mass_mode must be free or uniform")
+        raise ValueError("mass_mode must be free or uniform outside Nyström")
     return mode
 
 
@@ -59,14 +61,27 @@ def _candidate_nystrom_mass(candidate):
     """Preload validation; only balanced candidates gain effective controls."""
     candidate = dict(candidate)
     if candidate.get("method", "low_rank") != "nystrom":
+        if candidate.get("mass_mode") == "initial" or set(candidate) & {
+            "initial_mass_schema", "mass_target", "target_masses", "initial_mass_target", "initial_mass_provenance", "initial_context"
+        }:
+            raise ValueError("Initial mass_mode and its controls are supported only by Nyström")
         return candidate
     from src.nystrom_ce import _mass_controls
     mode = _assignment_mass_mode(candidate)
+    if set(candidate) & {"mass_target", "target_masses", "initial_mass_target", "initial_mass_provenance", "initial_context"}:
+        raise ValueError("Nyström fixed targets must be derived internally from original P0")
+    if mode == "initial":
+        schema = candidate.get("initial_mass_schema", 1)
+        if isinstance(schema, bool) or schema != 1:
+            raise ValueError("Unsupported initial_mass_schema; preserve old endpoints in their own folder")
+        candidate["initial_mass_schema"] = 1
+    elif "initial_mass_schema" in candidate:
+        raise ValueError("initial_mass_schema requires mass_mode='initial'")
     steps, tolerance = _mass_controls(mode, candidate.get("balance_steps", 300),
                                       candidate.get("balance_tol", 1e-8), candidate.get("balance_backend", "chunked"))
     if any(key in candidate for key in ("balance_cg_steps", "balance_cg_rtol")):
         raise ValueError("Nyström balanced assignment currently supports only the fixed chunked backend")
-    if mode == "uniform":
+    if mode != "free":
         candidate.update(mass_mode=mode, balance_steps=steps, balance_tol=tolerance,
                          balance_backend="chunked")
     else:
@@ -75,13 +90,66 @@ def _candidate_nystrom_mass(candidate):
     return candidate
 
 
-def _check_nystrom_assignment(candidate, saved, resume=False):
+def _cached_initial_assignment(root, candidate, seed, device):
+    """Read the current source initializer, never trust a target's own metadata."""
+    if candidate.get("initialization", "feature") == "feature":
+        path = root / f"inputs_{seed}.pt"
+        if not path.exists():
+            raise ValueError("Initial-mass source assignment cache is missing")
+        return torch.load(path, map_location=device, weights_only=False)["assignment"]
+    context = dict(mode=candidate["initialization"], alpha=candidate.get("alpha", 1.0),
+                   T=candidate["T"], seed=seed)
+    if candidate.get("train_target_mix", 0.0) != 0:
+        context["train_target_mix"] = candidate["train_target_mix"]
+    path = root / f"assignment_{_fingerprint(context)}.pt"
+    if not path.exists():
+        raise ValueError("Initial-mass source assignment cache is missing")
+    return torch.load(path, map_location=device, weights_only=False)
+
+
+def _check_nystrom_assignment(candidate, saved, resume=False, *, root=None,
+                             condensation_seed=None, device="cpu", assignment=None,
+                             h=None, q=None):
     from src.nystrom_ce import validate_assignment_resume, validate_assignment_snapshot
     function = validate_assignment_resume if resume else validate_assignment_snapshot
     if not resume and saved.get("inner_loss_weighting", "mass") != _nystrom_inner_weighting(candidate):
         raise ValueError("Nyström checkpoint inner weighting differs from the candidate")
+    options = {}
+    if candidate.get("mass_mode") == "initial":
+        from src.nystrom_ce import initial_mass_config, initial_mass_context
+        if not resume and root is not None and condensation_seed is not None:
+            existing = root / _fingerprint(candidate) / f"condensation_{condensation_seed}"
+            if not (existing / "resume.pt").exists():
+                raise ValueError("Initial-mass cached endpoints require a verifiable resume state")
+        if condensation_seed is None:
+            raise ValueError("Initial-mass cached endpoint requires the current condensation seed")
+        if assignment is None:
+            if root is None:
+                raise ValueError("Initial-mass cached endpoint requires the current source assignment")
+            assignment = _cached_initial_assignment(root, candidate, condensation_seed, device)
+        options["initial_context"] = initial_mass_context(
+            assignment, int(assignment.max()) + 1, candidate["rank"], condensation_seed,
+            candidate.get("mixing", 0.05), 2048)
+        options["initial_config"] = initial_mass_config(
+            candidate["penalty"], candidate["lr"], candidate["rank"], condensation_seed,
+            int(assignment.max()) + 1, 2048, candidate.get("mixing", 0.05),
+            _nystrom_inner_weighting(candidate), candidate["balance_steps"],
+            candidate["balance_tol"], candidate["balance_backend"], options["initial_context"])
+        if h is not None and q is not None:
+            import numpy as np
+
+            from src.nystrom_ce import _cache_identity, _content_digest
+            map_path, phi_path = root / "nystrom_map_schema3.pt", root / "nystrom_phi_schema3.npy"
+            if not map_path.exists() or not phi_path.exists():
+                raise ValueError("Initial-mass shared map/feature cache is missing")
+            feature_map = get_shared_map(h, map_path, basis=3000, seed=0)
+            phi = np.load(phi_path, mmap_mode="r")
+            identity = _cache_identity(h, feature_map, tuple(phi.shape), 2048, lambda: False)
+            options["input_fingerprint"] = dict(
+                **identity, phi_digest=_content_digest(phi), q_digest=_content_digest(q, canonical_double=True),
+                assignment_digest=_content_digest(assignment))
     function(saved, candidate.get("mass_mode", "free"), candidate.get("balance_steps", 300),
-             candidate.get("balance_tol", 1e-8), candidate.get("balance_backend", "chunked"))
+             candidate.get("balance_tol", 1e-8), candidate.get("balance_backend", "chunked"), **options)
 
 
 def _candidate_background_mixing(candidate):
@@ -250,7 +318,19 @@ def run_screen(dataset, ratio, output_dir, candidates, steps=50,
         resume = folder / "resume.pt"
         state = torch.load(resume, map_location="cpu", weights_only=False) if resume.exists() else None
         if identity["method"] == "nystrom" and state is not None:
-            _check_nystrom_assignment(identity, state, resume=True)
+            current_q = (training_refined_targets(logits, identity["T"], graph["y"], train,
+                                                 identity.get("train_target_mix", 0.0))
+                         if mass_mode == "initial" else None)
+            _check_nystrom_assignment(identity, state, resume=True, root=root,
+                                     condensation_seed=condensation_seed, device=device,
+                                     h=h if mass_mode == "initial" else None, q=current_q)
+        if mass_mode == "initial":
+            current_q = training_refined_targets(logits, identity["T"], graph["y"], train,
+                                                identity.get("train_target_mix", 0.0))
+            for cached_path in sorted(folder.glob("step_*.pt")):
+                cached = torch.load(cached_path, map_location="cpu", weights_only=False)
+                _check_nystrom_assignment(identity, cached, root=root,
+                                         condensation_seed=condensation_seed, device=device, h=h, q=current_q)
         folder.mkdir(parents=True, exist_ok=True)
         save_json(identity, folder.parent / "candidate.json")
         q = training_refined_targets(logits, identity["T"], graph["y"], train,
@@ -292,7 +372,7 @@ def run_screen(dataset, ratio, output_dir, candidates, steps=50,
                 from src.nystrom_ce import cache_features, optimize
                 nystrom_options = (dict(inner_loss_weighting="uniform")
                                    if _nystrom_inner_weighting(identity) == "uniform" else {})
-                if mass_mode == "uniform":
+                if mass_mode != "free":
                     nystrom_options.update(mass_mode=mass_mode, balance_steps=identity["balance_steps"],
                                            balance_tol=identity["balance_tol"], balance_backend=identity["balance_backend"])
                 feature_map = get_shared_map(h, root / "nystrom_map_schema3.pt", basis=3000, seed=0)
@@ -345,7 +425,10 @@ def run_screen(dataset, ratio, output_dir, candidates, steps=50,
                     and snapshot.get("inner_loss_weighting", "mass") != _nystrom_inner_weighting(identity)):
                 raise ValueError("Nyström checkpoint inner weighting differs from the candidate")
             if identity["method"] == "nystrom":
-                _check_nystrom_assignment(identity, snapshot)
+                _check_nystrom_assignment(identity, snapshot, assignment=assignment,
+                                           condensation_seed=condensation_seed, device=device, root=root,
+                                           h=h if mass_mode == "initial" else None,
+                                           q=q if mass_mode == "initial" else None)
             temperature_diagnostic = (_temperature_diagnostics(snapshot, state, step)
                                       if identity.get("learn_temperature", False) else {})
             if identity["method"] == "coarsening":
@@ -396,7 +479,7 @@ def run_screen(dataset, ratio, output_dir, candidates, steps=50,
     keys = ["method", "width", "lr", "T", "rank", "penalty", "step", "candidate_path"]
     keys += [key for key in ("initialization", "alpha", "inner_loss_weighting", "mass_mode", "mass_scaling",
                             "metric_input", "metric_alpha", "strength", "train_target_mix", "mixing",
-                            "learn_temperature", "temperature_lr", "balance_steps", "balance_tol", "balance_backend") if key in frame.columns]
+                            "learn_temperature", "temperature_lr", "balance_steps", "balance_tol", "balance_backend", "initial_mass_schema") if key in frame.columns]
     keys += ["dropout", "input_scale", "epochs", "student_recipe"]
     grouped = frame.groupby(keys, dropna=False)
     if report_routes or "learn_temperature" in frame.columns:
@@ -426,15 +509,19 @@ def selected_test(root, choice, condensation_seeds=(0, 1, 2), student_seeds=(100
     root = Path(root)
     candidate = {key: choice[key] for key in ("method", "width", "lr", "T", "rank", "penalty")}
     candidate["rank"], candidate["width"] = int(candidate["rank"]), int(candidate["width"])
-    if candidate["method"] == "nystrom" and isinstance(choice.get("mass_mode"), str) and choice["mass_mode"] == "uniform":
+    if candidate["method"] == "nystrom" and isinstance(choice.get("mass_mode"), str) and choice["mass_mode"] in ("uniform", "initial"):
         for key in ("balance_steps", "balance_tol", "balance_backend"):
             if key not in choice or pd.isna(choice[key]):
-                raise ValueError("Selected uniform-mass balancing controls must be present and finite")
+                raise ValueError("Selected constrained-mass balancing controls must be present and finite")
+    if candidate["method"] == "nystrom" and choice.get("mass_mode") == "initial":
+        schema = choice.get("initial_mass_schema")
+        if isinstance(schema, bool) or not isinstance(schema, Real) or not math.isfinite(schema) or schema != 1:
+            raise ValueError("Selected initial_mass_schema must be present and equal one")
     if candidate["method"] == "nystrom":
         candidate["nystrom_schema"] = 3
     candidate.update({key: choice[key] for key in ("initialization", "alpha", "inner_loss_weighting", "mass_mode", "mass_scaling",
                                                   "metric_input", "metric_alpha", "strength", "train_target_mix",
-                                                  "balance_steps", "balance_tol", "balance_backend") if key in choice
+                                                  "balance_steps", "balance_tol", "balance_backend", "initial_mass_schema") if key in choice
                       and pd.notna(choice[key])})
     if "mixing" in choice:
         candidate["mixing"] = choice["mixing"]
@@ -463,7 +550,8 @@ def selected_test(root, choice, condensation_seeds=(0, 1, 2), student_seeds=(100
             for filename, is_resume in (("resume.pt", True), (f"step_{step:06d}.pt", False)):
                 if (existing / filename).exists():
                     _check_nystrom_assignment(candidate, torch.load(existing / filename, map_location="cpu",
-                                                                   weights_only=False), resume=is_resume)
+                                                                   weights_only=False), resume=is_resume, root=root,
+                                               condensation_seed=cond_seed, device=device)
     selection = dict(candidate=candidate, step=step, selection="validation_only",
                      student=dict(dropout=dropout, input_scale=input_scale, epochs=epochs),
                      condensation_seeds=list(condensation_seeds), student_seeds=list(student_seeds))
@@ -478,11 +566,22 @@ def selected_test(root, choice, condensation_seeds=(0, 1, 2), student_seeds=(100
     if dataset_digest(graph, train, validation, testing) != config["data_digest"]:
         raise ValueError("Graph or splits differ from the selected source screen")
     h = fixed_propagated_features(h, config, root)
-    save_json(selection, root / "selected.json")
-    save_json(selection, root / f"selected_{selection_key}.json")
+    if candidate.get("mass_mode") != "initial":
+        save_json(selection, root / "selected.json")
+        save_json(selection, root / f"selected_{selection_key}.json")
     logits = torch.load(root / "teacher.pt", map_location=device, weights_only=False)["logits"]
     q = training_refined_targets(logits, candidate["T"], graph["y"], train,
                                  candidate.get("train_target_mix", 0.0))
+    if candidate.get("mass_mode") == "initial":
+        for cond_seed in condensation_seeds:
+            existing = root / _fingerprint(candidate) / f"condensation_{cond_seed}"
+            for filename, is_resume in (("resume.pt", True), (f"step_{step:06d}.pt", False)):
+                if (existing / filename).exists():
+                    _check_nystrom_assignment(candidate, torch.load(existing / filename, map_location="cpu",
+                                                                   weights_only=False), resume=is_resume,
+                                             root=root, condensation_seed=cond_seed, device=device, h=h, q=q)
+        save_json(selection, root / "selected.json")
+        save_json(selection, root / f"selected_{selection_key}.json")
     records = []
     recipe_key = _fingerprint(dict(**settings, input_scale=input_scale))
     evaluation_graph = dict(graph, x=graph["x"] * input_scale)
@@ -505,7 +604,9 @@ def selected_test(root, choice, condensation_seeds=(0, 1, 2), student_seeds=(100
                 and snapshot.get("inner_loss_weighting", "mass") != _nystrom_inner_weighting(candidate)):
             raise ValueError("Nyström checkpoint inner weighting differs from the selection")
         if candidate["method"] == "nystrom":
-            _check_nystrom_assignment(candidate, snapshot)
+            _check_nystrom_assignment(candidate, snapshot, root=root, condensation_seed=cond_seed, device=device,
+                                      h=h if candidate.get("mass_mode") == "initial" else None,
+                                      q=q if candidate.get("mass_mode") == "initial" else None)
         if candidate["method"] == "coarsening":
             from src.coarsening_ce import gcn_inputs
             x, y, mass, training_adj = gcn_inputs(snapshot, device)
