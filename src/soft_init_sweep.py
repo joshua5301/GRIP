@@ -1,3 +1,5 @@
+import json
+import shutil
 from pathlib import Path
 
 import numpy as np
@@ -52,6 +54,7 @@ def run_soft_init_sweep(
     data_dir="/content/data/", device="cuda",
     finetune_temperatures=None,
     initialization="kmeans",
+    resume_from=None,
 ):
     if initialization not in ("kmeans", "random"):
         raise ValueError("Unknown initialization")
@@ -74,7 +77,7 @@ def run_soft_init_sweep(
     checkpoints = sorted({0, steps, *checkpoint_steps})
     if any(not isinstance(s, int) or not 0 <= s <= steps for s in checkpoints):
         raise ValueError("Checkpoint outside optimization budget")
-    config = {k: v for k, v in locals().copy().items() if k not in ("output_dir", "device", "values")}
+    config = {k: v for k, v in locals().copy().items() if k not in ("output_dir", "device", "values", "resume_from")}
     if finetune_temperatures is None:
         config.pop("finetune_temperatures")
     if initialization == "kmeans":
@@ -89,6 +92,25 @@ def run_soft_init_sweep(
     ))
     root = Path(output_dir) / _fingerprint(config)
     root.mkdir(parents=True, exist_ok=True)
+    if resume_from is not None:
+        previous = Path(resume_from)
+        old = json.loads((previous / "config.json").read_text(encoding="utf-8"))
+        ignored = {"steps", "checkpoint_steps", "checkpoints"}
+        canonical = lambda c: json.dumps({k: v for k, v in c.items() if k not in ignored}, sort_keys=True)
+        if canonical(old) != canonical(config) or steps <= old["steps"]:
+            raise ValueError("Continuation must only increase the step budget and add checkpoints")
+        if not set(old["checkpoints"]).issubset(checkpoints):
+            raise ValueError("Keep the original checkpoints when extending a run")
+        if any(s < old["steps"] and s not in old["checkpoints"] for s in checkpoints):
+            raise ValueError("Cannot add unsaved checkpoints before the previous endpoint")
+        candidates = previous / "finetune"
+        folders = list(candidates.glob("candidate_*/condensation_*"))
+        expected = len(penalties) * len(finetune_temperatures or taus) * len(condensation_seeds)
+        if len(folders) != expected or any(not (p / "resume.pt").exists() for p in folders):
+            raise ValueError("Continuation requires every candidate's saved optimizer state")
+        if not (root / "continued_from.json").exists():
+            shutil.copytree(previous, root, dirs_exist_ok=True)
+            save_json(dict(path=str(previous), steps=old["steps"]), root / "continued_from.json")
     save_json(config, root / "config.json")
     teachers = teacher_logits(
         h, graph, train, validation, "relu", list(gammas), basis, teacher_seed, root, return_all=True
@@ -157,7 +179,8 @@ def run_soft_init_sweep(
             base, initial = initial_state(seed, t, q)
             folder = root / "finetune" / f"candidate_{index:04d}" / f"condensation_{seed}"
             folder.mkdir(parents=True, exist_ok=True)
-            if not (folder / "complete.json").exists():
+            completed = folder / "complete.json"
+            if not completed.exists() or json.loads(completed.read_text())["steps"] < steps:
                 resume = folder / "resume.pt"
                 state = torch.load(resume, map_location="cpu", weights_only=False) if resume.exists() else None
                 result = optimize_ce_assignment(
@@ -211,6 +234,8 @@ def run_soft_init_sweep(
                 moments = torch.load(folder / "checkpoints" / f"step_{step:06d}.pt",
                                      map_location=device, weights_only=False)["moments"]
             cache = root / "final" / f"condensation_{seed}" / f"step_{step:06d}"
+            if step > 0:
+                cache = cache / f"candidate_{int(selected['candidate']):04d}"
             if normalized:
                 temperature = chosen["tau"] if phase == "selection_initial" else selected["t"]
                 cache = cache / f"t_{temperature:.12g}"

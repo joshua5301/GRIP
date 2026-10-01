@@ -179,3 +179,9 @@ starting assignment, not solely an initial value in a shared parameterization.
 For Cora 1.3%, compare both priors at gamma=0.0001, T=2, t=0.3, penalty=0.003,
 rank=8 and lr=0.01, with the same checkpoints and seeds. This is a matched-setting
 ablation, not a separately tuned performance comparison.
+
+Pass `resume_from` with an existing run directory to extend the cost sweep.
+Only the step budget and future checkpoints may change. The runner copies the
+original run into the new configuration directory, preserving the original files,
+and resumes every candidate's parameters, Adam state and solver warm starts.
+Retain all old checkpoints. Selection considers both old and new checkpoints.
