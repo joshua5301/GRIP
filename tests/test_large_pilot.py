@@ -368,3 +368,249 @@ def test_nystrom_deadline_and_stop_guard_are_preserved(tmp_path, mocked_pipeline
     )
     assert report["status"] == "stopped"
     assert time.monotonic() - started < 1.0
+
+
+def test_default_routes_option_preserves_legacy_cache_identity(tmp_path, mocked_pipeline, monkeypatch):
+    def forbidden(*args, **kwargs):
+        pytest.fail("Default pilots must not prepare or replay extra serving routes")
+
+    monkeypatch.setattr(pilot, "_validation_route_inputs", forbidden)
+    monkeypatch.setattr(pilot, "replay_routes", forbidden)
+    options = dict(device="cpu", basis=2, rank=2, steps=20)
+    default, root = pilot.run_pilot("arxiv", 0.0005, tmp_path, **options)
+    explicit, same = pilot.run_pilot("arxiv", 0.0005, tmp_path, report_routes=False, **options)
+    assert default["status"] == explicit["status"] == "complete"
+    assert same == root
+    settings = dict(
+        epochs=300, eval_every=10, hidden=256, dropout=0.31881090213944857,
+        lr=0.01, weight_decay=0.0005,
+    )
+    assert default["student_recipe"] == explicit["student_recipe"] == settings
+    folder = root / "validation" / f"step_20_{pilot._fingerprint(settings)}"
+    assert all(call["folder"] == folder for call in mocked_pipeline["students"])
+    assert (root / f"report_step_20_{pilot._fingerprint(settings)}.json").exists()
+    assert "serving_comparison" not in default and "serving_comparison" not in explicit
+    assert "report_routes" not in default["candidate"] and "report_routes" not in settings
+    assert mocked_pipeline["teacher"] == mocked_pipeline["optimizer"] == 1
+
+
+@pytest.mark.parametrize("dataset,ratio", [("arxiv", 0.0005), ("flickr", 0.001), ("reddit", 0.0005)])
+def test_validation_routes_use_own_graph_and_explicit_validation_mask_only(
+    tmp_path, mocked_pipeline, monkeypatch, dataset, ratio,
+):
+    replays = []
+
+    def replay(selected_path, graph, propagated, masks, settings, output_path, seed, stop):
+        expected_graph, original_mask = mocked_pipeline["validation"]
+        assert graph is expected_graph
+        assert set(masks) == {"val"}
+        if original_mask is None:
+            assert torch.equal(masks["val"], torch.ones(len(graph["x"]), dtype=torch.bool))
+            assert len(graph["x"]) != len(mocked_pipeline["graph"]["x"])
+        else:
+            assert masks["val"] is original_mask
+        expected = torch.sparse.mm(graph["adj"], torch.sparse.mm(graph["adj"], graph["x"]))
+        assert torch.equal(propagated, expected)
+        assert selected_path == output_path.parent / f"seed_{seed}_selected.pt"
+        assert output_path.name == f"seed_{seed}_validation_routes_v1.json"
+        assert settings == mocked_pipeline["students"][-1]["settings"]
+        assert not stop()
+        replays.append(seed)
+        return dict(
+            seed=seed, epoch=10, selection="same weights at GCN validation-selected epoch",
+            gcn_val_acc=61.0, gcn_val_ce=0.5, mlp_val_acc=55.0, mlp_val_ce=0.9,
+        )
+
+    monkeypatch.setattr(pilot, "replay_routes", replay)
+    options = dict(device="cpu", basis=2, rank=2, steps=20, student_seeds=(2, 7))
+    original, root = pilot.run_pilot(dataset, ratio, tmp_path, **options)
+    legacy_report = root / f"report_step_20_{pilot._fingerprint(original['student_recipe'])}.json"
+    legacy_bytes = legacy_report.read_bytes()
+    protocol_bytes = (root / "protocol.json").read_bytes()
+    report, same = pilot.run_pilot(dataset, ratio, tmp_path, report_routes=True, **options)
+    assert report["status"] == "complete"
+    assert same == root
+    assert replays == [2, 7]
+    assert report["val_acc_mean"] == report["gcn_val_acc_mean"] == 61
+    assert report["mlp_val_acc_mean"] == 55
+    assert report["gcn_minus_mlp_val_acc_mean"] == 6
+    assert report["gcn_minus_mlp_val_ce_mean"] == pytest.approx(-0.4)
+    assert all(not any("test_" in key for key in row) for row in report["students"])
+    assert legacy_report.read_bytes() == legacy_bytes
+    assert (root / "protocol.json").read_bytes() == protocol_bytes
+    route_report_key = pilot._fingerprint(dict(student=original["student_recipe"], report_routes=True, version=1))
+    assert (root / f"report_step_20_{route_report_key}.json").exists()
+    assert mocked_pipeline["teacher"] == mocked_pipeline["optimizer"] == 1
+
+
+@pytest.mark.parametrize("sparse", [False, True])
+def test_validation_h_uses_own_packed_adjacency(tmp_path, sparse):
+    x = torch.tensor([[1.0, 0.1], [0.1, 2.0], [0.5, 1.0]])
+    adjacency = 0.7 * torch.eye(3) + 0.3 * torch.eye(3).roll(1, 1)
+    graph = dict(x=x, y=torch.tensor([0, 1, 1]), adj=adjacency.to_sparse_csr() if sparse else adjacency)
+    checks = []
+    supplied, propagated, masks = pilot._validation_route_inputs(
+        (graph, None), "validation-source", tmp_path, lambda: checks.append(1),
+    )
+    assert supplied is graph
+    torch.testing.assert_close(propagated, adjacency @ adjacency @ x)
+    assert not torch.equal(propagated, x)
+    assert set(masks) == {"val"}
+    assert torch.equal(masks["val"], torch.ones(3, dtype=torch.bool))
+    assert len(checks) == 3
+
+
+def test_validation_h_freezes_original_source_coordinates_and_refuses_changed_source(tmp_path, monkeypatch):
+    x = torch.tensor([[1.0, 0.1], [0.1, 2.0], [0.5, 1.0]])
+    graph = dict(x=x, y=torch.tensor([0, 1, 1]), adj=torch.eye(3).to_sparse_csr())
+    validation = graph, torch.tensor([True, False, True])
+    _, first, masks = pilot._validation_route_inputs(validation, "source-v1", tmp_path, lambda: None)
+    saved_path = tmp_path / "validation_routes_S2X_v1.pt"
+    saved_bytes = saved_path.read_bytes()
+    original_mm = torch.sparse.mm
+
+    def slightly_rounded(adjacency, features):
+        return original_mm(adjacency, features) + 1e-7
+
+    monkeypatch.setattr(torch.sparse, "mm", slightly_rounded)
+    _, frozen, same_masks = pilot._validation_route_inputs(validation, "source-v1", tmp_path, lambda: None)
+    assert torch.equal(frozen, first)
+    assert same_masks["val"] is masks["val"] is validation[1]
+    assert saved_path.read_bytes() == saved_bytes
+    with pytest.raises(ValueError, match="source digest differs"):
+        pilot._validation_route_inputs(validation, "different-source", tmp_path, lambda: None)
+    assert saved_path.read_bytes() == saved_bytes
+
+
+def test_existing_selected_student_is_replayed_without_refit_or_weight_changes(
+    tmp_path, mocked_pipeline, monkeypatch,
+):
+    import src.student_routes as routes
+    from src.inductive_evaluation import fit_inductive_gcn
+
+    monkeypatch.setattr(pilot, "fit_inductive_gcn", fit_inductive_gcn)
+    graph = mocked_pipeline["graph"]
+    graph["adj"] = (0.7 * torch.eye(18) + 0.3 * torch.eye(18).roll(1, 1)).to_sparse_csr()
+    options = dict(device="cpu", basis=2, rank=2, steps=20, epochs=4, hidden=4, dropout=0.5)
+    first, root = pilot.run_pilot("arxiv", 0.0005, tmp_path, **options)
+    assert first["status"] == "complete"
+    folder = root / "validation" / f"step_20_{pilot._fingerprint(first['student_recipe'])}"
+    selected_path = folder / "seed_0_selected.pt"
+    selected_bytes = selected_path.read_bytes()
+    selected = torch.load(selected_path, map_location="cpu", weights_only=False)
+    assert set(selected) == {"epoch", "model_state", "fingerprint"}
+    forward = routes._forward
+    seen = []
+
+    def same_weights(model, features, adjacency):
+        for name, value in model.state_dict().items():
+            assert torch.equal(value, selected["model_state"][name])
+        seen.append("mlp" if adjacency is None else "gcn")
+        return forward(model, features, adjacency)
+
+    def no_training(*args, **kwargs):
+        pytest.fail("An existing validation-selected student must not be refit")
+
+    monkeypatch.setattr(routes, "_forward", same_weights)
+    monkeypatch.setattr(torch.optim, "Adam", no_training)
+    original_replay = pilot.replay_routes
+
+    def only_validation(selected_path, graph, propagated, masks, *args, **kwargs):
+        assert set(masks) == {"val"}
+        raw_labels = graph["y"]
+
+        class GuardedLabels:
+            def __getitem__(self, mask):
+                assert mask is masks["val"], "Replay may read only validation labels"
+                return raw_labels[mask]
+
+        return original_replay(selected_path, dict(graph, y=GuardedLabels()), propagated, masks, *args, **kwargs)
+
+    monkeypatch.setattr(pilot, "replay_routes", only_validation)
+    paired, same = pilot.run_pilot("arxiv", 0.0005, tmp_path, report_routes=True, **options)
+    assert paired["status"] == "complete"
+    assert same == root
+    assert seen == ["gcn", "mlp"]
+    assert selected_path.read_bytes() == selected_bytes
+    assert paired["students"][0]["epoch"] == selected["epoch"]
+    assert paired["students"][0]["gcn_val_acc"] == first["students"][0]["val_acc"]
+    assert paired["students"][0]["gcn_val_ce"] == first["students"][0]["val_ce"]
+    assert paired["students"][0]["serving_selection"] == routes.SELECTION
+    assert json.loads((folder / "seed_0_validation_routes_v1.json").read_text())["recipe"]["test_enabled"] is False
+    paired_cached, _ = pilot.run_pilot("arxiv", 0.0005, tmp_path, report_routes=True, **options)
+    assert paired_cached["students"] == paired["students"]
+    assert seen == ["gcn", "mlp"]
+
+
+@pytest.mark.parametrize("mismatch", ["accuracy", "ce", "test_mask"])
+def test_inconsistent_or_test_enabled_replay_is_refused(tmp_path, mocked_pipeline, monkeypatch, mismatch):
+    def replay(*args, **kwargs):
+        result = dict(
+            selection="same weights at GCN validation-selected epoch",
+            gcn_val_acc=61.0, gcn_val_ce=0.5, mlp_val_acc=55.0, mlp_val_ce=0.9,
+        )
+        if mismatch == "accuracy":
+            result["gcn_val_acc"] = 62
+        elif mismatch == "ce":
+            result["gcn_val_ce"] = 0.7
+        else:
+            result["gcn_test_acc"] = 99
+        return result
+
+    monkeypatch.setattr(pilot, "replay_routes", replay)
+    report, _ = pilot.run_pilot("arxiv", 0.0005, tmp_path, device="cpu", basis=2, rank=2, report_routes=True)
+    assert report["status"] == "failed"
+    assert not report["students"]
+    if mismatch == "test_mask":
+        assert "test metrics" in report["reason"]
+    else:
+        assert "differs" in report["reason"]
+
+
+def test_validation_route_preparation_checks_stop_before_propagation_or_save(tmp_path, monkeypatch):
+    def stopped():
+        raise InterruptedError("paused")
+
+    def forbidden(*args):
+        pytest.fail("A stopped route preparation must not compute propagation")
+
+    monkeypatch.setattr(torch.sparse, "mm", forbidden)
+    graph = dict(x=torch.ones(3, 2), y=torch.tensor([0, 1, 0]), adj=torch.eye(3).to_sparse_csr())
+    with pytest.raises(InterruptedError, match="paused"):
+        pilot._validation_route_inputs((graph, None), "source", tmp_path, stopped)
+    assert not (tmp_path / "validation_routes_S2X_v1.pt").exists()
+
+
+def test_interrupted_route_replay_preserves_selected_student_and_checkpoint(
+    tmp_path, mocked_pipeline, monkeypatch,
+):
+    from src.inductive_evaluation import fit_inductive_gcn
+
+    def paused(*args, **kwargs):
+        raise InterruptedError("Serving replay paused")
+
+    monkeypatch.setattr(pilot, "fit_inductive_gcn", fit_inductive_gcn)
+    options = dict(device="cpu", basis=2, rank=2, epochs=4, hidden=4)
+    complete, root = pilot.run_pilot("arxiv", 0.0005, tmp_path, **options)
+    assert complete["status"] == "complete"
+    selected_path = (
+        root / "validation" / f"step_20_{pilot._fingerprint(complete['student_recipe'])}"
+        / "seed_0_selected.pt"
+    )
+    selected_bytes = selected_path.read_bytes()
+    monkeypatch.setattr(pilot, "replay_routes", paused)
+    report, same = pilot.run_pilot("arxiv", 0.0005, tmp_path, report_routes=True, **options)
+    assert report["status"] == "stopped"
+    assert same == root
+    assert report["stage"] == "validation_serving_routes"
+    assert selected_path.read_bytes() == selected_bytes
+    assert (root / "condensation" / "checkpoints" / "step_000020.pt").exists()
+    assert (root.parent / "teacher.pt").exists()
+    assert not report["students"]
+    assert not list(root.rglob("*_validation_routes_v1.json"))
+
+
+def test_invalid_routes_option_is_rejected_before_loading(tmp_path, mocked_pipeline):
+    with pytest.raises(ValueError, match="report_routes must be boolean"):
+        pilot.run_pilot("arxiv", 0.0005, tmp_path, device="cpu", basis=2, rank=2, report_routes="true")
+    assert mocked_pipeline["data"] == 0

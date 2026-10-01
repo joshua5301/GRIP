@@ -40,6 +40,7 @@ from src.nystrom_ce import optimize as optimize_nystrom
 from src.partition_initialization import teacher_aware_kmeans, teacher_balanced_kmeans
 from src.shared_features import get_shared_h
 from src.soft_ce_partition import optimize_ce_assignment, solve_head_system, solve_inner_newton_first
+from src.student_routes import replay_routes
 from src.sweep_utils import representative
 from src.target_refinement import training_refined_targets
 from src.transforms import fit_transform
@@ -134,6 +135,34 @@ def _teacher_validation(feature_map, weight, graph, mask, chunk, guard):
     return dict(val_acc=100 * correct / count, val_ce=ce / count, val_nodes=count)
 
 
+@torch.no_grad()
+def _validation_route_inputs(validation, source_digest, teacher_root, guard):
+    """Freeze the validation graph's own packed-adjacency S²X for paired serving."""
+    graph, mask = validation
+    guard()
+    x, adjacency = graph["x"], graph["adj"]
+    if adjacency.layout == torch.strided:
+        propagated = adjacency @ (adjacency @ x)
+    else:
+        propagated = torch.sparse.mm(adjacency, torch.sparse.mm(adjacency, x))
+    guard()
+    source = _fingerprint(
+        dict(
+            data_digest=source_digest,
+            propagation="validation-packed-adjacency-S2X-v1",
+            dtype=str(x.dtype),
+            torch_version=str(torch.__version__),
+        )
+    )
+    propagated = get_shared_h(propagated, teacher_root / "validation_routes_S2X_v1.pt", source)
+    guard()
+    # replay_routes requires explicit masks. None means every node in this
+    # induced validation graph, never the separate training/testing graph.
+    if mask is None:
+        mask = torch.ones(len(x), dtype=torch.bool, device=x.device)
+    return graph, propagated, dict(val=mask)
+
+
 def run_pilot(
     dataset,
     ratio,
@@ -162,6 +191,7 @@ def run_pilot(
     train_target_mix=0.0,
     inner_loss_weighting="mass",
     surrogate="linear",
+    report_routes=False,
 ):
     """Return (report, root) for a bounded, resumable full-data screen.
 
@@ -177,7 +207,11 @@ def run_pilot(
     such a pilot is not a claim of parity with a basis-3000 research benchmark.
 
     The report records complete/stopped/failed, stages, elapsed seconds, GPU peak,
-    teacher validation and completed student validation fits.  A nonconverged
+    teacher validation and completed student validation fits. report_routes=True
+    also replays paired MLP/GCN serving with the same GCN validation-selected
+    weights on the validation graph's own S²X/X+adjacency. No route-specific
+    training or epoch selection occurs. The default preserves existing cache
+    identities and report names. A nonconverged
     teacher or exact inner/adjoint is refused and reported.  No test metrics exist.
     """
     if dataset not in ("arxiv", "flickr", "reddit") or (dataset, ratio) not in BUDGET:
@@ -215,6 +249,8 @@ def run_pilot(
         raise ValueError("surrogate must be linear or nystrom")
     if surrogate == "nystrom" and inner_loss_weighting != "mass":
         raise ValueError("The Nyström surrogate supports mass inner CE only")
+    if not isinstance(report_routes, bool):
+        raise ValueError("report_routes must be boolean")
     started, deadline = time.monotonic(), time.monotonic() + deadline_seconds
     teacher_protocol = dict(
         version=2,
@@ -270,6 +306,13 @@ def run_pilot(
         candidate=candidate,
         student_recipe=settings,
     )
+    if report_routes:
+        report["serving_comparison"] = dict(
+            selection="same weights at GCN validation-selected epoch",
+            graph="validation split graph; Arxiv full graph with validation mask",
+            gcn="validation X and its own normalized adjacency",
+            mlp="validation graph own S²X; no adjacency",
+        )
     lock, gpu_started = None, False
 
     def guard():
@@ -463,6 +506,12 @@ def run_pilot(
                     raise RuntimeError("Refusing a nonconverged condensation endpoint")
                 report.update(completed_steps=steps, outer_ce=float(snapshot["teacher_ce"]))
                 cx, cy, mass = representative(snapshot["moments"], transform, z.shape[1], device)
+            evaluation_folder = root / "validation" / f"step_{steps}_{_fingerprint(settings)}"
+            if report_routes:
+                stage("preparing_validation_serving_inputs")
+                route_graph, route_h, route_masks = _validation_route_inputs(
+                    validation, source_digest, teacher_root, guard
+                )
             for seed in student_seeds:
                 stage("validation_student", student_seed=seed)
                 result = fit_inductive_gcn(
@@ -473,18 +522,54 @@ def run_pilot(
                     validation,
                     seed=seed,
                     settings=settings,
-                    folder=root / "validation" / f"step_{steps}_{_fingerprint(settings)}",
+                    folder=evaluation_folder,
                     stop=stopped,
                     weighting="uniform",
                     train_mask=train,
                 )
                 if any(key.startswith("test_") for key in result):
                     raise RuntimeError("Screening evaluator unexpectedly returned test metrics")
+                if report_routes:
+                    stage("validation_serving_routes", student_seed=seed)
+                    routes = replay_routes(
+                        evaluation_folder / f"seed_{seed}_selected.pt",
+                        route_graph,
+                        route_h,
+                        route_masks,
+                        settings,
+                        evaluation_folder / f"seed_{seed}_validation_routes_v1.json",
+                        seed=seed,
+                        stop=stopped,
+                    )
+                    if any("test_" in key for key in routes):
+                        raise RuntimeError("Validation route replay unexpectedly returned test metrics")
+                    if not math.isclose(routes["gcn_val_acc"], result["val_acc"], rel_tol=0, abs_tol=1e-8):
+                        raise RuntimeError("GCN route replay differs from the selected student's validation score")
+                    if not math.isclose(routes["gcn_val_ce"], result["val_ce"], rel_tol=1e-6, abs_tol=1e-6):
+                        raise RuntimeError("GCN route replay differs from the selected student's validation CE")
+                    result = dict(
+                        result,
+                        **{key: value for key, value in routes.items() if key.startswith(("mlp_", "gcn_"))},
+                        serving_selection=routes["selection"],
+                        gcn_minus_mlp_val_acc=routes["gcn_val_acc"] - routes["mlp_val_acc"],
+                        gcn_minus_mlp_val_ce=routes["gcn_val_ce"] - routes["mlp_val_ce"],
+                    )
                 report["students"].append(result)
                 save_json(report, root / "report.json")
             report.update(
                 status="complete", val_acc_mean=float(np.mean([r["val_acc"] for r in report["students"]]))
             )
+            if report_routes:
+                report.update(
+                    mlp_val_acc_mean=float(np.mean([r["mlp_val_acc"] for r in report["students"]])),
+                    gcn_val_acc_mean=float(np.mean([r["gcn_val_acc"] for r in report["students"]])),
+                    gcn_minus_mlp_val_acc_mean=float(
+                        np.mean([r["gcn_minus_mlp_val_acc"] for r in report["students"]])
+                    ),
+                    gcn_minus_mlp_val_ce_mean=float(
+                        np.mean([r["gcn_minus_mlp_val_ce"] for r in report["students"]])
+                    ),
+                )
     except InterruptedError as exc:
         report.update(status="stopped", reason=str(exc))
     except (RuntimeError, ValueError, OSError) as exc:
@@ -495,6 +580,10 @@ def run_pilot(
         report["elapsed_seconds"] = time.monotonic() - started
         report["peak_gpu_bytes"] = int(torch.cuda.max_memory_allocated(device)) if gpu_started else 0
         save_json(report, root / "report.json")
-        save_json(report, root / f"report_step_{steps}_{_fingerprint(settings)}.json")
+        report_key = (
+            _fingerprint(dict(student=settings, report_routes=True, version=1))
+            if report_routes else _fingerprint(settings)
+        )
+        save_json(report, root / f"report_step_{steps}_{report_key}.json")
         print("LARGE_PILOT_RESULT", json.dumps(report), flush=True)
     return report, root
