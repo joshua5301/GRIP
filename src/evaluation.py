@@ -114,6 +114,20 @@ def _initialize_geom_uniform(model, seed):
             layer.bias.copy_(bias)
 
 
+@torch.no_grad()
+def _initialize_geom_uniform_zero_bias(model, seed):
+    """Keep GEOM weights and post-initialization RNG, then zero every bias.
+
+    Consume the complete original weight/bias draw sequence before zeroing:
+    skipping a bias draw would change the next layer's weights and subsequent
+    dropout draws, making this more than a bias-only initialization control.
+    """
+    _initialize_geom_uniform(model, seed)
+    for layer in model.layers:
+        if layer.bias is not None:
+            layer.bias.zero_()
+
+
 def fit_gcn_diagnostic(
     cx,
     cy,
@@ -142,14 +156,16 @@ def fit_gcn_diagnostic(
     only after restoring validation-selected weights; ``last_test_*`` values
     are intentionally absent. ``stop`` interrupts without writing a new cache.
     lr_schedule is half_reset (the original Adam reset to lr/10 halfway) or
-    constant. initialization is pyg (the original Glorot/zero-bias draws) or
-    geom_uniform (GEOM's seeded CPU fan-in uniform weights and biases). Default
-    calls retain their original numerical trajectory and recipe fingerprint.
+    constant. initialization is pyg (the original Glorot/zero-bias draws),
+    geom_uniform (GEOM's seeded CPU fan-in uniform weights and biases), or
+    geom_uniform_zero_bias (the same GEOM weight/bias draws and final RNG state,
+    with biases then zeroed). Existing policies retain their numerical
+    trajectories and recipe fingerprints; the new policy has its own identity.
     """
     if lr_schedule not in ("half_reset", "constant"):
         raise ValueError("lr_schedule must be half_reset or constant")
-    if initialization not in ("pyg", "geom_uniform"):
-        raise ValueError("initialization must be pyg or geom_uniform")
+    if initialization not in ("pyg", "geom_uniform", "geom_uniform_zero_bias"):
+        raise ValueError("initialization must be pyg, geom_uniform or geom_uniform_zero_bias")
     settings = dict(epochs=epochs, eval_every=eval_every, hidden=hidden, dropout=dropout,
                     lr=lr, weight_decay=weight_decay)
     # Preserve existing cache identities when the optional policies are default.
@@ -193,6 +209,8 @@ def fit_gcn_diagnostic(
     model = GCN(cx.shape[1], hidden, cy.shape[1], 2, dropout)
     if initialization == "geom_uniform":
         _initialize_geom_uniform(model, seed)
+    elif initialization == "geom_uniform_zero_bias":
+        _initialize_geom_uniform_zero_bias(model, seed)
     model = model.to(cx.device)
     optimizer = torch.optim.Adam(model.parameters(), lr=lr, weight_decay=weight_decay)
     weights = (mass / mass.sum()).to(cx)

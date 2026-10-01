@@ -31,6 +31,7 @@ import torch
 import torch.nn.functional as F
 
 from src.data import BUDGET, _prepare_dataset
+from src.gcn_teacher import fit_gcn_teacher, teacher_settings
 from src.inductive_evaluation import _update_tensor_digest, fit_inductive_gcn
 from src.initialization import feature_kmeans
 from src.io import _fingerprint, save_json, save_state
@@ -194,6 +195,8 @@ def run_pilot(
     report_routes=False,
     mixing=0.05,
     teacher_gamma=0.01,
+    teacher_type="kernel",
+    gcn_teacher_epochs=200,
 ):
     """Return (report, root) for a bounded, resumable full-data screen.
 
@@ -210,6 +213,12 @@ def run_pilot(
     teacher_gamma defaults to .01 with its exact legacy cache identity. Other
     values have separate teacher/condensation/student folders, while original H,
     map, phi and validation-route H reuse the legacy geometry folder unchanged.
+    teacher_type='gcn' instead fits a training-label-only two-layer GCN, choosing
+    its epoch on the validation graph. Requested fits resume atomically and must
+    finish before their targets enter condensation. This route keeps the H/map
+    geometry and P-derived representatives; it has a separate complete teacher
+    recipe and never claims exact convex convergence. gcn_teacher_epochs controls
+    its requested budget. Kernel defaults retain their legacy cache identities.
     Teacher basis defaults to 512 for a pilot and is explicit in protocol/results;
     such a pilot is not a claim of parity with a basis-3000 research benchmark.
 
@@ -274,6 +283,14 @@ def run_pilot(
     ):
         raise ValueError("teacher_gamma must be positive and finite")
     teacher_gamma = float(teacher_gamma)
+    if teacher_type not in ("kernel", "gcn"):
+        raise ValueError("teacher_type must be kernel or gcn")
+    if isinstance(gcn_teacher_epochs, bool) or not isinstance(gcn_teacher_epochs, int) or gcn_teacher_epochs < 1:
+        raise ValueError("gcn_teacher_epochs must be a positive integer")
+    if teacher_type == "gcn" and teacher_gamma != 0.01:
+        raise ValueError("GCN teacher uses its own weight decay; leave teacher_gamma at .01")
+    if teacher_type == "kernel" and gcn_teacher_epochs != 200:
+        raise ValueError("gcn_teacher_epochs only applies to teacher_type='gcn'")
     started, deadline = time.monotonic(), time.monotonic() + deadline_seconds
     # The legacy gamma=.01 identity anchors shared, gamma-independent geometry.
     geometry_protocol = dict(
@@ -294,6 +311,10 @@ def run_pilot(
         geometry_root if teacher_gamma == 0.01
         else geometry_root / f"gamma_{_fingerprint(teacher_protocol)}"
     )
+    if teacher_type == "gcn":
+        teacher_protocol = dict(geometry_protocol, teacher_type="gcn",
+                                gcn_settings=teacher_settings(gcn_teacher_epochs, teacher_seed))
+        teacher_root = geometry_root / f"gcn_{_fingerprint(teacher_protocol)}"
     candidate = dict(
         version=1,
         ratio=ratio,
@@ -340,6 +361,9 @@ def run_pilot(
     if teacher_gamma != 0.01:
         report["teacher_gamma"] = teacher_gamma
         report["geometry_cache_root"] = str(geometry_root.resolve())
+    if teacher_type == "gcn":
+        report.update(teacher_type="gcn", gcn_teacher_epochs=gcn_teacher_epochs,
+                      geometry_cache_root=str(geometry_root.resolve()))
     if report_routes:
         report["serving_comparison"] = dict(
             selection="same weights at GCN validation-selected epoch",
@@ -427,7 +451,15 @@ def run_pilot(
             bounded_phi = _BoundedFeatures(phi, guard)
             teacher_path = teacher_root / "teacher.pt"
             stage("fitting_teacher")
-            if teacher_path.exists():
+            if teacher_type == "gcn":
+                fitted = fit_gcn_teacher(graph, train, validation, teacher_root,
+                                         epochs=gcn_teacher_epochs, seed=teacher_seed, guard=guard)
+                logits = fitted["logits"]
+                report["teacher"] = dict(fitted["selected_validation"],
+                                         training_complete=fitted["training_complete"],
+                                         timings=fitted["timings"])
+                del fitted
+            elif teacher_path.exists():
                 saved = torch.load(teacher_path, map_location=device, weights_only=False)
                 if (
                     saved["data_digest"] != digest or not saved["converged"]
@@ -454,9 +486,11 @@ def run_pilot(
                     teacher_path,
                 )
             stage("teacher_validation")
-            report["teacher"] = _teacher_validation(feature_map, weight, *validation, chunk, guard)
+            if teacher_type == "kernel":
+                report["teacher"] = _teacher_validation(feature_map, weight, *validation, chunk, guard)
+                del weight
             q = training_refined_targets(logits, temperature, graph["y"], train, mixing=train_target_mix)
-            del logits, weight
+            del logits
             if surrogate == "linear":
                 del phi, bounded_phi, feature_map
                 z, transform = fit_transform(h, kind="rms")
