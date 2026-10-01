@@ -1,7 +1,15 @@
 import pytest
 import torch
 
-from src.low_rank_assignment import CachedLowRankMoments, LowRankMoments, initialize_factors
+from src.low_rank_assignment import (
+    CachedLowRankMoments,
+    LowRankMoments,
+    encode_nodes,
+    initialize_dual_mlp,
+    initialize_factors,
+    saved_encoder_cells,
+    saved_encoder_nodes,
+)
 from src.soft_ce_partition import optimize_ce_assignment
 from src.soft_init_sweep import distance_base, random_cost_base
 
@@ -46,6 +54,36 @@ def test_no_fixed_cost_starts_with_distinct_cells(tmp_path):
             penalty=0.2, inner_method="newton_first", inner_tol=1e-8,
             steps=2, resume_state=state,
         )
+
+
+def test_dual_feature_mlp_preserves_initial_moments(tmp_path):
+    z, q, assignment = problem()
+    inputs = z.float() * z.shape[1]**0.5
+    node_parameters, cell_parameters, anchors = initialize_dual_mlp(inputs, 3, 2, 6, 7)
+    u = encode_nodes(inputs, node_parameters)
+    v = encode_nodes(inputs[anchors], cell_parameters)
+    base = z.new_zeros(len(z), 3)
+    material = torch.cat((torch.ones(12, 1, dtype=z.dtype), z, q), 1)
+    initial = LowRankMoments.apply(u, -v / 0.3, base, material, 0.05, 5)
+    actual = (base + u @ (-v / 0.3).T / 2**0.5).softmax(1).T @ material / 12
+    torch.testing.assert_close(initial, actual)
+    gradients = torch.autograd.grad(initial.square().sum(), [*node_parameters, *cell_parameters])
+    assert gradients[0].norm() > 0
+    assert gradients[4].norm() > 0
+    result = optimize_ce_assignment(
+        z, q, assignment, assignment_rank=2, assignment_input="features",
+        assignment_encoder="dual_mlp", encoder_hidden=6, factor_seed=7,
+        base_logits=base, correction_scale=-1 / 0.3, penalty=0.2,
+        inner_method="newton_first", inner_tol=1e-8, steps=1,
+        checkpoint_steps=(0, 1), folder=tmp_path, save_resume=True,
+    )
+    torch.testing.assert_close(result["checkpoints"][0]["moments"], initial)
+    saved = torch.load(tmp_path / "best_assignment_encoder.pt", weights_only=False)
+    node = saved_encoder_nodes(z, q, saved)
+    cell = saved_encoder_cells(z, q, saved)
+    recovered = (saved["base_logits"] + node @ (cell * saved["correction_scale"]).T / 2**0.5)
+    recovered = recovered.softmax(1).T @ material / 12
+    torch.testing.assert_close(recovered, result["best_moments"])
 
 
 def test_distance_probabilities():

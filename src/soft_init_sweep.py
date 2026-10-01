@@ -11,7 +11,12 @@ from src.data import BUDGET, _prepare_dataset
 from src.evaluation import fit_gcn_diagnostic
 from src.initialization import cell_means, feature_kmeans
 from src.io import _fingerprint, array_digest, save_json, save_state, write_table
-from src.low_rank_assignment import LowRankMoments, initialize_factors
+from src.low_rank_assignment import (
+    LowRankMoments,
+    encode_nodes,
+    initialize_dual_mlp,
+    initialize_factors,
+)
 from src.moments import make_material
 from src.multiseed_sweep import aggregate_search
 from src.soft_ce_partition import optimize_ce_assignment
@@ -38,6 +43,13 @@ def run_distance_cost_sweep(output_dir, gammas, temperatures, assignment_tempera
     )
 
 
+def run_dual_mlp_width_sweep(output_dir, widths, gammas, temperatures, t, penalty, **options):
+    return run_soft_init_sweep(
+        output_dir, gammas, temperatures, [1.0], [penalty],
+        finetune_temperatures=[t], initialization="none", assignment_widths=widths, **options,
+    )
+
+
 def random_cost_base(nodes, cells, seed, temperature, device, dtype):
     generator = torch.Generator().manual_seed(seed)
     cost = torch.randn(nodes, cells, generator=generator, dtype=dtype).to(device)
@@ -56,11 +68,17 @@ def run_soft_init_sweep(
     initialization="kmeans",
     resume_from=None,
     shared_features_path=None,
+    assignment_widths=None,
 ):
     if initialization not in ("kmeans", "random", "none"):
         raise ValueError("Unknown initialization")
     if initialization in ("random", "none") and finetune_temperatures is None:
         raise ValueError("Non-geometric assignments require the normalized cost sweep")
+    if assignment_widths is not None and (
+        initialization != "none" or not assignment_widths
+        or any(not isinstance(width, int) or width < 1 for width in assignment_widths)
+    ):
+        raise ValueError("Dual MLP widths require positive integers and no fixed cost")
     values = [*gammas, *temperatures, *taus, *penalties, *(finetune_temperatures or ())]
     if any(not v for v in (gammas, temperatures, taus, penalties)) or any(
         not np.isfinite(v) or v <= 0 for v in values
@@ -85,6 +103,8 @@ def run_soft_init_sweep(
         config.pop("initialization")
     if shared_features_path is None:
         config.pop("shared_features_path")
+    if assignment_widths is None:
+        config.pop("assignment_widths")
     normalized = finetune_temperatures is not None
     torch.backends.cuda.matmul.allow_tf32 = False
     torch.backends.cudnn.allow_tf32 = False
@@ -126,7 +146,8 @@ def run_soft_init_sweep(
             raise ValueError("Cannot add unsaved checkpoints before the previous endpoint")
         candidates = previous / "finetune"
         folders = list(candidates.glob("candidate_*/condensation_*"))
-        expected = len(penalties) * len(finetune_temperatures or taus) * len(condensation_seeds)
+        expected = (len(penalties) * len(finetune_temperatures or taus) * len(condensation_seeds)
+                    * len(assignment_widths or [None]))
         if len(folders) != expected or any(not (p / "resume.pt").exists() for p in folders):
             raise ValueError("Continuation requires every candidate's saved optimizer state")
         if not (root / "continued_from.json").exists():
@@ -160,15 +181,23 @@ def run_soft_init_sweep(
             seed, folder=folder, **settings,
         ) for seed in (final_seeds if final else search_seeds)]
 
-    def initial_state(seed, tau, q):
+    def initial_state(seed, tau, q, width=None):
         if initialization == "kmeans":
             base = distance_base(z, assignments[seed], tau, normalized=normalized)
         elif initialization == "random":
             base = random_cost_base(len(z), cells, seed, tau, device, z.dtype)
         else:
             base = z.new_zeros(len(z), cells)
-        u_std = 1.0 if initialization == "none" else 0.0
-        u, v = initialize_factors(assignments[seed], cells, rank, seed, u_std)
+        if assignment_widths is not None:
+            inputs = z.detach().float() * z.shape[1]**0.5
+            node_parameters, cell_parameters, anchors = initialize_dual_mlp(
+                inputs, cells, rank, width or assignment_widths[0], seed
+            )
+            u = encode_nodes(inputs, node_parameters)
+            v = encode_nodes(inputs[anchors], cell_parameters)
+        else:
+            u_std = 1.0 if initialization == "none" else 0.0
+            u, v = initialize_factors(assignments[seed], cells, rank, seed, u_std)
         correction_scale = -1 / tau if normalized else 1.0
         with torch.no_grad():
             moments = LowRankMoments.apply(u, v * correction_scale, base, make_material(z, q), 0.05, 8192)
@@ -198,12 +227,16 @@ def run_soft_init_sweep(
     chosen = initial_grid.sort_values(["val", "candidate"], ascending=[False, True]).iloc[0].to_dict()
     save_json(chosen, root / "selected_initialization.json")
     q = (teachers[chosen["gamma"]].to(device) / chosen["T"]).softmax(1).double()
-    fine_grid = grid_rows(dict(t=list(finetune_temperatures or [chosen["tau"]]), penalty=list(penalties)))
+    fine_space = dict(t=list(finetune_temperatures or [chosen["tau"]]), penalty=list(penalties))
+    if assignment_widths is not None:
+        fine_space["width"] = list(assignment_widths)
+    fine_grid = grid_rows(fine_space)
     records = []
     for index, params in enumerate(tqdm(fine_grid, desc="Low-rank fine-tuning")):
         t, penalty = params["t"], params["penalty"]
+        width = params.get("width")
         for seed in condensation_seeds:
-            base, initial, probability = initial_state(seed, t, q)
+            base, initial, probability = initial_state(seed, t, q, width)
             folder = root / "finetune" / f"candidate_{index:04d}" / f"condensation_{seed}"
             folder.mkdir(parents=True, exist_ok=True)
             completed = folder / "complete.json"
@@ -214,7 +247,10 @@ def run_soft_init_sweep(
                     z, q, assignments[seed], penalty=penalty, steps=steps, lr=assignment_lr,
                     assignment_rank=rank, factor_seed=seed, base_logits=base,
                     correction_scale=-1 / t if normalized else 1.0,
-                    factor_initial_std=1.0 if initialization == "none" else 0.0,
+                    factor_initial_std=1.0 if initialization == "none" and width is None else 0.0,
+                    assignment_input="features" if width is not None else "node",
+                    assignment_encoder="dual_mlp" if width is not None else "linear",
+                    encoder_hidden=width or 64,
                     checkpoint_steps=checkpoints, folder=folder, resume_state=state,
                     save_resume=True, save_assignment=False, inner_method="newton_first",
                     implicit_warm_start=True, inner_loss_weighting="mass", cg_max_iter=512,
@@ -228,7 +264,8 @@ def run_soft_init_sweep(
                     raise RuntimeError("Fine-tuning initialization differs from selection")
                 if step == 0:
                     cache = ((root / "initial_grid" / f"candidate_{int(chosen['candidate']):04d}")
-                             if t == chosen["tau"] else root / "fine_initial" / f"t_{t:.12g}")
+                             if t == chosen["tau"] and (width is None or width == assignment_widths[0])
+                             else root / "fine_initial" / f"t_{t:.12g}" / f"width_{width}")
                     cache = cache / f"condensation_{seed}" / "search"
                     if normalized:
                         cache.parent.mkdir(parents=True, exist_ok=True)
@@ -241,10 +278,11 @@ def run_soft_init_sweep(
                         ), cache.parent / "assignment.json")
                 else:
                     cache = folder / "search" / f"step_{step:06d}"
-                records.extend(dict(candidate=index, t=t, penalty=penalty, step=step, condensation_seed=seed, **row)
+                records.extend(dict(candidate=index, **params, step=step, condensation_seed=seed, **row)
                                for row in evaluate(snapshot["moments"], q, cache))
         write_table(pd.DataFrame(records), root / "finetune_students.csv")
-        search = aggregate_search(records, condensation_seeds, search_seeds, ("t", "penalty"))
+        keys = ("t", "penalty", "width") if assignment_widths is not None else ("t", "penalty")
+        search = aggregate_search(records, condensation_seeds, search_seeds, keys)
         write_table(search, root / "finetune_grid.csv")
     selected = search.sort_values(["val", "step", "candidate"], ascending=[False, True, True]).iloc[0].to_dict()
     save_json(selected, root / "selected_finetune.json")
@@ -266,6 +304,9 @@ def run_soft_init_sweep(
             if normalized:
                 temperature = chosen["tau"] if phase == "selection_initial" else selected["t"]
                 cache = cache / f"t_{temperature:.12g}"
+            if assignment_widths is not None:
+                width = assignment_widths[0] if phase == "selection_initial" else int(selected["width"])
+                cache = cache / f"width_{width}"
             rows.extend(dict(phase=phase, condensation_seed=seed, **r)
                         for r in evaluate(moments, q, cache, final=True))
     final = pd.DataFrame(rows)
@@ -289,6 +330,8 @@ def run_soft_init_sweep(
         summary["step"] = summary.phase.map(dict(selection_initial=0, initial=0, selected=int(selected["step"])))
         summary["search_val"] = summary.phase.map(dict(selection_initial=chosen["val"], initial=initial_score, selected=selected["val"]))
     summary["initialization"] = initialization
+    if assignment_widths is not None:
+        summary["width"] = selected["width"]
     for name, table in (("summary", summary), ("by_seed", by_seed), ("final_students", final)):
         write_table(table, root / f"{name}.csv")
     return summary, by_seed, initial_grid, search, root

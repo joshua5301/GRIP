@@ -45,6 +45,27 @@ def initialize_mlp(inputs, clusters, rank, hidden=64, seed=0):
     return [p.requires_grad_() for p in parameters], v
 
 
+def random_anchors(inputs, clusters, seed):
+    generator = torch.Generator().manual_seed(seed)
+    return torch.randperm(len(inputs), generator=generator)[:clusters].to(inputs.device)
+
+
+def initialize_dual_mlp(inputs, clusters, rank, hidden, seed):
+    if not isinstance(hidden, int) or hidden < 1:
+        raise ValueError("encoder_hidden must be a positive integer")
+    anchors = random_anchors(inputs, clusters, seed)
+
+    def tower(offset):
+        generator = torch.Generator(device=inputs.device).manual_seed(seed + offset)
+        first = torch.randn(inputs.shape[1], hidden, generator=generator, device=inputs.device)
+        last = torch.randn(hidden, rank, generator=generator, device=inputs.device)
+        parameters = [first * math.sqrt(2 / inputs.shape[1]), inputs.new_zeros(hidden),
+                      last / math.sqrt(hidden), inputs.new_zeros(rank)]
+        return [p.requires_grad_() for p in parameters]
+
+    return tower(1), tower(2), anchors
+
+
 def encode_nodes(inputs, parameters):
     if len(parameters) == 1:
         return inputs @ parameters[0]
@@ -54,8 +75,17 @@ def encode_nodes(inputs, parameters):
 
 def saved_encoder_nodes(z, q, saved):
     inputs = assignment_inputs(z, q, saved["assignment_input"])
+    if saved["assignment_encoder"] == "dual_mlp":
+        inputs = inputs * inputs.shape[1]**0.5
     parameters = saved["encoder_parameters"] if "encoder_parameters" in saved else [saved["weight"]]
     return encode_nodes(inputs, [p.to(inputs) for p in parameters])
+
+
+def saved_encoder_cells(z, q, saved):
+    inputs = assignment_inputs(z, q, saved["assignment_input"])
+    inputs = inputs * inputs.shape[1]**0.5
+    parameters = [p.to(inputs) for p in saved["cell_encoder_parameters"]]
+    return encode_nodes(inputs[saved["anchor_indices"]], parameters)
 
 
 def logit_block(u, v, assignment, mixing):

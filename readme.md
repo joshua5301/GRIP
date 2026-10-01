@@ -198,3 +198,14 @@ unit Gaussian values. Zero U would make all initial cells identical, so this
 initialization breaks that symmetry. The same rank, temperature, inner model,
 optimizer and evaluation apply. Use the shared propagated features from the
 k-means/random-cost ablation for a matched Cora comparison.
+
+`src.soft_init_sweep.run_dual_mlp_width_sweep` uses two independent two-layer
+feature MLPs: U_i=g(H_i) and V_j=h(H_{a_j}), where a_j is one of M seeded,
+distinct random original-node anchors. Each network has one ReLU hidden layer
+and an output of the requested rank. Only node features enter either network;
+anchors stay fixed and no k-means or fixed logit cost is used. Input scaling
+restores per-coordinate variance after RMS normalization. The assignment is
+softmax(-UVᵀ/(sqrt(rank)*t)). The sweep selects width and checkpoint by mean
+GCN validation over the same condensation/student seed pairs, then evaluates
+only the selected setting on independent student seeds. `t` and inner penalty
+are fixed by the caller. The complete grid and optimizer states are resumable.

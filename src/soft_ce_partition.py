@@ -19,6 +19,7 @@ from src.low_rank_assignment import (
     WeightedLowRankMoments,
     assignment_inputs,
     encode_nodes,
+    initialize_dual_mlp,
     initialize_encoder,
     initialize_factors,
     initialize_mlp,
@@ -560,9 +561,12 @@ def optimize_ce_assignment(
         )
     }
     if base_logits is not None:
-        if (assignment_rank is None or assignment_input != "node" or mass_mode != "free"
+        supported = assignment_input == "node" or (
+            assignment_input == "features" and assignment_encoder == "dual_mlp"
+        )
+        if (assignment_rank is None or not supported or mass_mode != "free"
                 or node_weighting or temperature_logits is not None or sparse_k is not None):
-            raise ValueError("Fixed base logits require free-mass node-factor optimization")
+            raise ValueError("Fixed base logits require free-mass node factors or dual feature MLPs")
         if base_logits.shape != (len(z), int(assignment.max()) + 1) or not bool(torch.isfinite(base_logits).all()):
             raise ValueError("Invalid base logits")
         base_logits = base_logits.detach().to(z)
@@ -674,8 +678,9 @@ def optimize_ce_assignment(
         assignment_input != "node" and assignment_rank is None and assignment_encoder != "prototype"
     ):
         raise ValueError("Feature assignment requires assignment_rank and a supported input mode")
-    if assignment_encoder not in ("linear", "mlp", "prototype") or (
+    if assignment_encoder not in ("linear", "mlp", "dual_mlp", "prototype") or (
         assignment_input == "node" and assignment_encoder != "linear"
+    ) or (assignment_encoder == "dual_mlp" and assignment_input != "features"
     ):
         raise ValueError("MLP encoder requires feature-conditioned assignments")
     if solver_mode not in ("exact", "tracking") or any(
@@ -711,14 +716,22 @@ def optimize_ce_assignment(
         parameters = [logits]
     elif assignment_input != "node":
         inputs = assignment_inputs(z, q, assignment_input)
-        if assignment_encoder == "mlp":
+        if assignment_encoder == "dual_mlp":
+            inputs = inputs * inputs.shape[1]**0.5
+            encoder_parameters, cell_parameters, anchor_indices = initialize_dual_mlp(
+                inputs, clusters, assignment_rank, encoder_hidden, factor_seed
+            )
+            anchor_inputs = inputs[anchor_indices]
+            parameters = [*encoder_parameters, *cell_parameters]
+        elif assignment_encoder == "mlp":
             encoder_parameters, v = initialize_mlp(
                 inputs, clusters, assignment_rank, encoder_hidden, factor_seed
             )
         else:
             weight, v = initialize_encoder(inputs, clusters, assignment_rank, factor_seed)
             encoder_parameters = [weight]
-        parameters = [*encoder_parameters, v]
+        if assignment_encoder != "dual_mlp":
+            parameters = [*encoder_parameters, v]
     else:
         u, v = initialize_factors(assignment, clusters, assignment_rank, factor_seed, factor_initial_std)
         parameters = [u, v]
@@ -794,6 +807,8 @@ def optimize_ce_assignment(
             logits = prototype_logits(inputs, prototypes, prototype_temperature)
         elif assignment_input != "node":
             u = encode_nodes(inputs, encoder_parameters)
+            if assignment_encoder == "dual_mlp":
+                v = encode_nodes(anchor_inputs, cell_parameters)
         balance = dict(balance_iterations=0, row_residual=np.nan, column_residual=np.nan)
         if sparse_k is not None:
             moments = SparseMoments.apply(sparse_logits, candidate_indices, material, clusters, chunk_size)
@@ -1151,7 +1166,6 @@ def optimize_ce_assignment(
             torch.save(best_parameters[0].cpu(), folder / "best_assignment_logits.pt")
         elif assignment_input != "node":
             saved = dict(
-                v=best_parameters[-1].cpu(),
                 assignment=assignment.cpu(),
                 mixing=mixing,
                 rank=assignment_rank,
@@ -1160,6 +1174,16 @@ def optimize_ce_assignment(
                 step=best_step,
                 assignment_encoder=assignment_encoder,
             )
+            if assignment_encoder == "dual_mlp":
+                saved.update(
+                    encoder_parameters=[p.cpu() for p in best_parameters[:4]],
+                    cell_encoder_parameters=[p.cpu() for p in best_parameters[4:8]],
+                    anchor_indices=anchor_indices.cpu(), encoder_hidden=encoder_hidden,
+                    base_logits=base_logits.cpu() if base_logits is not None else None,
+                    correction_scale=correction_scale,
+                )
+            else:
+                saved["v"] = best_parameters[-1].cpu()
             if assignment_encoder == "mlp":
                 saved.update(
                     encoder_parameters=[p.cpu() for p in best_parameters[:-1]], encoder_hidden=encoder_hidden
