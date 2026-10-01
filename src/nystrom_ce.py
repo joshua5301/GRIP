@@ -9,7 +9,6 @@ import json
 import marshal
 import time
 import types
-from numbers import Real
 from pathlib import Path
 
 import numpy as np
@@ -327,6 +326,8 @@ def moment_gradient(moments, dimension, feature_map, theta, vector, penalty):
 def optimize(h, q, assignment, feature_map, phi, folder, steps, penalty=1e-4,
              lr=0.01, rank=16, seed=0, chunk=2048, stop=lambda: False,
              progress=lambda row: None, checkpoint_every=25, mixing=0.05):
+    from numbers import Real
+
     if (isinstance(mixing, bool) or not isinstance(mixing, Real)
             or not np.isfinite(mixing) or not 0 < mixing < 1):
         raise ValueError("mixing must be finite and lie strictly in (0, 1)")
