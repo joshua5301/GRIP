@@ -9,6 +9,7 @@ import json
 import marshal
 import time
 import types
+from numbers import Real
 from pathlib import Path
 
 import numpy as np
@@ -325,7 +326,11 @@ def moment_gradient(moments, dimension, feature_map, theta, vector, penalty):
 
 def optimize(h, q, assignment, feature_map, phi, folder, steps, penalty=1e-4,
              lr=0.01, rank=16, seed=0, chunk=2048, stop=lambda: False,
-             progress=lambda row: None, checkpoint_every=25):
+             progress=lambda row: None, checkpoint_every=25, mixing=0.05):
+    if (isinstance(mixing, bool) or not isinstance(mixing, Real)
+            or not np.isfinite(mixing) or not 0 < mixing < 1):
+        raise ValueError("mixing must be finite and lie strictly in (0, 1)")
+    mixing = float(mixing)
     folder = Path(folder)
     folder.mkdir(parents=True, exist_ok=True)
     if chunk < 1 or not isinstance(chunk, int):
@@ -341,6 +346,9 @@ def optimize(h, q, assignment, feature_map, phi, folder, steps, penalty=1e-4,
     )
     config = dict(steps_schema=2, penalty=penalty, lr=lr, rank=rank, seed=seed,
                   cells=int(assignment.max()) + 1, chunk=chunk)
+    # Default .05 remains implicit for compatibility with verified old resumes.
+    if mixing != 0.05:
+        config["mixing"] = mixing
     u, v = initialize_factors(assignment, config["cells"], rank, seed)
     optimizer = torch.optim.Adam([u, v], lr=lr)
     material = make_material(h.double(), q.double())
@@ -375,7 +383,7 @@ def optimize(h, q, assignment, feature_map, phi, folder, steps, penalty=1e-4,
             persist(step)
             raise InterruptedError("Condensation stopped with resumable state")
         started = time.monotonic()
-        moments = LowRankMoments.apply(u, v, assignment, material, 0.05, chunk)
+        moments = LowRankMoments.apply(u, v, assignment, material, mixing, chunk)
         centers, labels, mass = decode_moments(moments.detach(), h.shape[1])
         mapped = feature_map(centers).detach()
         inner = solve_inner_newton_first(mapped, labels, mass, penalty, initial=theta)

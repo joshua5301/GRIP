@@ -192,6 +192,8 @@ def run_pilot(
     inner_loss_weighting="mass",
     surrogate="linear",
     report_routes=False,
+    mixing=0.05,
+    teacher_gamma=0.01,
 ):
     """Return (report, root) for a bounded, resumable full-data screen.
 
@@ -199,10 +201,15 @@ def run_pilot(
     initialization may be feature, teacher_joint, or teacher_balanced; the latter
     two use the selected target Q. train_target_mix optionally blends training
     rows with their hard labels; held-out Q stays softmax(logits/temperature).
+    mixing controls the fixed hard-partition logit prior used by both surrogates;
+    it does not change k-means or teacher targets. The default preserves caches.
     inner_loss_weighting controls only the convex surrogate; final students
     always use uniform CE. Extend steps (e.g. 20 -> 50) to resume the same candidate.
     surrogate='nystrom' applies the shared teacher map after P-weighted raw-H
     means and evaluates outer CE on verified CPU phi; it requires mass inner CE.
+    teacher_gamma defaults to .01 with its exact legacy cache identity. Other
+    values have separate teacher/condensation/student folders, while original H,
+    map, phi and validation-route H reuse the legacy geometry folder unchanged.
     Teacher basis defaults to 512 for a pilot and is explicit in protocol/results;
     such a pilot is not a claim of parity with a basis-3000 research benchmark.
 
@@ -249,10 +256,27 @@ def run_pilot(
         raise ValueError("surrogate must be linear or nystrom")
     if surrogate == "nystrom" and inner_loss_weighting != "mass":
         raise ValueError("The Nyström surrogate supports mass inner CE only")
+    if (
+        isinstance(mixing, bool)
+        or not isinstance(mixing, Real)
+        or not math.isfinite(mixing)
+        or not 0 < mixing < 1
+    ):
+        raise ValueError("mixing must be finite and lie strictly in (0, 1)")
+    mixing = float(mixing)
     if not isinstance(report_routes, bool):
         raise ValueError("report_routes must be boolean")
+    if (
+        isinstance(teacher_gamma, bool)
+        or not isinstance(teacher_gamma, Real)
+        or not math.isfinite(teacher_gamma)
+        or teacher_gamma <= 0
+    ):
+        raise ValueError("teacher_gamma must be positive and finite")
+    teacher_gamma = float(teacher_gamma)
     started, deadline = time.monotonic(), time.monotonic() + deadline_seconds
-    teacher_protocol = dict(
+    # The legacy gamma=.01 identity anchors shared, gamma-independent geometry.
+    geometry_protocol = dict(
         version=2,
         dataset=dataset,
         data_dir=str(Path(data_dir).resolve()),
@@ -264,7 +288,12 @@ def run_pilot(
         chunk=chunk,
         torch_version=str(torch.__version__),
     )
-    teacher_root = Path(output_dir) / dataset / f"teacher_{_fingerprint(teacher_protocol)}"
+    geometry_root = Path(output_dir) / dataset / f"teacher_{_fingerprint(geometry_protocol)}"
+    teacher_protocol = dict(geometry_protocol, gamma=teacher_gamma)
+    teacher_root = (
+        geometry_root if teacher_gamma == 0.01
+        else geometry_root / f"gamma_{_fingerprint(teacher_protocol)}"
+    )
     candidate = dict(
         version=1,
         ratio=ratio,
@@ -286,6 +315,8 @@ def run_pilot(
         candidate["train_target_mix"] = train_target_mix
     if surrogate != "linear":
         candidate["surrogate"] = surrogate
+    if mixing != 0.05:
+        candidate["mixing"] = mixing
     root = teacher_root / f"candidate_{_fingerprint(candidate)}"
     root.mkdir(parents=True, exist_ok=True)
     settings = dict(
@@ -306,6 +337,9 @@ def run_pilot(
         candidate=candidate,
         student_recipe=settings,
     )
+    if teacher_gamma != 0.01:
+        report["teacher_gamma"] = teacher_gamma
+        report["geometry_cache_root"] = str(geometry_root.resolve())
     if report_routes:
         report["serving_comparison"] = dict(
             selection="same weights at GCN validation-selected epoch",
@@ -362,7 +396,7 @@ def run_pilot(
             source_digest = _data_digest(graph, train, validation, None, guard)
             h = get_shared_h(
                 h,
-                teacher_root / "propagated_H.pt",
+                geometry_root / "propagated_H.pt",
                 _fingerprint(
                     dict(
                         data=source_digest,
@@ -381,7 +415,7 @@ def run_pilot(
             save_json(protocol, protocol_path)
             save_json(dict(candidate=candidate, data_digest=digest), root / "protocol.json")
             h = h.double()
-            map_path = teacher_root / "feature_map.pt"
+            map_path = geometry_root / "feature_map.pt"
             stage("preparing_teacher_map")
             if map_path.exists():
                 feature_map = NystromMap(**torch.load(map_path, map_location=device, weights_only=False))
@@ -389,13 +423,16 @@ def run_pilot(
                 feature_map = NystromMap.fit(h, basis=basis, seed=teacher_seed)
                 save_state(vars(feature_map), map_path)
             stage("caching_teacher_features")
-            phi = cache_features(h, feature_map, teacher_root / "phi.npy", chunk=chunk, stop=stopped)
+            phi = cache_features(h, feature_map, geometry_root / "phi.npy", chunk=chunk, stop=stopped)
             bounded_phi = _BoundedFeatures(phi, guard)
             teacher_path = teacher_root / "teacher.pt"
             stage("fitting_teacher")
             if teacher_path.exists():
                 saved = torch.load(teacher_path, map_location=device, weights_only=False)
-                if saved["data_digest"] != digest or not saved["converged"]:
+                if (
+                    saved["data_digest"] != digest or not saved["converged"]
+                    or saved.get("gamma") != teacher_gamma
+                ):
                     raise ValueError("Teacher cache does not match the converged training-only fit")
                 logits, weight = saved["logits"], saved["weight"]
             else:
@@ -405,7 +442,7 @@ def run_pilot(
                     bounded_phi,
                     train_labels,
                     train,
-                    gamma=0.01,
+                    gamma=teacher_gamma,
                     chunk=chunk,
                     max_iter=teacher_max_iter,
                     stop=stopped,
@@ -413,7 +450,7 @@ def run_pilot(
                 )
                 guard()
                 save_state(
-                    dict(logits=logits, weight=weight, gamma=0.01, data_digest=digest, converged=True),
+                    dict(logits=logits, weight=weight, gamma=teacher_gamma, data_digest=digest, converged=True),
                     teacher_path,
                 )
             stage("teacher_validation")
@@ -469,6 +506,7 @@ def run_pilot(
                         chunk=chunk,
                         stop=stopped,
                         checkpoint_every=5,
+                        mixing=mixing,
                     )
                 else:
                     optimize_ce_assignment(
@@ -479,6 +517,7 @@ def run_pilot(
                         steps=steps,
                         lr=lr,
                         assignment_rank=rank,
+                        mixing=mixing,
                         factor_seed=condensation_seed,
                         chunk_size=chunk,
                         inner_method="newton_first",
@@ -510,7 +549,7 @@ def run_pilot(
             if report_routes:
                 stage("preparing_validation_serving_inputs")
                 route_graph, route_h, route_masks = _validation_route_inputs(
-                    validation, source_digest, teacher_root, guard
+                    validation, source_digest, geometry_root, guard
                 )
             for seed in student_seeds:
                 stage("validation_student", student_seed=seed)
