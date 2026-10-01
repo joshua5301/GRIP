@@ -51,6 +51,7 @@ def recipe():
                 logit_replay=dict(atol=LOGIT_ATOL, rtol=LOGIT_RTOL),
                 val_ce_replay=dict(atol=CE_ATOL, rtol=CE_RTOL),
                 source_rms_replay=dict(atol=RMS_ATOL, rtol=RMS_RTOL),
+                derived_probability_digest_device="cpu",
                 history_selection="first_strict_maximum_validation_accuracy_no_CE_tie")
 
 
@@ -294,10 +295,11 @@ def _raw_validate(state, graph, train, validation, ctx, stop=lambda: False):
             or not math.isclose(ce, best["val_ce"], abs_tol=CE_ATOL, rel_tol=CE_RTOL)):
         raise ValueError("GCN selected own-graph validation replay differs")
     _stop(stop)
+    canonical_logits = logits.detach().cpu().double()
     return dict(state_digest=_digest(state["selected_state"]), logits_digest=_digest(logits),
                 history_digest=_digest(state["history"]), selected_validation=best,
-                double_logits_digest=_digest(logits.double()),
-                q_digest=_digest((logits.double() / ctx["temperature"]).softmax(1)))
+                double_logits_digest=_digest(canonical_logits),
+                q_digest=_digest((canonical_logits / ctx["temperature"]).softmax(1)))
 
 
 def _resume_validate(state, graph, train, validation, ctx):
