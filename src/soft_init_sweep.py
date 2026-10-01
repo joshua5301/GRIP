@@ -58,6 +58,11 @@ def random_cost_base(nodes, cells, seed, temperature, device, dtype):
     return -cost / cost.square().mean().sqrt().clamp_min(1e-12) / temperature
 
 
+def extended_candidate_grid(space, old_penalties):
+    old = grid_rows({**space, "penalty": old_penalties})
+    return old + [candidate for candidate in grid_rows(space) if candidate not in old]
+
+
 def run_soft_init_sweep(
     output_dir, gammas, temperatures, taus, penalties, ratio=0.013, rank=8,
     steps=1000, checkpoint_steps=(0, 25, 100, 300, 500, 750, 1000),
@@ -151,10 +156,16 @@ def run_soft_init_sweep(
     ))
     root = Path(output_dir) / _fingerprint(config)
     root.mkdir(parents=True, exist_ok=True)
+    old_penalties = None
     if resume_from is not None:
         previous = Path(resume_from)
         old = json.loads((previous / "config.json").read_text(encoding="utf-8"))
         ignored = {"steps", "checkpoint_steps", "checkpoints"}
+        if old["penalties"] != list(penalties):
+            old_penalties = old["penalties"]
+            if list(penalties[:len(old_penalties)]) != old_penalties or len(penalties) <= len(old_penalties):
+                raise ValueError("Append new penalty values after the original grid")
+            ignored.add("penalties")
         changed = {
             key: (old.get(key), config.get(key))
             for key in old.keys() | config.keys()
@@ -168,7 +179,7 @@ def run_soft_init_sweep(
             raise ValueError("Cannot add unsaved checkpoints before the previous endpoint")
         candidates = previous / "finetune"
         folders = list(candidates.glob("candidate_*/condensation_*"))
-        expected = (len(penalties) * len(finetune_temperatures or taus) * len(condensation_seeds)
+        expected = (len(old["penalties"]) * len(finetune_temperatures or taus) * len(condensation_seeds)
                     * len(assignment_widths or [None]))
         if len(folders) != expected or any(not (p / "resume.pt").exists() for p in folders):
             raise ValueError("Continuation requires every candidate's saved optimizer state")
@@ -266,7 +277,21 @@ def run_soft_init_sweep(
     fine_space = dict(t=list(finetune_temperatures or [chosen["tau"]]), penalty=list(penalties))
     if assignment_widths is not None:
         fine_space["width"] = list(assignment_widths)
-    fine_grid = grid_rows(fine_space)
+    candidate_grid_path = root / "candidate_grid.json"
+    if candidate_grid_path.exists():
+        fine_grid = json.loads(candidate_grid_path.read_text(encoding="utf-8"))
+        if old_penalties is not None:
+            fine_grid += [candidate for candidate in grid_rows(fine_space) if candidate not in fine_grid]
+            save_json(fine_grid, candidate_grid_path)
+    elif old_penalties is not None:
+        fine_grid = extended_candidate_grid(fine_space, old_penalties)
+        save_json(fine_grid, candidate_grid_path)
+    else:
+        fine_grid = grid_rows(fine_space)
+    if len(fine_grid) != len(grid_rows(fine_space)) or any(
+        candidate not in fine_grid for candidate in grid_rows(fine_space)
+    ):
+        raise ValueError("Saved candidate order does not match the requested grid")
     records = []
     for index, params in enumerate(tqdm(fine_grid, desc="Low-rank fine-tuning")):
         t, penalty = params["t"], params["penalty"]

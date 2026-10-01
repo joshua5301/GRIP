@@ -218,3 +218,7 @@ separate validation graph. Final test evaluation uses the separate test graph
 only after selection. The no-fixed-cost low-rank option remains
 `initialization="none"`. Keep the same configuration and output directory to
 resume candidates and cached evaluations.
+To extend a completed run, pass its fingerprinted directory as `resume_from`,
+increase `steps`, retain old checkpoints, and append new penalty values after
+the old penalty list. Existing candidate indices and optimizer states are
+preserved; appended penalty candidates start fresh.

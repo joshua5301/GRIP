@@ -11,7 +11,7 @@ from src.low_rank_assignment import (
     saved_encoder_nodes,
 )
 from src.soft_ce_partition import optimize_ce_assignment
-from src.soft_init_sweep import distance_base, random_cost_base
+from src.soft_init_sweep import distance_base, extended_candidate_grid, random_cost_base
 
 
 def problem():
@@ -19,6 +19,15 @@ def problem():
     z = torch.randn(12, 3, dtype=torch.double, generator=generator)
     q = torch.randn(12, 2, dtype=torch.double, generator=generator).softmax(1)
     return z, q, torch.arange(12) % 3
+
+
+def test_penalty_expansion_preserves_candidate_indices():
+    space = dict(t=[0.3, 1.0], penalty=[3e-5, 3e-4, 3e-6, 1e-5])
+    candidates = extended_candidate_grid(space, [3e-5, 3e-4])
+    assert [(row["t"], row["penalty"]) for row in candidates] == [
+        (0.3, 3e-5), (0.3, 3e-4), (1.0, 3e-5), (1.0, 3e-4),
+        (0.3, 3e-6), (0.3, 1e-5), (1.0, 3e-6), (1.0, 1e-5),
+    ]
 
 
 def test_random_cost_initialization():
