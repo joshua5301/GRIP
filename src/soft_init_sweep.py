@@ -55,6 +55,7 @@ def run_soft_init_sweep(
     finetune_temperatures=None,
     initialization="kmeans",
     resume_from=None,
+    shared_features_path=None,
 ):
     if initialization not in ("kmeans", "random"):
         raise ValueError("Unknown initialization")
@@ -82,10 +83,26 @@ def run_soft_init_sweep(
         config.pop("finetune_temperatures")
     if initialization == "kmeans":
         config.pop("initialization")
+    if shared_features_path is None:
+        config.pop("shared_features_path")
     normalized = finetune_temperatures is not None
     torch.backends.cuda.matmul.allow_tf32 = False
     torch.backends.cudnn.allow_tf32 = False
     graph, train, validation, testing, h = _prepare_dataset("cora", data_dir, device)
+    if shared_features_path is not None:
+        shared = Path(shared_features_path)
+        raw_digest = array_digest(
+            graph["x"].cpu().numpy(), graph["y"].cpu().numpy(), train.cpu().numpy(),
+            validation[1].cpu().numpy(), testing[1].cpu().numpy(),
+        )
+        if shared.exists():
+            cached = torch.load(shared, map_location="cpu", weights_only=False)
+            if cached["raw_digest"] != raw_digest:
+                raise ValueError("Shared features belong to different graph data")
+            h = cached["h"].to(device)
+        else:
+            shared.parent.mkdir(parents=True, exist_ok=True)
+            save_state(dict(h=h, raw_digest=raw_digest), shared)
     config.update(version=1, data_digest=array_digest(
         h.cpu().numpy(), graph["y"].cpu().numpy(), train.cpu().numpy(),
         validation[1].cpu().numpy(), testing[1].cpu().numpy(),

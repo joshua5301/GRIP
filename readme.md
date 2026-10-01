@@ -185,3 +185,9 @@ Only the step budget and future checkpoints may change. The runner copies the
 original run into the new configuration directory, preserving the original files,
 and resumes every candidate's parameters, Adam state and solver warm starts.
 Retain all old checkpoints. Selection considers both old and new checkpoints.
+
+For a fresh comparison across methods, pass the same `shared_features_path` to
+each run. The first run saves S²X and a digest of the original graph features,
+labels and masks; later runs reuse exactly those propagated features after
+checking the raw graph digest. This avoids separate sparse propagation results
+changing the experiment input between methods.
