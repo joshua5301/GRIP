@@ -187,7 +187,12 @@ def _check_nystrom_assignment(candidate, saved, resume=False, *, root=None,
             raise ValueError("Cached NTK endpoint requires a verifiable resume state")
         if h is None or q is None or assignment is None:
             h, q, assignment = _cached_ntk_inputs(root, candidate, condensation_seed, device)
-        validate_cached(saved, candidate, h, q, assignment, root, condensation_seed, resume=resume)
+        validation_saved = saved
+        if not resume and torch.is_tensor(saved.get("moments")):
+            # Cached snapshots may be loaded on CPU while the frozen map is on CUDA.
+            # Validate a device-aligned view without changing the saved payload.
+            validation_saved = {**saved, "moments": saved["moments"].to(h.device)}
+        validate_cached(validation_saved, candidate, h, q, assignment, root, condensation_seed, resume=resume)
 
 
 
