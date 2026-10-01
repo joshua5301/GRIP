@@ -64,6 +64,69 @@ def _candidate_background_mixing(candidate):
     return candidate, mixing
 
 
+def _candidate_temperature(candidate):
+    """Keep fixed-temperature identities unchanged and validate the new mode."""
+    candidate = dict(candidate)
+    for key in ("T", "lr"):
+        if key in candidate:
+            value = candidate[key]
+            if (isinstance(value, bool) or not isinstance(value, Real)
+                    or not math.isfinite(value) or value <= 0):
+                raise ValueError(f"{key} must be a positive finite number")
+    enabled = candidate.get("learn_temperature", False)
+    if not pd.api.types.is_bool(enabled):
+        raise ValueError("learn_temperature must be a boolean")
+    enabled = bool(enabled)
+    learning_rate = candidate.get("temperature_lr", 0.003)
+    if (isinstance(learning_rate, bool) or not isinstance(learning_rate, Real)
+            or not math.isfinite(learning_rate) or learning_rate <= 0):
+        raise ValueError("temperature_lr must be a positive finite number")
+    if not enabled:
+        if learning_rate != 0.003:
+            raise ValueError("temperature_lr requires learn_temperature=True")
+        candidate.pop("learn_temperature", None)
+        candidate.pop("temperature_lr", None)
+        return candidate
+    if "T" not in candidate:
+        raise ValueError("Learnable temperature requires an initial T")
+    if (candidate.get("method", "low_rank") != "low_rank"
+            or candidate.get("mass_mode", "free") != "free"
+            or candidate.get("node_weighting", False) is not False
+            or candidate.get("solver_mode", "exact") != "exact"
+            or candidate.get("assignment_input", "node") != "node"
+            or candidate.get("assignment_encoder", "linear") != "linear"
+            or candidate.get("feature_control", "joint") != "joint"):
+        raise ValueError("Learnable temperature requires exact, unweighted, free-mass low_rank assignments")
+    target_mix = candidate.get("train_target_mix", 0.0)
+    if (isinstance(target_mix, bool) or not isinstance(target_mix, Real)
+            or not math.isfinite(target_mix) or target_mix != 0):
+        raise ValueError("Learnable temperature requires train_target_mix=0")
+    candidate["learn_temperature"] = True
+    candidate["temperature_lr"] = float(learning_rate)
+    return candidate
+
+
+def _temperature_diagnostics(snapshot, state, step):
+    temperature, value = snapshot.get("temperature"), snapshot.get("teacher_ce")
+    if (snapshot.get("J_exact") is not True
+            or isinstance(temperature, bool) or not isinstance(temperature, Real)
+            or not math.isfinite(temperature) or temperature <= 0
+            or isinstance(value, bool) or not isinstance(value, Real) or not math.isfinite(value)):
+        raise ValueError("Invalid learnable-temperature checkpoint diagnostics")
+    gradients = []
+    for row in state.get("history", []):
+        if row["step"] <= step and "log_temperature_gradient" in row:
+            gradient = row["log_temperature_gradient"]
+            if (isinstance(gradient, bool) or not isinstance(gradient, Real)
+                    or not math.isfinite(gradient)):
+                raise ValueError("Nonfinite temperature gradient in checkpoint history")
+            gradients.append(row)
+    latest = max(gradients, key=lambda row: row["step"]) if gradients else None
+    return dict(learned_temperature=float(temperature), surrogate_ce=float(value), surrogate_J_exact=True,
+                log_temperature_gradient=None if latest is None else float(latest["log_temperature_gradient"]),
+                temperature_gradient_step=None if latest is None else int(latest["step"]))
+
+
 def _student_settings(dropout, epochs, overrides):
     settings = dict(epochs=epochs, eval_every=10, hidden=256, dropout=dropout,
                     lr=0.01, weight_decay=0.0005)
@@ -89,7 +152,8 @@ def run_screen(dataset, ratio, output_dir, candidates, steps=50,
         raise ValueError("Use a configured Cora/Citeseer budget")
     # Check every requested prior before loading a dataset or fitting a teacher.
     # Explicit .05 removes the field so legacy identities/protocols are retained.
-    candidates = [_candidate_background_mixing(candidate)[0] for candidate in candidates]
+    candidates = [_candidate_temperature(_candidate_background_mixing(candidate)[0])
+                  for candidate in candidates]
     if not isinstance(report_routes, bool):
         raise ValueError("report_routes must be a boolean")
     settings = _student_settings(dropout, epochs, student_settings)
@@ -203,6 +267,11 @@ def run_screen(dataset, ratio, output_dir, candidates, steps=50,
             else:
                 if identity["method"] not in ("low_rank", "mlp"):
                     raise ValueError("Unknown assignment method")
+                temperature_options = {}
+                if identity.get("learn_temperature", False):
+                    temperature_options = dict(temperature_logits=logits.double(),
+                        temperature_initial=identity["T"], temperature_lr=identity["temperature_lr"],
+                        outer_targets=q.detach())
                 optimize_ce_assignment(z, q, assignment, penalty=identity["penalty"], steps=steps,
                     mixing=mixing,
                     lr=identity["lr"], assignment_rank=identity["rank"], factor_seed=condensation_seed,
@@ -214,7 +283,11 @@ def run_screen(dataset, ratio, output_dir, candidates, steps=50,
                     inner_loss_weighting=identity.get("inner_loss_weighting", "mass"), inner_max_iter=2000, inner_tol=1e-7,
                     cg_max_iter=512, cg_rtol=1e-6, cache_assignment=False,
                     folder=folder, checkpoint_steps=checks, resume_state=state,
-                    save_resume=True, save_assignment=False, stop=stop)
+                    save_resume=True, save_assignment=False, stop=stop, **temperature_options)
+        if identity.get("learn_temperature", False):
+            if not resume.exists():
+                raise ValueError("Learnable-temperature resume state is missing")
+            state = torch.load(resume, map_location="cpu", weights_only=False)
         for step in checks:
             snapshot_path = folder / "checkpoints" / f"step_{step:06d}.pt"
             if identity["method"] == "nystrom":
@@ -222,6 +295,8 @@ def run_screen(dataset, ratio, output_dir, candidates, steps=50,
             if not snapshot_path.exists():
                 continue
             snapshot = torch.load(snapshot_path, map_location=device, weights_only=False)
+            temperature_diagnostic = (_temperature_diagnostics(snapshot, state, step)
+                                      if identity.get("learn_temperature", False) else {})
             if identity["method"] == "coarsening":
                 from src.coarsening_ce import gcn_inputs
                 x, y, mass, training_adj = gcn_inputs(snapshot, device)
@@ -254,7 +329,8 @@ def run_screen(dataset, ratio, output_dir, candidates, steps=50,
                     result = dict(result, **{key: value for key, value in routes.items()
                                             if key.startswith(("gcn_", "mlp_"))})
                 records.append(dict(**identity, condensation_seed=condensation_seed, step=step,
-                                    **result, dropout=dropout, input_scale=input_scale, epochs=epochs,
+                                    **result, **temperature_diagnostic,
+                                    dropout=dropout, input_scale=input_scale, epochs=epochs,
                                     student_recipe=recipe_key,
                                     candidate_path=str(folder.parent.resolve())))
         print("CANDIDATE_DONE", dataset, identity, "seconds", round(time.monotonic() - started, 2), flush=True)
@@ -263,16 +339,26 @@ def run_screen(dataset, ratio, output_dir, candidates, steps=50,
     if "mixing" in frame.columns:
         # A selected default row must carry .05, not an ambiguous NaN value.
         frame["mixing"] = frame["mixing"].fillna(config["mixing"])
+    if "learn_temperature" in frame.columns:
+        frame["learn_temperature"] = frame["learn_temperature"].eq(True)
+        frame["temperature_lr"] = frame["temperature_lr"].fillna(0.003)
     keys = ["method", "width", "lr", "T", "rank", "penalty", "step", "candidate_path"]
     keys += [key for key in ("initialization", "alpha", "inner_loss_weighting", "mass_mode", "mass_scaling",
-                            "metric_input", "metric_alpha", "strength", "train_target_mix", "mixing") if key in frame.columns]
+                            "metric_input", "metric_alpha", "strength", "train_target_mix", "mixing",
+                            "learn_temperature", "temperature_lr") if key in frame.columns]
     keys += ["dropout", "input_scale", "epochs", "student_recipe"]
     grouped = frame.groupby(keys, dropna=False)
-    if report_routes:
+    if report_routes or "learn_temperature" in frame.columns:
         aggregates = dict(mean=("val_acc", "mean"), std=("val_acc", "std"), count=("val_acc", "count"))
-        aggregates.update({f"{metric}_{stat}": (metric, stat)
-                           for metric in ("gcn_val_acc", "mlp_val_acc", "gcn_val_ce", "mlp_val_ce")
-                           for stat in ("mean", "std")})
+        if report_routes:
+            aggregates.update({f"{metric}_{stat}": (metric, stat)
+                               for metric in ("gcn_val_acc", "mlp_val_acc", "gcn_val_ce", "mlp_val_ce")
+                               for stat in ("mean", "std")})
+        if "learn_temperature" in frame.columns:
+            aggregates.update({f"{metric}_{stat}": (metric, stat)
+                               for metric in ("learned_temperature", "log_temperature_gradient", "surrogate_ce")
+                               for stat in ("mean", "std")})
+            aggregates["surrogate_J_exact"] = ("surrogate_J_exact", "min")
         summary = grouped.agg(**aggregates).reset_index()
     else:
         summary = grouped.val_acc.agg(["mean", "std", "count"]).reset_index()
@@ -289,8 +375,6 @@ def selected_test(root, choice, condensation_seeds=(0, 1, 2), student_seeds=(100
     root = Path(root)
     candidate = {key: choice[key] for key in ("method", "width", "lr", "T", "rank", "penalty")}
     candidate["rank"], candidate["width"] = int(candidate["rank"]), int(candidate["width"])
-    for key in ("lr", "T", "penalty"):
-        candidate[key] = float(candidate[key])
     if candidate["method"] == "nystrom":
         candidate["nystrom_schema"] = 3
     candidate.update({key: choice[key] for key in ("initialization", "alpha", "inner_loss_weighting", "mass_mode", "mass_scaling",
@@ -298,7 +382,13 @@ def selected_test(root, choice, condensation_seeds=(0, 1, 2), student_seeds=(100
                       and pd.notna(choice[key])})
     if "mixing" in choice:
         candidate["mixing"] = choice["mixing"]
+    for key in ("learn_temperature", "temperature_lr"):
+        if key in choice:
+            candidate[key] = choice[key]
     candidate, _ = _candidate_background_mixing(candidate)
+    candidate = _candidate_temperature(candidate)
+    for key in ("lr", "T", "penalty"):
+        candidate[key] = float(candidate[key])
     _assignment_mass_mode(candidate)
     config = json.loads((root / "config.json").read_text())
     step = int(choice["step"])
