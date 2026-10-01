@@ -96,9 +96,13 @@ def run_soft_init_sweep(
         previous = Path(resume_from)
         old = json.loads((previous / "config.json").read_text(encoding="utf-8"))
         ignored = {"steps", "checkpoint_steps", "checkpoints"}
-        canonical = lambda c: json.dumps({k: v for k, v in c.items() if k not in ignored}, sort_keys=True)
-        if canonical(old) != canonical(config) or steps <= old["steps"]:
-            raise ValueError("Continuation must only increase the step budget and add checkpoints")
+        changed = {
+            key: (old.get(key), config.get(key))
+            for key in old.keys() | config.keys()
+            if key not in ignored and old.get(key) != config.get(key)
+        }
+        if changed or steps <= old["steps"]:
+            raise ValueError(f"Continuation settings differ: {changed}; steps {old['steps']} -> {steps}")
         if not set(old["checkpoints"]).issubset(checkpoints):
             raise ValueError("Keep the original checkpoints when extending a run")
         if any(s < old["steps"] and s not in old["checkpoints"] for s in checkpoints):
