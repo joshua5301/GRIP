@@ -148,3 +148,22 @@ Temperature tau is in normalized squared-distance units, not teacher temperature
 units. A larger initial grid costs GCN training but no bilevel optimization.
 Use an unchanged output directory/configuration to resume. Numerical checks live
 in `tests/test_soft_init_sweep.py` and must run in Colab, not locally.
+
+`src.soft_init_sweep.run_distance_cost_sweep` uses row-centered squared distances
+divided by their global RMS: Dn=(D-row_mean(D))/RMS(D-row_mean(D)). Assignments are
+P=softmax(-(Dn+UVᵀ/sqrt(rank))/t). Centers and distance normalization stay fixed.
+U starts at zero and V at unit Gaussian scale, preserving the initial assignment
+exactly. This measures the learned cost in distance units and places both costs
+under the same temperature; the correction need not remain a metric.
+Gamma and teacher T are selected by initial condensed GCN validation at reference
+t=1. They are then fixed while assignment t, inner penalty and checkpoint are
+selected by validation. Rank defaults to 8. Inner CE is mass weighted; evaluation
+uses fresh two-layer GCNs with uniform CE. Three condensation seeds and disjoint
+search/final student seeds are used. Test is evaluated only after selection.
+The summary separates selection_initial (reference t=1), initial (selected t,
+before learning), and selected (selected t, after learning). Compare the last two
+to isolate optimization gains. The returned initial grid calls reference t `tau`
+for compatibility; the fine-tuning grid and summary call it `t`. This sequential
+selection does not jointly optimize gamma, T and t. Reusing the same configuration
+resumes optimization and cached student evaluations. The old unnormalized sweep
+retains its original formula and cache identity.
