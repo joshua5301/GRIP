@@ -520,6 +520,7 @@ def optimize_ce_assignment(
     inner_loss_weighting="mass",
     prototype_temperature=0.1,
     sparse_k=None,
+    base_logits=None,
 ):
     if feature_control != "joint" or initial_representatives is not None:
         raise ValueError("Only clustering-derived features and labels are supported")
@@ -553,8 +554,17 @@ def optimize_ce_assignment(
             "inner_solver",
             "temperature_logits",
             "outer_targets",
+            "base_logits",
         )
     }
+    if base_logits is not None:
+        if (assignment_rank is None or assignment_input != "node" or mass_mode != "free"
+                or node_weighting or temperature_logits is not None or sparse_k is not None):
+            raise ValueError("Fixed base logits require free-mass node-factor optimization")
+        if base_logits.shape != (len(z), int(assignment.max()) + 1) or not bool(torch.isfinite(base_logits).all()):
+            raise ValueError("Invalid base logits")
+        base_logits = base_logits.detach().to(z)
+        resume_config["base_logits_digest"] = array_digest(base_logits.cpu().numpy())
     if sparse_k is None:
         resume_config.pop("sparse_k")
     elif (assignment_rank is not None or assignment_input != "node" or assignment_encoder != "linear"
@@ -806,7 +816,9 @@ def optimize_ce_assignment(
             )
         elif assignment_rank is not None:
             operation = CachedLowRankMoments if cache_assignment else LowRankMoments
-            moments = operation.apply(u, v, assignment, material, mixing, chunk_size)
+            moments = operation.apply(
+                u, v, assignment if base_logits is None else base_logits, material, mixing, chunk_size
+            )
         else:
             moments = AssignmentMoments.apply(logits, material, chunk_size)
         if not bool(torch.isfinite(moments).all()) or bool((moments[:, 0] <= 0).any()):
@@ -1109,6 +1121,8 @@ def optimize_ce_assignment(
         result["prototype_temperature"] = prototype_temperature
     if sparse_k is not None:
         result["sparse_k"] = sparse_k
+    if base_logits is not None:
+        result["initialization"] = "fixed_base_logits"
     if folder is not None and save_assignment:
         if sparse_k is not None:
             torch.save(
@@ -1152,6 +1166,8 @@ def optimize_ce_assignment(
             )
             if node_weighting:
                 saved["node_weight_logits"] = best_parameters[2].cpu()
+            if base_logits is not None:
+                saved["base_logits"] = base_logits.cpu()
             if temperature_logits is not None:
                 saved["temperature"] = float(best_parameters[-1].exp())
             torch.save(saved, folder / "best_assignment_factors.pt")

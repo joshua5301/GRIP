@@ -1,0 +1,173 @@
+from pathlib import Path
+
+import numpy as np
+import pandas as pd
+import torch
+from tqdm.auto import tqdm
+
+from src.data import BUDGET, _prepare_dataset
+from src.evaluation import fit_gcn_diagnostic
+from src.initialization import cell_means, feature_kmeans
+from src.io import _fingerprint, array_digest, save_json, save_state, write_table
+from src.low_rank_assignment import LowRankMoments, initialize_factors
+from src.moments import make_material
+from src.multiseed_sweep import aggregate_search
+from src.soft_ce_partition import optimize_ce_assignment
+from src.sweep_utils import grid_rows, representative
+from src.teacher import teacher_logits
+from src.transforms import FeatureTransform, fit_transform
+
+
+def distance_base(z, assignment, tau):
+    if not np.isfinite(tau) or tau <= 0:
+        raise ValueError("Positive finite assignment temperature required")
+    centers = cell_means(z, assignment, int(assignment.max()) + 1)
+    distance = (z.square().sum(1, keepdim=True) + centers.square().sum(1) - 2 * z @ centers.T).clamp_min(0)
+    return -(distance - distance.min(1, keepdim=True).values) / tau
+
+
+def run_soft_init_sweep(
+    output_dir, gammas, temperatures, taus, penalties, ratio=0.013, rank=8,
+    steps=1000, checkpoint_steps=(0, 25, 100, 300, 500, 750, 1000),
+    condensation_seeds=(0, 1, 2), search_seeds=(0, 1, 2), final_seeds=tuple(range(100, 110)),
+    assignment_lr=0.01, basis=3000, teacher_seed=0, epochs=1000, eval_every=10,
+    hidden=256, dropout=0.9, student_lr=0.01, weight_decay=0.0005,
+    data_dir="/content/data/", device="cuda",
+):
+    values = [*gammas, *temperatures, *taus, *penalties]
+    if any(not v for v in (gammas, temperatures, taus, penalties)) or any(
+        not np.isfinite(v) or v <= 0 for v in values
+    ):
+        raise ValueError("All grids must be nonempty with positive finite values")
+    cells = BUDGET[("cora", ratio)]
+    if not isinstance(rank, int) or not 1 <= rank <= cells or steps < 1:
+        raise ValueError("Invalid rank or optimization budget")
+    if (len(condensation_seeds) < 2 or not search_seeds or not final_seeds
+            or set(search_seeds) & set(final_seeds)
+            or any(len(set(s)) != len(s) for s in (condensation_seeds, search_seeds, final_seeds))):
+        raise ValueError("Use distinct condensation seeds and disjoint search/final student seeds")
+    checkpoints = sorted({0, steps, *checkpoint_steps})
+    if any(not isinstance(s, int) or not 0 <= s <= steps for s in checkpoints):
+        raise ValueError("Checkpoint outside optimization budget")
+    config = {k: v for k, v in locals().copy().items() if k not in ("output_dir", "device", "values")}
+    torch.backends.cuda.matmul.allow_tf32 = False
+    torch.backends.cudnn.allow_tf32 = False
+    graph, train, validation, testing, h = _prepare_dataset("cora", data_dir, device)
+    config.update(version=1, data_digest=array_digest(
+        h.cpu().numpy(), graph["y"].cpu().numpy(), train.cpu().numpy(),
+        validation[1].cpu().numpy(), testing[1].cpu().numpy(),
+    ))
+    root = Path(output_dir) / _fingerprint(config)
+    root.mkdir(parents=True, exist_ok=True)
+    save_json(config, root / "config.json")
+    teachers = teacher_logits(
+        h, graph, train, validation, "relu", list(gammas), basis, teacher_seed, root, return_all=True
+    )
+    if (root / "inputs.pt").exists():
+        saved = torch.load(root / "inputs.pt", map_location=device, weights_only=False)
+        z, assignments = saved["z"], saved["assignments"]
+        transform = FeatureTransform(**saved["transform"])
+    else:
+        z, transform = fit_transform(h.double(), kind="rms")
+        assignments = {s: feature_kmeans(h.cpu(), cells, s).to(device) for s in condensation_seeds}
+        save_state(dict(z=z, assignments=assignments, transform=vars(transform)), root / "inputs.pt")
+    settings = dict(epochs=epochs, eval_every=eval_every, hidden=hidden, dropout=dropout,
+                    lr=student_lr, weight_decay=weight_decay)
+    masks = dict(train=train, val=validation[1], test=testing[1])
+
+    def evaluate(moments, q, folder, final=False):
+        x, y, mass = representative(moments, transform, z.shape[1], device)
+        return [fit_gcn_diagnostic(
+            x, y, torch.full_like(mass, 1 / cells), graph, q,
+            masks if final else {k: masks[k] for k in ("train", "val")},
+            seed, folder=folder, **settings,
+        ) for seed in (final_seeds if final else search_seeds)]
+
+    def initial_state(seed, tau, q):
+        base = distance_base(z, assignments[seed], tau)
+        u, v = initialize_factors(assignments[seed], cells, rank, seed)
+        with torch.no_grad():
+            moments = LowRankMoments.apply(u, v, base, make_material(z, q), 0.05, 8192)
+        return base, moments
+
+    grid = grid_rows(dict(gamma=list(gammas), T=list(temperatures), tau=list(taus)))
+    records = []
+    for index, params in enumerate(tqdm(grid, desc="Soft initialization validation")):
+        q = (teachers[params["gamma"]].to(device) / params["T"]).softmax(1).double()
+        for seed in condensation_seeds:
+            base, moments = initial_state(seed, params["tau"], q)
+            folder = root / "initial_grid" / f"candidate_{index:04d}" / f"condensation_{seed}"
+            folder.mkdir(parents=True, exist_ok=True)
+            probability = base.softmax(1)
+            save_json(dict(
+                entropy=float(-(probability * probability.clamp_min(1e-300).log()).sum(1).mean()),
+                agreement=float((probability.argmax(1) == assignments[seed]).double().mean()),
+                min_mass=float(moments[:, 0].min()),
+            ), folder / "assignment.json")
+            records.extend(dict(candidate=index, **params, step=0, condensation_seed=seed, **row)
+                           for row in evaluate(moments, q, folder / "search"))
+        write_table(pd.DataFrame(records), root / "initial_students.csv")
+        initial_grid = aggregate_search(records, condensation_seeds, search_seeds, ("gamma", "T", "tau"))
+        write_table(initial_grid, root / "initial_grid.csv")
+    chosen = initial_grid.sort_values(["val", "candidate"], ascending=[False, True]).iloc[0].to_dict()
+    save_json(chosen, root / "selected_initialization.json")
+    q = (teachers[chosen["gamma"]].to(device) / chosen["T"]).softmax(1).double()
+    bases, initials = {}, {}
+    for seed in condensation_seeds:
+        bases[seed], initials[seed] = initial_state(seed, chosen["tau"], q)
+    records = []
+    for index, penalty in enumerate(tqdm(penalties, desc="Low-rank fine-tuning")):
+        for seed in condensation_seeds:
+            folder = root / "finetune" / f"candidate_{index:04d}" / f"condensation_{seed}"
+            folder.mkdir(parents=True, exist_ok=True)
+            if not (folder / "complete.json").exists():
+                resume = folder / "resume.pt"
+                state = torch.load(resume, map_location="cpu", weights_only=False) if resume.exists() else None
+                result = optimize_ce_assignment(
+                    z, q, assignments[seed], penalty=penalty, steps=steps, lr=assignment_lr,
+                    assignment_rank=rank, factor_seed=seed, base_logits=bases[seed],
+                    checkpoint_steps=checkpoints, folder=folder, resume_state=state,
+                    save_resume=True, save_assignment=False, inner_method="newton_first",
+                    implicit_warm_start=True, inner_loss_weighting="mass", cg_max_iter=512,
+                )
+                del result, state
+                save_json(dict(steps=steps), folder / "complete.json")
+            for step in checkpoints:
+                snapshot = torch.load(folder / "checkpoints" / f"step_{step:06d}.pt",
+                                      map_location=device, weights_only=False)
+                if step == 0 and not torch.allclose(snapshot["moments"], initials[seed], atol=1e-12, rtol=1e-10):
+                    raise RuntimeError("Fine-tuning initialization differs from selection")
+                cache = (root / "initial_grid" / f"candidate_{int(chosen['candidate']):04d}"
+                         / f"condensation_{seed}" / "search") if step == 0 else folder / "search" / f"step_{step:06d}"
+                records.extend(dict(candidate=index, penalty=penalty, step=step, condensation_seed=seed, **row)
+                               for row in evaluate(snapshot["moments"], q, cache))
+        write_table(pd.DataFrame(records), root / "finetune_students.csv")
+        search = aggregate_search(records, condensation_seeds, search_seeds, ("penalty",))
+        write_table(search, root / "finetune_grid.csv")
+    selected = search.sort_values(["val", "step", "candidate"], ascending=[False, True, True]).iloc[0].to_dict()
+    save_json(selected, root / "selected_finetune.json")
+    rows = []
+    for phase, step in (("initial", 0), ("selected", int(selected["step"]))):
+        for seed in condensation_seeds:
+            folder = root / "finetune" / f"candidate_{int(selected['candidate']):04d}" / f"condensation_{seed}"
+            snapshot = torch.load(folder / "checkpoints" / f"step_{step:06d}.pt", map_location=device, weights_only=False)
+            cache = root / "final" / f"condensation_{seed}" / f"step_{step:06d}"
+            rows.extend(dict(phase=phase, condensation_seed=seed, **r)
+                        for r in evaluate(snapshot["moments"], q, cache, final=True))
+    final = pd.DataFrame(rows)
+    by_seed = final.groupby(["phase", "condensation_seed"], sort=False).agg(
+        val_mean=("val_acc", "mean"), test_mean=("test_acc", "mean"),
+        test_student_std=("test_acc", lambda x: x.std(ddof=0)),
+    ).reset_index()
+    summary = by_seed.groupby("phase", sort=False).agg(
+        final_val=("val_mean", "mean"), test_mean=("test_mean", "mean"),
+        test_condensation_std=("test_mean", "std"), mean_student_std=("test_student_std", "mean"),
+    ).reset_index()
+    for key in ("gamma", "T", "tau"):
+        summary[key] = chosen[key]
+    summary["rank"], summary["nodes"], summary["penalty"] = rank, cells, selected["penalty"]
+    summary["step"] = summary.phase.map(dict(initial=0, selected=int(selected["step"])))
+    summary["search_val"] = summary.phase.map(dict(initial=chosen["val"], selected=selected["val"]))
+    for name, table in (("summary", summary), ("by_seed", by_seed), ("final_students", final)):
+        write_table(table, root / f"{name}.csv")
+    return summary, by_seed, initial_grid, search, root

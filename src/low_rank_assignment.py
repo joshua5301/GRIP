@@ -56,7 +56,8 @@ def saved_encoder_nodes(z, q, saved):
 
 
 def logit_block(u, v, assignment, mixing):
-    return initial_logits(assignment, len(v), mixing, u.dtype) + u @ v.T / math.sqrt(u.shape[1])
+    base = assignment if assignment.ndim == 2 else initial_logits(assignment, len(v), mixing, u.dtype)
+    return base + u @ v.T / math.sqrt(u.shape[1])
 
 
 class LowRankLogits(torch.autograd.Function):

@@ -132,3 +132,19 @@ the dense/low-rank baseline. Rank and assignment temperature are not parameters.
 To tune teacher gamma by condensation performance, call the sweep separately for
 each singleton gamma and select the global winner by search validation only.
 Run `tests/test_sparse_assignment.py` in Colab for gradient and resume checks.
+
+`src.soft_init_sweep.run_soft_init_sweep` implements a two-stage Cora experiment.
+First, fixed k-means centers define P=softmax(-squared_distance/tau) in the existing
+RMS-normalized S²X space, without uniform mixing or soft Lloyd iterations. Gamma,
+teacher T and assignment tau are jointly selected by mean uniform-CE GCN validation
+accuracy across condensation and student seeds. All teacher candidates are used;
+teacher accuracy does not preselect gamma. Then only the selected initialization
+is fine-tuned using fixed distance logits plus UVᵀ/sqrt(rank), mass-weighted inner
+CE and the original implicit solver. Inner penalty and step (including zero) are
+selected by validation. Independent final student seeds evaluate initial and
+selected checkpoints on test. Initial selection and fine-tuning share exact cached
+inputs and teacher logits; their step-zero moments are checked for agreement.
+Temperature tau is in normalized squared-distance units, not teacher temperature
+units. A larger initial grid costs GCN training but no bilevel optimization.
+Use an unchanged output directory/configuration to resume. Numerical checks live
+in `tests/test_soft_init_sweep.py` and must run in Colab, not locally.
