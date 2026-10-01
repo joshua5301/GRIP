@@ -108,7 +108,12 @@ def _cached_ntk_inputs(root, candidate, seed, device):
     config = json.loads((root / "config.json").read_text())
     state = torch.load(path, map_location=device, weights_only=True)
     h = fixed_propagated_features(state["h"], config, root)
-    logits = torch.load(teacher, map_location=device, weights_only=False)["logits"]
+    if config.get("teacher_kernel") is not None:
+        from src.ntk_teacher import validate_root
+        selected, _, _ = validate_root(root, device=device)
+        logits = selected["logits"].to(device)
+    else:
+        logits = torch.load(teacher, map_location=device, weights_only=False)["logits"]
     q = (logits / candidate["T"]).softmax(1).double()
     assignment = _cached_initial_assignment(root, candidate, seed, device)
     return h, q, assignment
@@ -282,11 +287,23 @@ def _student_settings(dropout, epochs, overrides):
     return settings
 
 
+def _legacy_teacher_config(dataset, ratio, graph, train, validation, testing, citation_features):
+    config = dict(dataset=dataset, ratio=ratio, data_digest=dataset_digest(graph, train, validation, testing),
+        teacher_basis=3000, teacher_seed=0,
+        teacher_gammas=[1e-5, 1e-4, 1e-3, 0.01], kernel="relu", mixing=0.05,
+        inner_loss="mass_ce", student_loss="uniform_ce", version=1)
+    if citation_features != "default":
+        config["citation_features"] = citation_features
+    return config
+
+
 def run_screen(dataset, ratio, output_dir, candidates, steps=50,
                student_seeds=(0, 1), condensation_seed=0, dropout=0.9,
                epochs=500, data_dir="data", device="cuda", checkpoints=None, input_scale=1.0,
                citation_features="default", stop=lambda: False, student_settings=None,
-               report_routes=False):
+               report_routes=False, teacher_kernel="relu"):
+    if not isinstance(teacher_kernel, str) or teacher_kernel not in ("relu", "relu_ntk1_diagmatch_v1"):
+        raise ValueError("Unsupported top-level teacher_kernel")
     if dataset not in ("cora", "citeseer") or (dataset, ratio) not in BUDGET:
         raise ValueError("Use a configured Cora/Citeseer budget")
     # Check every requested prior before loading a dataset or fitting a teacher.
@@ -296,6 +313,8 @@ def run_screen(dataset, ratio, output_dir, candidates, steps=50,
     for candidate in candidates:
         if candidate.get("method", "low_rank") == "nystrom":
             _nystrom_inner_weighting(candidate)
+    if teacher_kernel != "relu" and any(candidate.get("surrogate_kernel") != teacher_kernel for candidate in candidates):
+        raise ValueError("NTK teacher requires the same frozen NTK surrogate candidate")
     if not isinstance(report_routes, bool):
         raise ValueError("report_routes must be a boolean")
     settings = _student_settings(dropout, epochs, student_settings)
@@ -303,20 +322,27 @@ def run_screen(dataset, ratio, output_dir, candidates, steps=50,
     torch.backends.cuda.matmul.allow_tf32 = False
     torch.backends.cudnn.allow_tf32 = False
     graph, train, validation, testing, h = _prepare_dataset(dataset, data_dir, device, citation_features)
-    config = dict(dataset=dataset, ratio=ratio, data_digest=dataset_digest(graph, train, validation, testing),
-        teacher_basis=3000, teacher_seed=0,
-        teacher_gammas=[1e-5, 1e-4, 1e-3, 0.01], kernel="relu", mixing=0.05,
-        inner_loss="mass_ce", student_loss="uniform_ce", version=1)
-    if citation_features != "default":
-        config["citation_features"] = citation_features
-    root = Path(output_dir) / dataset / f"ratio_{ratio}" / _fingerprint(config)
-    root.mkdir(parents=True, exist_ok=True)
-    save_json(config, root / "config.json")
-    h = fixed_propagated_features(h, config, root)
-    logits, gamma = teacher_logits(h, graph, train, validation, "relu", config["teacher_gammas"],
-                                  3000, 0, root)
-    save_json(dict(gamma=gamma, val=100 * float((logits[validation[1]].argmax(1)
-                   == graph["y"][validation[1]]).double().mean())), root / "teacher_selected.json")
+    config = _legacy_teacher_config(dataset, ratio, graph, train, validation, testing, citation_features)
+    source_root = Path(output_dir) / dataset / f"ratio_{ratio}" / _fingerprint(config)
+    if teacher_kernel == "relu":
+        root = source_root
+        root.mkdir(parents=True, exist_ok=True)
+        save_json(config, root / "config.json")
+        h = fixed_propagated_features(h, config, root)
+        logits, gamma = teacher_logits(h, graph, train, validation, "relu", config["teacher_gammas"],
+                                      3000, 0, root)
+        save_json(dict(gamma=gamma, val=100 * float((logits[validation[1]].argmax(1)
+                       == graph["y"][validation[1]]).double().mean())), root / "teacher_selected.json")
+    else:
+        from src.ntk_teacher import context, teacher_inputs, teacher_root, validate_root
+        labels, val_labels = teacher_inputs(graph, train, validation[1])
+        h, _, effective = context(h, config, source_root, train, labels, validation[1], val_labels)
+        root = teacher_root(output_dir, config, effective)
+        if not (root / "config.json").exists():
+            raise ValueError("NTK teacher gamma preparation must finish before condensation")
+        selected, config, _ = validate_root(root, h=h, train_mask=train, train_labels=labels,
+                                           val_mask=validation[1], val_labels=val_labels, device=device, stop=stop)
+        logits, gamma = selected["logits"].to(device), selected["gamma"]
     inputs_path = root / f"inputs_{condensation_seed}.pt"
     if inputs_path.exists():
         saved = torch.load(inputs_path, map_location=device, weights_only=False)
@@ -546,6 +572,10 @@ def selected_test(root, choice, condensation_seeds=(0, 1, 2), student_seeds=(100
                   stop=lambda: False, report_routes=True, student_settings=None):
     """Test only a fixed configuration and checkpoint, with fresh student seeds."""
     root = Path(root)
+    root_config = json.loads((root / "config.json").read_text())
+    if root_config.get("teacher_kernel") is not None:
+        from src.ntk_teacher import validate_root
+        validate_root(root, device=device, stop=stop)
     # Mixed ranking tables have NaN NTK columns on legitimate legacy rows.
     # Validate every supplied non-null kernel control before the row whitelist.
     raw = {key: value for key, value in choice.items() if pd.notna(value)}
@@ -614,6 +644,9 @@ def selected_test(root, choice, condensation_seeds=(0, 1, 2), student_seeds=(100
     selection = dict(candidate=candidate, step=step, selection="validation_only",
                      student=dict(dropout=dropout, input_scale=input_scale, epochs=epochs),
                      condensation_seeds=list(condensation_seeds), student_seeds=list(student_seeds))
+    if config.get("teacher_kernel") is not None:
+        selection["teacher_kernel"] = config["teacher_kernel"]
+        selection["teacher_context_digest"] = _fingerprint(config["teacher_context"])
     settings = _student_settings(dropout, epochs, student_settings)
     if student_settings:
         selection["student"]["overrides"] = student_settings
@@ -625,6 +658,11 @@ def selected_test(root, choice, condensation_seeds=(0, 1, 2), student_seeds=(100
     if dataset_digest(graph, train, validation, testing) != config["data_digest"]:
         raise ValueError("Graph or splits differ from the selected source screen")
     h = fixed_propagated_features(h, config, root)
+    if config.get("teacher_kernel") is not None:
+        from src.ntk_teacher import teacher_inputs, validate_root
+        labels, val_labels = teacher_inputs(graph, train, validation[1])
+        validate_root(root, h=h, train_mask=train, train_labels=labels, val_mask=validation[1],
+                      val_labels=val_labels, device=device, stop=stop)
     if candidate.get("mass_mode") != "initial" and candidate.get("surrogate_kernel") is None:
         save_json(selection, root / "selected.json")
         save_json(selection, root / f"selected_{selection_key}.json")
@@ -650,7 +688,7 @@ def selected_test(root, choice, condensation_seeds=(0, 1, 2), student_seeds=(100
                    student_seeds=(0,), condensation_seed=cond_seed, dropout=dropout, epochs=epochs,
                    data_dir=data_dir, device=device, input_scale=input_scale,
                    citation_features=config.get("citation_features", "default"), stop=stop,
-                   student_settings=student_settings)
+                   student_settings=student_settings, teacher_kernel=config.get("teacher_kernel", "relu"))
         if generated_root.resolve() != root.resolve():
             raise ValueError("Generated condensate belongs to a different source screen")
         folder = root / _fingerprint(candidate) / f"condensation_{cond_seed}"
