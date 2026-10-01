@@ -37,6 +37,9 @@ def dispatch(job, stop):
         ranking, root = run_screen(**options, stop=stop)
         return dict(root=str(root.resolve()), ranking=ranking.to_dict("records"),
                     validation_only=True)
+    if job["kind"] == "citation_gcn_teacher":
+        from src.citation_gcn_teacher import prepare_job
+        return prepare_job(**options, stop=stop)
     if job["kind"] == "citation_teacher_gamma":
         from src.ntk_teacher import prepare_gamma_job
         return prepare_gamma_job(**options, stop=stop)

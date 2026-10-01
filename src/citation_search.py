@@ -306,7 +306,18 @@ def run_screen(dataset, ratio, output_dir, candidates, steps=50,
                student_seeds=(0, 1), condensation_seed=0, dropout=0.9,
                epochs=500, data_dir="data", device="cuda", checkpoints=None, input_scale=1.0,
                citation_features="default", stop=lambda: False, student_settings=None,
-               report_routes=False, teacher_kernel="relu"):
+               report_routes=False, teacher_kernel="relu", teacher_backend=None, initialization_source=None):
+    if teacher_backend is not None or initialization_source is not None or any(
+            set(candidate) & {"teacher_backend", "initialization_source", "teacher_type", "initialization_policy",
+                              "gcn_teacher_epochs", "gcn_teacher_seed"} for candidate in candidates):
+        from src.citation_gcn_teacher import controls
+        controls(teacher_backend, initialization_source, candidates, teacher_kernel, condensation_seed)
+        if teacher_backend is not None:
+            if (type(steps) is not int or steps not in (0, 25)
+                    or any(type(v) is not int or v not in (0, steps) for v in (checkpoints or []))):
+                raise ValueError("First fixed-ReLU GCN pilot supports only step0/fixed25 endpoints")
+            if torch.is_autocast_enabled() or torch.is_autocast_enabled("cpu"):
+                raise ValueError("GCN native FP32 backend does not support external autocast")
     if not isinstance(teacher_kernel, str) or teacher_kernel not in ("relu", "relu_ntk1_diagmatch_v1"):
         raise ValueError("Unsupported top-level teacher_kernel")
     if dataset not in ("cora", "citeseer") or (dataset, ratio) not in BUDGET:
@@ -329,7 +340,20 @@ def run_screen(dataset, ratio, output_dir, candidates, steps=50,
     graph, train, validation, testing, h = _prepare_dataset(dataset, data_dir, device, citation_features)
     config = _legacy_teacher_config(dataset, ratio, graph, train, validation, testing, citation_features)
     source_root = Path(output_dir) / dataset / f"ratio_{ratio}" / _fingerprint(config)
-    if teacher_kernel == "relu":
+    if teacher_backend is not None:
+        from src.citation_gcn_teacher import context, teacher_root, validate_root
+        if len(candidates) != 1:
+            raise ValueError("Fixed-ReLU GCN pilot requires one original candidate")
+        current = {"method": "low_rank", "width": 0, "lr": .01, **candidates[0]}
+        h, _, _, effective = context(graph, train, validation, h, config, source_root,
+                                    initialization_source, candidate=current, stop=stop)
+        root = teacher_root(output_dir, effective)
+        if not (root / "config.json").exists():
+            raise ValueError("GCN teacher preparation must complete before condensation")
+        selected, config, (_, frozen_inputs, pinned_assignment), _ = validate_root(
+            root, graph, train, validation, h, stop=stop)
+        logits, gamma = selected["logits"].to(device).double(), None
+    elif teacher_kernel == "relu":
         root = source_root
         root.mkdir(parents=True, exist_ok=True)
         save_json(config, root / "config.json")
@@ -349,7 +373,12 @@ def run_screen(dataset, ratio, output_dir, candidates, steps=50,
                                            val_mask=validation[1], val_labels=val_labels, device=device, stop=stop)
         logits, gamma = selected["logits"].to(device), selected["gamma"]
     inputs_path = root / f"inputs_{condensation_seed}.pt"
-    if inputs_path.exists():
+    if teacher_backend is not None:
+        z = frozen_inputs["z"].to(device)
+        transform = FeatureTransform(**{key: value.to(device) if torch.is_tensor(value) else value
+                                      for key, value in frozen_inputs["transform"].items()})
+        assignment = pinned_assignment
+    elif inputs_path.exists():
         saved = torch.load(inputs_path, map_location=device, weights_only=False)
         z, assignment = saved["z"], saved["assignment"]
         transform = FeatureTransform(**saved["transform"])
@@ -396,12 +425,16 @@ def run_screen(dataset, ratio, output_dir, candidates, steps=50,
                 cached = torch.load(cached_path, map_location="cpu", weights_only=False)
                 _check_nystrom_assignment(identity, cached, root=root,
                                          condensation_seed=condensation_seed, device=device, h=h, q=current_q)
+        if teacher_backend is not None:
+            from src.citation_gcn_teacher import validate_condensation
+            current_q = training_refined_targets(logits, identity["T"], graph["y"], train, 0)
+            validate_condensation(root, identity, condensation_seed, z, current_q, pinned_assignment, steps)
         folder.mkdir(parents=True, exist_ok=True)
         save_json(identity, folder.parent / "candidate.json")
         q = training_refined_targets(logits, identity["T"], graph["y"], train,
                                      identity.get("train_target_mix", 0.0))
         assignment = feature_assignment
-        if identity.get("initialization", "feature") != "feature":
+        if teacher_backend is None and identity.get("initialization", "feature") != "feature":
             from src.partition_initialization import teacher_aware_kmeans, teacher_balanced_kmeans
             init_config = dict(mode=identity["initialization"], alpha=identity.get("alpha", 1.0),
                                T=identity["T"], seed=condensation_seed)
@@ -417,6 +450,9 @@ def run_screen(dataset, ratio, output_dir, candidates, steps=50,
                 save_state(initializer(h, q, BUDGET[(dataset, ratio)], condensation_seed,
                                        alpha=init_config["alpha"]), init_path)
             assignment = torch.load(init_path, map_location=device, weights_only=False)
+        if teacher_backend is not None:
+            from src.citation_gcn_teacher import bind_condensation_inputs
+            bind_condensation_inputs(root, identity, condensation_seed, z, q, pinned_assignment, create=True)
         started = time.monotonic()
         if state is None or state["step"] < steps:
             print("CANDIDATE", dataset, ratio, identity, "budget", steps, flush=True)
@@ -479,6 +515,8 @@ def run_screen(dataset, ratio, output_dir, candidates, steps=50,
                     cg_max_iter=512, cg_rtol=1e-6, cache_assignment=False,
                     folder=folder, checkpoint_steps=checks, resume_state=state,
                     save_resume=True, save_assignment=False, stop=stop, **temperature_options)
+        if teacher_backend is not None:
+            validate_condensation(root, identity, condensation_seed, z, q, pinned_assignment, steps, create=True)
         if identity.get("learn_temperature", False):
             if not resume.exists():
                 raise ValueError("Learnable-temperature resume state is missing")
@@ -585,6 +623,10 @@ def selected_test(root, choice, condensation_seeds=(0, 1, 2), student_seeds=(100
     # Validate every supplied non-null kernel control before the row whitelist.
     raw = {key: value for key, value in choice.items() if pd.notna(value)}
     _candidate_surrogate(raw)
+    if set(raw) & {"teacher_backend", "initialization_source", "teacher_type", "initialization_policy",
+                   "gcn_teacher_epochs", "gcn_teacher_seed"}:
+        from src.citation_gcn_teacher import controls
+        controls(None, None, [raw])
     recorded = None
     if "candidate_path" in raw:
         path = Path(raw["candidate_path"]) / "candidate.json"
@@ -637,6 +679,14 @@ def selected_test(root, choice, condensation_seeds=(0, 1, 2), student_seeds=(100
         _nystrom_inner_weighting(candidate)
     config = json.loads((root / "config.json").read_text())
     step = int(choice["step"])
+    if config.get("teacher_backend") is not None:
+        from src.citation_gcn_teacher import controls
+        controls(config["teacher_backend"], config["gcn_context"]["source_pin"], [candidate])
+        if step not in (0, 25):
+            raise ValueError("Selected GCN pilot checkpoint must be0 or25")
+        if "candidate_path" in raw and (Path(raw["candidate_path"]).resolve() != (root / _fingerprint(candidate)).resolve()
+                                         or recorded != candidate):
+            raise ValueError("Selected GCN row differs from its recorded candidate/root")
     if candidate["method"] == "nystrom":
         # Reject stale/cross-mode cached selections before writing selection files.
         for cond_seed in condensation_seeds:
@@ -649,6 +699,9 @@ def selected_test(root, choice, condensation_seeds=(0, 1, 2), student_seeds=(100
     selection = dict(candidate=candidate, step=step, selection="validation_only",
                      student=dict(dropout=dropout, input_scale=input_scale, epochs=epochs),
                      condensation_seeds=list(condensation_seeds), student_seeds=list(student_seeds))
+    if config.get("teacher_backend") is not None:
+        selection["teacher_backend"] = config["teacher_backend"]
+        selection["gcn_context_digest"] = _fingerprint(config["gcn_context"])
     if config.get("teacher_kernel") is not None:
         selection["teacher_kernel"] = config["teacher_kernel"]
         selection["teacher_context_digest"] = _fingerprint(config["teacher_context"])
@@ -662,7 +715,15 @@ def selected_test(root, choice, condensation_seeds=(0, 1, 2), student_seeds=(100
                                                           config.get("citation_features", "default"))
     if dataset_digest(graph, train, validation, testing) != config["data_digest"]:
         raise ValueError("Graph or splits differ from the selected source screen")
-    h = fixed_propagated_features(h, config, root)
+    if config.get("teacher_backend") is None:
+        h = fixed_propagated_features(h, config, root)
+    if config.get("teacher_backend") is not None:
+        from src.citation_gcn_teacher import validate_condensation, validate_root
+        selected, _, (h, pinned_inputs, pinned_assignment), _ = validate_root(root, graph, train, validation, h, stop=stop)
+        current_q = training_refined_targets(selected["logits"].to(device).double(), candidate["T"], graph["y"], train, 0)
+        for cond_seed in condensation_seeds:
+            validate_condensation(root, candidate, cond_seed, pinned_inputs["z"].to(device), current_q,
+                                  pinned_assignment, step)
     if config.get("teacher_kernel") is not None:
         from src.ntk_teacher import teacher_inputs, validate_root
         labels, val_labels = teacher_inputs(graph, train, validation[1])
@@ -672,6 +733,8 @@ def selected_test(root, choice, condensation_seeds=(0, 1, 2), student_seeds=(100
         save_json(selection, root / "selected.json")
         save_json(selection, root / f"selected_{selection_key}.json")
     logits = torch.load(root / "teacher.pt", map_location=device, weights_only=False)["logits"]
+    if config.get("teacher_backend") is not None:
+        logits = logits.double()
     q = training_refined_targets(logits, candidate["T"], graph["y"], train,
                                  candidate.get("train_target_mix", 0.0))
     if candidate.get("mass_mode") == "initial" or candidate.get("surrogate_kernel") is not None:
@@ -693,7 +756,9 @@ def selected_test(root, choice, condensation_seeds=(0, 1, 2), student_seeds=(100
                    student_seeds=(0,), condensation_seed=cond_seed, dropout=dropout, epochs=epochs,
                    data_dir=data_dir, device=device, input_scale=input_scale,
                    citation_features=config.get("citation_features", "default"), stop=stop,
-                   student_settings=student_settings, teacher_kernel=config.get("teacher_kernel", "relu"))
+                   student_settings=student_settings, teacher_kernel=config.get("teacher_kernel", "relu"),
+                   **(dict(teacher_backend=config["teacher_backend"], initialization_source=config["gcn_context"]["source_pin"])
+                      if config.get("teacher_backend") is not None else {}))
         if generated_root.resolve() != root.resolve():
             raise ValueError("Generated condensate belongs to a different source screen")
         folder = root / _fingerprint(candidate) / f"condensation_{cond_seed}"
