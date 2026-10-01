@@ -191,3 +191,10 @@ each run. The first run saves S²X and a digest of the original graph features,
 labels and masks; later runs reuse exactly those propagated features after
 checking the raw graph digest. This avoids separate sparse propagation results
 changing the experiment input between methods.
+
+Set `initialization="none"` in `run_distance_cost_sweep` to remove the fixed
+cost entirely: P=softmax(-UVᵀ/(sqrt(rank)*t)). Both factors start from seeded
+unit Gaussian values. Zero U would make all initial cells identical, so this
+initialization breaks that symmetry. The same rank, temperature, inner model,
+optimizer and evaluation apply. Use the shared propagated features from the
+k-means/random-cost ablation for a matched Cora comparison.

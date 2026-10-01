@@ -1,7 +1,7 @@
 import pytest
 import torch
 
-from src.low_rank_assignment import CachedLowRankMoments, LowRankMoments
+from src.low_rank_assignment import CachedLowRankMoments, LowRankMoments, initialize_factors
 from src.soft_ce_partition import optimize_ce_assignment
 from src.soft_init_sweep import distance_base, random_cost_base
 
@@ -21,6 +21,31 @@ def test_random_cost_initialization():
     assert not torch.equal(base, random_cost_base(100, 5, 8, 0.3, "cpu", torch.double))
     torch.testing.assert_close(base.mean(1), torch.zeros(100, dtype=torch.double), atol=1e-12, rtol=0)
     torch.testing.assert_close((base * 0.3).square().mean(), torch.ones((), dtype=torch.double))
+
+
+def test_no_fixed_cost_starts_with_distinct_cells(tmp_path):
+    z, q, assignment = problem()
+    t = 0.3
+    base = z.new_zeros(len(z), 3)
+    u, v = initialize_factors(assignment, 3, 2, seed=7, u_std=1.0)
+    probabilities = (base + u @ (v * (-1 / t)).T / 2**0.5).softmax(1)
+    assert probabilities.std(0).min() > 0
+    expected = probabilities.double().T @ torch.cat((torch.ones(12, 1, dtype=z.dtype), z, q), 1) / 12
+    result = optimize_ce_assignment(
+        z, q, assignment, assignment_rank=2, factor_seed=7,
+        base_logits=base, correction_scale=-1 / t, factor_initial_std=1.0,
+        penalty=0.2, inner_method="newton_first", inner_tol=1e-8,
+        steps=1, checkpoint_steps=(0, 1), folder=tmp_path, save_resume=True,
+    )
+    torch.testing.assert_close(result["checkpoints"][0]["moments"], expected)
+    state = torch.load(tmp_path / "resume.pt", weights_only=False)
+    with pytest.raises(ValueError, match="Resume state"):
+        optimize_ce_assignment(
+            z, q, assignment, assignment_rank=2, factor_seed=7,
+            base_logits=base, correction_scale=-1 / t, factor_initial_std=0.5,
+            penalty=0.2, inner_method="newton_first", inner_tol=1e-8,
+            steps=2, resume_state=state,
+        )
 
 
 def test_distance_probabilities():

@@ -522,6 +522,7 @@ def optimize_ce_assignment(
     sparse_k=None,
     base_logits=None,
     correction_scale=1.0,
+    factor_initial_std=0.0,
 ):
     if feature_control != "joint" or initial_representatives is not None:
         raise ValueError("Only clustering-derived features and labels are supported")
@@ -570,6 +571,11 @@ def optimize_ce_assignment(
         resume_config.pop("correction_scale")
     elif base_logits is None or not np.isfinite(correction_scale) or correction_scale == 0:
         raise ValueError("A finite nonzero correction scale requires fixed base logits")
+    if factor_initial_std == 0.0:
+        resume_config.pop("factor_initial_std")
+    elif (assignment_rank is None or assignment_input != "node" or not np.isfinite(factor_initial_std)
+          or factor_initial_std < 0):
+        raise ValueError("Random factor initialization requires node-level low-rank assignment")
     if sparse_k is None:
         resume_config.pop("sparse_k")
     elif (assignment_rank is not None or assignment_input != "node" or assignment_encoder != "linear"
@@ -714,7 +720,7 @@ def optimize_ce_assignment(
             encoder_parameters = [weight]
         parameters = [*encoder_parameters, v]
     else:
-        u, v = initialize_factors(assignment, clusters, assignment_rank, factor_seed)
+        u, v = initialize_factors(assignment, clusters, assignment_rank, factor_seed, factor_initial_std)
         parameters = [u, v]
     if node_weighting:
         node_logits = z.new_zeros(len(z), dtype=torch.float32).requires_grad_()

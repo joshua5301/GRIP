@@ -22,12 +22,15 @@ def initialize_encoder(inputs, clusters, rank, seed=0):
     return weight.requires_grad_(), v.requires_grad_()
 
 
-def initialize_factors(assignment, clusters, rank, seed=0):
+def initialize_factors(assignment, clusters, rank, seed=0, u_std=0.0):
     if not isinstance(rank, int) or not 1 <= rank <= min(len(assignment), clusters):
         raise ValueError("rank must be a positive integer no larger than min(nodes, cells)")
     generator = torch.Generator(device=assignment.device).manual_seed(seed)
-    u = torch.zeros(len(assignment), rank, device=assignment.device)
+    if not math.isfinite(u_std) or u_std < 0:
+        raise ValueError("Invalid factor initialization scale")
     v = torch.randn(clusters, rank, generator=generator, device=assignment.device)
+    u = (torch.randn(len(assignment), rank, generator=generator, device=assignment.device) * u_std
+         if u_std else torch.zeros(len(assignment), rank, device=assignment.device))
     return u.requires_grad_(), v.requires_grad_()
 
 

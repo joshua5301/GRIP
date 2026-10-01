@@ -57,10 +57,10 @@ def run_soft_init_sweep(
     resume_from=None,
     shared_features_path=None,
 ):
-    if initialization not in ("kmeans", "random"):
+    if initialization not in ("kmeans", "random", "none"):
         raise ValueError("Unknown initialization")
-    if initialization == "random" and finetune_temperatures is None:
-        raise ValueError("Random costs require the normalized cost sweep")
+    if initialization in ("random", "none") and finetune_temperatures is None:
+        raise ValueError("Non-geometric assignments require the normalized cost sweep")
     values = [*gammas, *temperatures, *taus, *penalties, *(finetune_temperatures or ())]
     if any(not v for v in (gammas, temperatures, taus, penalties)) or any(
         not np.isfinite(v) or v <= 0 for v in values
@@ -161,23 +161,29 @@ def run_soft_init_sweep(
         ) for seed in (final_seeds if final else search_seeds)]
 
     def initial_state(seed, tau, q):
-        base = (distance_base(z, assignments[seed], tau, normalized=normalized)
-                if initialization == "kmeans"
-                else random_cost_base(len(z), cells, seed, tau, device, z.dtype))
-        u, v = initialize_factors(assignments[seed], cells, rank, seed)
+        if initialization == "kmeans":
+            base = distance_base(z, assignments[seed], tau, normalized=normalized)
+        elif initialization == "random":
+            base = random_cost_base(len(z), cells, seed, tau, device, z.dtype)
+        else:
+            base = z.new_zeros(len(z), cells)
+        u_std = 1.0 if initialization == "none" else 0.0
+        u, v = initialize_factors(assignments[seed], cells, rank, seed, u_std)
+        correction_scale = -1 / tau if normalized else 1.0
         with torch.no_grad():
-            moments = LowRankMoments.apply(u, v, base, make_material(z, q), 0.05, 8192)
-        return base, moments
+            moments = LowRankMoments.apply(u, v * correction_scale, base, make_material(z, q), 0.05, 8192)
+            logits = base + u @ (v * correction_scale).T / rank**0.5
+            probability = logits.softmax(1)
+        return base, moments, probability
 
     grid = grid_rows(dict(gamma=list(gammas), T=list(temperatures), tau=list(taus)))
     records = []
     for index, params in enumerate(tqdm(grid, desc="Soft initialization validation")):
         q = (teachers[params["gamma"]].to(device) / params["T"]).softmax(1).double()
         for seed in condensation_seeds:
-            base, moments = initial_state(seed, params["tau"], q)
+            base, moments, probability = initial_state(seed, params["tau"], q)
             folder = root / "initial_grid" / f"candidate_{index:04d}" / f"condensation_{seed}"
             folder.mkdir(parents=True, exist_ok=True)
-            probability = base.softmax(1)
             save_json(dict(
                 entropy=float(-(probability * probability.clamp_min(1e-300).log()).sum(1).mean()),
                 agreement=(float((probability.argmax(1) == assignments[seed]).double().mean())
@@ -197,7 +203,7 @@ def run_soft_init_sweep(
     for index, params in enumerate(tqdm(fine_grid, desc="Low-rank fine-tuning")):
         t, penalty = params["t"], params["penalty"]
         for seed in condensation_seeds:
-            base, initial = initial_state(seed, t, q)
+            base, initial, probability = initial_state(seed, t, q)
             folder = root / "finetune" / f"candidate_{index:04d}" / f"condensation_{seed}"
             folder.mkdir(parents=True, exist_ok=True)
             completed = folder / "complete.json"
@@ -208,6 +214,7 @@ def run_soft_init_sweep(
                     z, q, assignments[seed], penalty=penalty, steps=steps, lr=assignment_lr,
                     assignment_rank=rank, factor_seed=seed, base_logits=base,
                     correction_scale=-1 / t if normalized else 1.0,
+                    factor_initial_std=1.0 if initialization == "none" else 0.0,
                     checkpoint_steps=checkpoints, folder=folder, resume_state=state,
                     save_resume=True, save_assignment=False, inner_method="newton_first",
                     implicit_warm_start=True, inner_loss_weighting="mass", cg_max_iter=512,
@@ -225,7 +232,6 @@ def run_soft_init_sweep(
                     cache = cache / f"condensation_{seed}" / "search"
                     if normalized:
                         cache.parent.mkdir(parents=True, exist_ok=True)
-                        probability = base.softmax(1)
                         save_json(dict(
                             t=t,
                             entropy=float(-(probability * probability.clamp_min(1e-300).log()).sum(1).mean()),
@@ -250,7 +256,7 @@ def run_soft_init_sweep(
         for seed in condensation_seeds:
             folder = root / "finetune" / f"candidate_{int(selected['candidate']):04d}" / f"condensation_{seed}"
             if phase == "selection_initial":
-                _, moments = initial_state(seed, chosen["tau"], q)
+                _, moments, _ = initial_state(seed, chosen["tau"], q)
             else:
                 moments = torch.load(folder / "checkpoints" / f"step_{step:06d}.pt",
                                      map_location=device, weights_only=False)["moments"]
