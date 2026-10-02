@@ -33,13 +33,22 @@ def test_selection_averages_all_seed_pairs_and_ignores_test():
         experiment._search_scores(rows + rows[:1], (0, 1, 2), (0, 1))
 
 
-def test_sweep_uniform_evaluation_selection_and_restart(tmp_path, monkeypatch):
+@pytest.mark.parametrize(
+    "dataset,ratio,kernel,dropout,cells",
+    [("cora", 0.013, "relu", 0.9, 35), ("citeseer", 0.009, "erf", 0.5, 30)],
+)
+def test_sweep_uniform_evaluation_selection_and_restart(
+    tmp_path, monkeypatch, dataset, ratio, kernel, dropout, cells
+):
     h = torch.arange(80, dtype=torch.float32).reshape(40, 2)
     graph = dict(x=h, y=torch.arange(40) % 2, adj=torch.eye(40).to_sparse_csr())
     train, val, test = (torch.arange(40) < 10), (torch.arange(40) == 10), (torch.arange(40) > 10)
-    monkeypatch.setattr(
-        experiment, "_prepare_dataset", lambda *args: (graph, train, (graph, val), (graph, test), h)
-    )
+
+    def prepare(name, *args):
+        assert name == dataset
+        return graph, train, (graph, val), (graph, test), h
+
+    monkeypatch.setattr(experiment, "_prepare_dataset", prepare)
     solves, fits = [], []
 
     def partition(features, labels, cells, B, seed, **kwargs):
@@ -59,8 +68,12 @@ def test_sweep_uniform_evaluation_selection_and_restart(tmp_path, monkeypatch):
             seconds=0.01,
         )
 
+    def features(x, kind, basis):
+        assert kind == kernel
+        return x.double()
+
     teacher = dict(
-        get_kernel_features=lambda x, *args: x.double(),
+        get_kernel_features=features,
         fit_logistic=lambda x, y, gamma: torch.zeros(x.shape[1], y.shape[1], dtype=x.dtype),
     )
     monkeypatch.setattr(
@@ -77,6 +90,7 @@ def test_sweep_uniform_evaluation_selection_and_restart(tmp_path, monkeypatch):
         path = folder / f"seed_{seed}.json"
         if path.exists():
             return json.loads(path.read_text())
+        assert kwargs["dropout"] == dropout
         torch.testing.assert_close(mass / mass.sum(), torch.full_like(mass, 1 / len(mass)))
         B = round(float(x[0, 0]), 1)
         condensation_seed = int(folder.parent.name.split("_")[1])
@@ -90,7 +104,8 @@ def test_sweep_uniform_evaluation_selection_and_restart(tmp_path, monkeypatch):
 
     monkeypatch.setattr(experiment, "fit_gcn_diagnostic", evaluate)
     options = dict(
-        ratio=0.013,
+        ratio=ratio,
+        dataset=dataset,
         output_dir=tmp_path,
         space=dict(gamma=[0.01], T=[1.0], B=[0.3, 1.0]),
         search_seeds=(0, 1),
@@ -98,7 +113,11 @@ def test_sweep_uniform_evaluation_selection_and_restart(tmp_path, monkeypatch):
         device="cpu",
         epochs=10,
     )
-    summary, by_seed, search, root = experiment.run_cora_risk_sweep(**options)
+    run = experiment.run_cora_risk_sweep if dataset == "cora" else experiment.run_risk_sweep
+    summary, by_seed, search, root = run(**options)
+    assert summary.iloc[0].dataset == dataset and summary.iloc[0].nodes == cells
+    config = json.loads((root / "config.json").read_text())
+    assert config["teacher_kernel"] == kernel
     assert summary.iloc[0].B == 1
     assert len(solves) == 6 and len(fits) == 18
     assert all(B == 1 and seed >= 100 for B, _, seed, testing in fits if testing)
@@ -108,6 +127,6 @@ def test_sweep_uniform_evaluation_selection_and_restart(tmp_path, monkeypatch):
     assert set(by_seed.condensation_seed) == {0, 1, 2}
     assert len(pd.read_csv(root / "search_students.csv")) == 12
     before = len(fits), len(solves)
-    repeated = experiment.run_cora_risk_sweep(**options)
+    repeated = run(**options)
     assert repeated[-1] == root and before == (len(fits), len(solves))
     pd.testing.assert_frame_equal(summary, repeated[0])

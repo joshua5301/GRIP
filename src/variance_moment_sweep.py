@@ -65,7 +65,7 @@ def _select(search):
     return search.sort_values(["search_val", "candidate"], ascending=[False, True]).iloc[0].to_dict()
 
 
-def run_cora_risk_sweep(
+def run_risk_sweep(
     ratio,
     output_dir,
     space=None,
@@ -79,15 +79,22 @@ def run_cora_risk_sweep(
     epochs=1000,
     eval_every=10,
     hidden=256,
-    dropout=0.9,
+    dropout=None,
     student_lr=0.01,
     weight_decay=0.0005,
     data_dir="/content/data/",
     device="cuda",
+    dataset="cora",
 ):
-    space = DEFAULT_SPACE if space is None else space
-    if set(space) != {"gamma", "T", "B"} or ("cora", ratio) not in BUDGET:
-        raise ValueError("Use a Cora ratio and grid keys gamma, T, B")
+    if dataset not in ("cora", "citeseer") or (dataset, ratio) not in BUDGET:
+        raise ValueError("Use a configured Cora or Citeseer ratio")
+    kernel = "relu" if dataset == "cora" else "erf"
+    if dropout is None:
+        dropout = 0.9 if dataset == "cora" else 0.5
+    if space is None:
+        space = dict(DEFAULT_SPACE, B=DEFAULT_SPACE["B"] if dataset == "cora" else [0.03, 0.1, 0.3, 1.0, 3.0])
+    if set(space) != {"gamma", "T", "B"}:
+        raise ValueError("Use grid keys gamma, T, B")
     candidates = grid_rows(space)
     if any(not math.isfinite(value) or value <= 0 for row in candidates for value in row.values()):
         raise ValueError("Grid values must be finite and positive")
@@ -104,7 +111,7 @@ def run_cora_risk_sweep(
     torch.backends.cudnn.allow_tf32 = False
     sources, modules = _load_reference()
     solver, teacher = modules["risk_partition"]["risk_partition"], modules["teacher"]
-    graph, train, validation, testing, h = _prepare_dataset("cora", data_dir, device)
+    graph, train, validation, testing, h = _prepare_dataset(dataset, data_dir, device)
     masks = dict(train=train, val=validation[1], test=testing[1])
     adjacency = graph["adj"]
     data_digest = array_digest(
@@ -141,9 +148,9 @@ def run_cora_risk_sweep(
     )
     config = dict(
         version=1,
-        dataset="cora",
+        dataset=dataset,
         ratio=ratio,
-        nodes=BUDGET[("cora", ratio)],
+        nodes=BUDGET[(dataset, ratio)],
         reference=REFERENCE,
         source_digest=hashlib.sha256(code).hexdigest(),
         reference_digest=_fingerprint(sources),
@@ -156,7 +163,7 @@ def run_cora_risk_sweep(
         block_size=block_size,
         basis=basis,
         teacher_seed=teacher_seed,
-        teacher_kernel="relu",
+        teacher_kernel=kernel,
         student=settings,
         loss_weighting="uniform",
         layers=2,
@@ -186,7 +193,7 @@ def run_cora_risk_sweep(
         else:
             if phi is None:
                 seed_everything(teacher_seed)
-                phi = teacher["get_kernel_features"](h, "relu", basis)
+                phi = teacher["get_kernel_features"](h, kernel, basis)
             targets = F.one_hot(graph["y"][train], int(graph["y"].max()) + 1).to(phi)
             weights = teacher["fit_logistic"](phi[train], targets, gamma)
             scores = (phi @ weights).detach()
@@ -204,7 +211,7 @@ def run_cora_risk_sweep(
     write_table(pd.DataFrame(teacher_rows), root / "teacher_grid.csv")
 
     rows, diagnostics = [], []
-    progress = tqdm(enumerate(candidates), total=len(candidates), desc=f"Cora {ratio:g}: risk grid")
+    progress = tqdm(enumerate(candidates), total=len(candidates), desc=f"{dataset} {ratio:g}: risk grid")
     for index, candidate in progress:
         q = (logits[candidate["gamma"]] / candidate["T"]).softmax(1)
         for seed in condensation_seeds:
@@ -311,7 +318,7 @@ def run_cora_risk_sweep(
     summary = pd.DataFrame(
         [
             dict(
-                dataset="cora",
+                dataset=dataset,
                 ratio=ratio,
                 nodes=config["nodes"],
                 **selected,
@@ -332,3 +339,6 @@ def run_cora_risk_sweep(
     write_table(by_seed, root / "by_seed.csv")
     write_table(summary, root / "summary.csv")
     return summary, by_seed, search, root
+
+
+run_cora_risk_sweep = run_risk_sweep

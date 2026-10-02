@@ -1,14 +1,18 @@
-# Historical variance-moment grid
+# Historical variance-moment grid: Cora and Citeseer
 
-`src.variance_moment_sweep.run_cora_risk_sweep` runs one Cora density per session:
-0.013 (35 representatives), 0.026 (70), or 0.052 (140). It restores the original
+`src.variance_moment_sweep.run_risk_sweep` runs one density per session. Select
+`dataset="cora"` with ratio 0.013 (35 representatives), 0.026 (70), or 0.052 (140),
+or `dataset="citeseer"` with ratio 0.009 (30), 0.018 (60), or 0.036 (120).
+`run_cora_risk_sweep` remains a compatible alias with Cora as the default.
+The runner restores the original
 partitioner and kernel teacher in memory from pinned commit
 `12ceec5810e2c709f98f8aa518d401cd04390168`. A normal full Git clone is required.
 The reference sources are copied into each result directory.
 
 The grid is gamma `[0.001, 0.01, 0.1, 1]`, T `[0.2, 0.5, 1, 2]`, and B
-`[0.3, 1, 3, 10, 30]`: 80 settings per density. ReLU teacher features use 3000
-basis nodes with teacher seed zero. Gamma is selected jointly by condensed GCN
+`[0.3, 1, 3, 10, 30]` for Cora or `[0.03, 0.1, 0.3, 1, 3]` for Citeseer:
+80 settings per density. Teacher features use ReLU for Cora and erf for Citeseer,
+3000 basis nodes and teacher seed zero. Gamma is selected jointly by condensed GCN
 validation, not by teacher accuracy. The teacher validation table is diagnostic.
 
 The objective is the historical `B**2/4 * V + 2*B * ||M||_F`, using global
@@ -27,7 +31,8 @@ pairs, with candidate order breaking ties. This is 240 condensations and 720
 search student fits per density. Only the selected tuple receives final test
 evaluation, using student seeds 100 through 109 for each condensation seed.
 Students are two-layer GCNs with uniform soft CE, identity condensed adjacency,
-hidden width 256, dropout 0.9, LR 0.01, weight decay 0.0005, 1000 epochs and
+hidden width 256, fixed dropout 0.9 for Cora or 0.5 for Citeseer, LR 0.01,
+weight decay 0.0005, 1000 epochs and
 validation every 10 epochs. The existing evaluator resets Adam at half the
 training budget with LR multiplied by 0.1, matching the historical schedule.
 

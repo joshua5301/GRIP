@@ -230,8 +230,10 @@ representative count for a matched direct-logit control. Its initial logits
 come from seeded full-rank Gaussian factors with the same logit scaling as the
 low-rank runs; subsequent optimization updates every node-by-cell logit.
 
-`src.variance_moment_sweep.run_cora_risk_sweep` restores the historical global
-variance-moment partitioner for an 80-setting gamma/T/B grid at each Cora density.
+`src.variance_moment_sweep.run_risk_sweep` restores the historical global
+variance-moment partitioner for an 80-setting gamma/T/B grid at each Cora or
+Citeseer density. Citeseer uses the erf teacher and fixed student dropout 0.5;
+the previous `run_cora_risk_sweep` name remains supported.
 All three condensation seeds select one common setting through uniform-CE GCN
 validation. Completed condensations and student fits are cached; only the winner
 receives final test evaluation. See [the protocol](docs/variance_moment_sweep.md).
