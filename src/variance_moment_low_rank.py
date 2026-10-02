@@ -1,9 +1,11 @@
 import math
+from pathlib import Path
 from time import perf_counter
 
 import torch
 
-from src.io import array_digest
+from src.distance_initialization import distance_factors, project_features
+from src.io import array_digest, save_state
 
 
 def moment_objective(statistics, energy, original_moment, B, epsilon=1e-12, moment_weight=None):
@@ -34,16 +36,17 @@ def low_rank_partition(
     initialization="historical",
     moment_weight=None,
     backend="auto",
+    initialization_cache=None,
 ):
     if backend not in ("auto", "full", "chunked"):
         raise ValueError("Use auto, full or chunked backend")
-    if initialization not in ("historical", "random"):
-        raise ValueError("Use historical or random initialization")
+    if initialization not in ("historical", "random", "distance"):
+        raise ValueError("Use historical, random or distance initialization")
     coefficient = B if moment_weight is None else moment_weight
     if not 1 <= m <= len(H) or not math.isfinite(coefficient) or coefficient <= 0:
         raise ValueError("Require 1 <= m <= N and a finite positive objective coefficient")
-    if moment_weight is not None and initialization != "random":
-        raise ValueError("Lambda objective requires random initialization")
+    if moment_weight is not None and initialization == "historical":
+        raise ValueError("Lambda objective requires random or distance initialization")
     if (
         (initialization == "historical" and not 0 < mixing < 1)
         or min(rank, block_size, steps) < 1
@@ -70,12 +73,33 @@ def low_rank_partition(
         initial_digest = array_digest(assignment.cpu().numpy())
     energy, original = X.square().sum(1).mean(), X.T @ Q / n
     bias = math.log((1 - mixing + mixing / m) / (mixing / m)) if assignment is not None else None
-    U = torch.nn.Parameter(torch.randn(n, rank, generator=generator, device=X.device, dtype=X.dtype))
-    if initialization == "random":
-        V = torch.nn.Parameter(torch.randn(m, rank, generator=generator, device=X.device, dtype=X.dtype))
+    if initialization == "distance":
+        cache = Path(initialization_cache) if initialization_cache is not None else None
+        if cache is not None:
+            cache.mkdir(parents=True, exist_ok=True)
+        factors_path = cache / f"rank_{rank}_cells_{m}_seed_{seed}.pt" if cache else None
+        if factors_path is not None and factors_path.exists():
+            u, v = torch.load(factors_path, map_location=X.device, weights_only=True)
+        else:
+            projection_path = cache / f"projection_{rank}.pt" if cache else None
+            if projection_path is not None and projection_path.exists():
+                projected = torch.load(projection_path, map_location=X.device, weights_only=True)
+            else:
+                projected = project_features(X, rank)
+                if projection_path is not None:
+                    save_state(projected, projection_path)
+            u, v = distance_factors(projected, m, rank, seed, block_size=block_size)
+            if factors_path is not None:
+                save_state((u, v), factors_path)
+            del projected
     else:
-        U.data.div_(rank**0.5)
-        V = torch.nn.Parameter(X.new_zeros(m, rank))
+        u = torch.randn(n, rank, generator=generator, device=X.device, dtype=X.dtype)
+        if initialization == "random":
+            v = torch.randn(m, rank, generator=generator, device=X.device, dtype=X.dtype)
+        else:
+            u.div_(rank**0.5)
+            v = X.new_zeros(m, rank)
+    U, V = torch.nn.Parameter(u), torch.nn.Parameter(v)
     optimizer = torch.optim.Adam([U, V], lr=lr)
 
     def probabilities(start, end):

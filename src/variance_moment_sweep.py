@@ -177,8 +177,10 @@ def run_risk_sweep(
     required = {"gamma", "T", "lambda" if "lambda" in keys else "B"}
     if keys != required and not (method == "variance_moment_low_rank" and keys == required | {"rank"}):
         raise ValueError("Use gamma, T and B or lambda; low-rank also supports rank")
-    if "lambda" in keys and (method != "variance_moment_low_rank" or assignment_initialization != "random"):
-        raise ValueError("Lambda grid requires random low-rank optimization")
+    if "lambda" in keys and (
+        method != "variance_moment_low_rank" or assignment_initialization not in ("random", "distance")
+    ):
+        raise ValueError("Lambda grid requires random or distance low-rank optimization")
     candidates = grid_rows(space)
     if candidate_subset is not None:
         if not candidate_subset or any(candidate not in candidates for candidate in candidate_subset):
@@ -236,6 +238,7 @@ def run_risk_sweep(
             "variance_moment_sweep.py",
             "variance_kl.py",
             "variance_moment_low_rank.py",
+            "distance_initialization.py",
             "evaluation.py",
             "models.py",
             "data.py",
@@ -393,6 +396,11 @@ def run_risk_sweep(
                     block_size=block_size,
                     **({"rank": candidate["rank"]} if "rank" in candidate else {}),
                     **({"moment_weight": candidate["lambda"]} if "lambda" in candidate else {}),
+                    **(
+                        {"initialization_cache": root / "initializations"}
+                        if method == "variance_moment_low_rank" and assignment_initialization == "distance"
+                        else {}
+                    ),
                 )
                 save_state(partition, artifact)
                 gc.collect()

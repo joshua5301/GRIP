@@ -153,3 +153,29 @@ def test_joint_sgd_matches_explicit_updates(momentum):
         momentum=momentum,
     )
     assert result["J_final"] == pytest.approx(best, abs=1e-10)
+
+
+def test_distance_partition_matches_comparison_and_chunked_backend(tmp_path):
+    x, q = example()
+    options = dict(rank=4, seed=2, steps=6, lr=0.01, initialization="distance")
+    reference = optimize_initialization(x, q, 6, 0.8, **options)
+    full = low_rank_partition(
+        x, q, 6, None, None, moment_weight=0.8, backend="full", initialization_cache=tmp_path, **options
+    )
+    chunked = low_rank_partition(
+        x,
+        q,
+        6,
+        None,
+        None,
+        moment_weight=0.8,
+        backend="chunked",
+        block_size=7,
+        initialization_cache=tmp_path,
+        **options,
+    )
+    assert full["J"] == pytest.approx(reference["J_final"], abs=1e-10)
+    assert chunked["J"] == pytest.approx(full["J"], abs=1e-10)
+    torch.testing.assert_close(chunked["x"], full["x"])
+    torch.testing.assert_close(chunked["y"], full["y"])
+    assert (tmp_path / "rank_4_cells_6_seed_2.pt").exists()

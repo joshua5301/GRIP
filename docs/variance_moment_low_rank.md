@@ -78,3 +78,26 @@ updates on the top settings. Use the initial run as shared_run to retain exact
 features and teacher logits. Larger budgets currently restart from the same seed;
 optimizer state continuation is not implemented. Compare stage winners by search
 validation and invoke final evaluation only on the winning stage.
+# Distance initialization across datasets
+
+`run_risk_sweep(..., assignment_initialization="distance")` supports the lambda
+objective on all configured datasets. It uses the same PCA, k-means++ seeding,
+20 Lloyd updates and balanced distance-logit factors as moment_initialization.
+Distance temperature is fixed at 1, with row-centered logits scaled to unit RMS.
+Only the initial factors encode distance: training optimizes free U,V jointly
+with Adam, without annealing or a fixed distance bias.
+
+Lloyd assignments are computed in blocks. The existing auto backend computes
+soft-assignment moments and gradients in blocks when N*K exceeds 2,000,000.
+This avoids storing the whole assignment matrix, but does not reduce the
+O(N*K) work per step. The blockwise gradient is the full objective gradient,
+not a minibatch approximation. Runtime can remain substantial on large graphs.
+
+Within each fingerprinted sweep directory, PCA projections are cached by rank
+and initial factors by rank/cell count/seed, shared across lambda values. Cache
+reuse makes partition_seconds exclude already cached preparation. Do not reuse
+an initialization cache directly with different input features. Source/data
+fingerprints isolate caches in the sweep API. Completed trials resume; interrupted
+individual condensations restart. All cache and temporary files stay under the
+configured output directory.
+
