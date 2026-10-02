@@ -533,6 +533,7 @@ def optimize_ce_assignment(
     outer_targets=None,
     inner_loss_weighting="mass",
     stop=lambda: False,
+    **mlp_initial_options,
 ):
     if not callable(stop):
         raise ValueError("stop must be callable")
@@ -570,8 +571,13 @@ def optimize_ce_assignment(
             "temperature_logits",
             "outer_targets",
             "stop",
+            "mlp_initial_options",
         )
     }
+    if set(mlp_initial_options) - {"mlp_initial_mass_schema", "mlp_initial_mass_source"}:
+        raise ValueError("Unknown MLP initial-mass control")
+    mlp_initial_mass_schema = mlp_initial_options.get("mlp_initial_mass_schema")
+    mlp_initial_mass_source = mlp_initial_options.get("mlp_initial_mass_source")
     if inner_loss_weighting == "mass":
         resume_config.pop("inner_loss_weighting")
     if outer_targets is not None:
@@ -637,7 +643,7 @@ def optimize_ce_assignment(
         )
     ):
         raise ValueError("Require positive finite solver settings and nonnegative steps")
-    if mass_mode not in ("free", "uniform") or balance_steps < 1 or (not 0 < balance_tol < 1):
+    if mass_mode not in ("free", "uniform", "initial") or balance_steps < 1 or (not 0 < balance_tol < 1):
         raise ValueError("Invalid mass constraint settings")
     if (
         balance_backend not in ("cached", "chunked")
@@ -660,10 +666,24 @@ def optimize_ce_assignment(
         )
     ):
         raise ValueError("Invalid tracking solver settings")
+    if mass_mode == "initial":
+        if (torch.get_default_dtype() != torch.float32
+                or type(mlp_initial_mass_schema) is not int or mlp_initial_mass_schema != 1
+                or assignment_input != "features" or assignment_encoder != "mlp"
+                or assignment_rank is None or inner_loss_weighting != "uniform"
+                or solver_mode != "exact" or node_weighting or temperature_logits is not None
+                or outer_targets is not None or outer_indices is not None or implicit_solver is not None
+                or inner_solver is not None or cache_assignment or save_assignment or not save_resume
+                or mixing != .05 or balance_backend != "chunked" or balance_steps != 5000
+                or balance_tol != 1e-8):
+            raise ValueError("Initial mass is an MLP-only fixed-P0 uniform-CE pilot with verifiable checkpoints")
+        resume_config.update(mlp_initial_mass_schema=1, mlp_initial_mass_source=mlp_initial_mass_source)
+    elif mlp_initial_mass_schema is not None or mlp_initial_mass_source is not None:
+        raise ValueError("MLP initial provenance controls require mass_mode='initial'")
     checkpoints = set(checkpoint_steps)
     if any((not isinstance(step, (int, np.integer)) or not 0 <= step <= steps for step in checkpoints)):
         raise ValueError("Checkpoint steps must be integers within the optimization budget")
-    if checkpoints:
+    if checkpoints or mass_mode == "initial":
         checkpoints.update((0, steps))
     snapshots = {}
     _check_assignment_stop(stop)
@@ -691,6 +711,20 @@ def optimize_ce_assignment(
     else:
         u, v = initialize_factors(assignment, clusters, assignment_rank, factor_seed)
         parameters = [u, v]
+    if mass_mode == "initial":
+        from src.mlp_initial_mass import original_context, validate_resume
+        mass_target, initial_mass_context, initial_parameters = original_context(
+            z, q, assignment, assignment_rank, encoder_hidden, factor_seed, mixing,
+            chunk_size, resume_config, mlp_initial_mass_source)
+        if [array_digest(p.detach().cpu().numpy()) for p in parameters] != [
+                array_digest(p.detach().cpu().numpy()) for p in initial_parameters]:
+            raise ValueError("Native initial MLP parameters differ from the source target derivation")
+        if resume_state is not None:
+            validate_resume(resume_state, z, q, assignment, mass_target, initial_mass_context,
+                            initial_parameters, steps, folder)
+        elif folder is not None and (Path(folder) / "checkpoints").exists() and any(
+                (Path(folder) / "checkpoints").glob("step_*.pt")):
+            raise ValueError("Initial-mass cached checkpoints require a verifiable resume state")
     if node_weighting:
         node_logits = z.new_zeros(len(z), dtype=torch.float32).requires_grad_()
         groups = [
@@ -768,6 +802,13 @@ def optimize_ce_assignment(
             moments = WeightedLowRankMoments.apply(
                 u, v, node_weights, assignment, material, mixing, chunk_size
             )
+        elif mass_mode == "initial":
+            from src.fixed_mass_assignment import FixedMassMoments
+            logits = LowRankLogits.apply(u, v, assignment, mixing, chunk_size)
+            moments, dual, diagnostic = FixedMassMoments.apply(
+                logits, material, mass_target, chunk_size, balance_steps, balance_tol, dual)
+            balance = dict(balance_iterations=int(diagnostic[0]), row_residual=float(diagnostic[1]),
+                           column_residual=float(diagnostic[2]))
         elif mass_mode == "uniform":
             if assignment_rank is not None:
                 logits = LowRankLogits.apply(u, v, assignment, mixing, chunk_size)
@@ -1012,6 +1053,10 @@ def optimize_ce_assignment(
                     weight_min=row["weight_min"],
                     weight_max=row["weight_max"],
                 )
+            if mass_mode == "initial":
+                from src.mlp_initial_mass import attach
+                snapshot["column_dual"] = dual.detach().cpu().clone()
+                attach(snapshot, mass_target, initial_mass_context, parameters)
             snapshots[step] = snapshot
             if folder is not None:
                 checkpoint_dir = folder / "checkpoints"
@@ -1041,6 +1086,9 @@ def optimize_ce_assignment(
                     best_dual=best_dual if save_assignment else None,
                 )
             )
+            if mass_mode == "initial":
+                from src.mlp_initial_mass import attach
+                attach(state, mass_target, initial_mass_context)
             if folder is not None:
                 torch.save(state, folder / "resume.tmp.pt")
                 (folder / "resume.tmp.pt").replace(folder / "resume.pt")
@@ -1072,6 +1120,8 @@ def optimize_ce_assignment(
             if log_temperature.grad is None or not bool(torch.isfinite(log_temperature.grad)):
                 raise FloatingPointError("Missing or nonfinite temperature gradient")
             row["log_temperature_gradient"] = float(log_temperature.grad)
+        if mass_mode == "initial" and any(p.grad is None or not bool(torch.isfinite(p.grad).all()) for p in parameters):
+            raise FloatingPointError("Missing or nonfinite constrained MLP gradient")
         _check_assignment_stop(stop)
         optimizer.step()
         row["backward_seconds"] = timestamp() - backward_start
