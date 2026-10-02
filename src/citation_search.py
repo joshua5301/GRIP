@@ -68,6 +68,9 @@ def _nystrom_inner_weighting(identity):
 def _candidate_nystrom_mass(candidate):
     """Preload validation; only balanced candidates gain effective controls."""
     candidate = dict(candidate)
+    if candidate.get("method") == "finite_student" or any(
+            isinstance(key, str) and key.startswith("finite_") for key in candidate):
+        raise ValueError("Finite-student controls are runtime-probe-only; run_screen/selected_test unsupported")
     if candidate.get("method") == "source_linear" or any(
             isinstance(key, str) and key.startswith(("source_linear", "assignment_coordinate")) for key in candidate):
         from src.source_linear_assignment import candidate_controls
@@ -711,6 +714,9 @@ def selected_test(root, choice, condensation_seeds=(0, 1, 2), student_seeds=(100
                   dropout=0.9, epochs=1000, data_dir="data", device="cuda", input_scale=1.0,
                   stop=lambda: False, report_routes=True, student_settings=None):
     """Test only a fixed configuration and checkpoint, with fresh student seeds."""
+    if choice.get("method") == "finite_student" or any(
+            isinstance(key, str) and key.startswith("finite_") for key in choice):
+        raise ValueError("Finite-student controls are runtime-probe-only; run_screen/selected_test unsupported")
     root = Path(root)
     root_config = json.loads((root / "config.json").read_text())
     if root_config.get("teacher_kernel") is not None:
