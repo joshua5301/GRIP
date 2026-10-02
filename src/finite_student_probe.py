@@ -37,15 +37,16 @@ from .finite_student_outer import (
     geom_uniform_initial,
 )
 
-SCHEMA = 1
+SCHEMA = 2
 ENGINE_SHA = "35c3457e4e1bc25ab140b7f634b956cd4d7202d7bcc40095fbdf6aa20e1eee00"
 ROOT_NAME = "19fccc37cc2f"
 REFERENCE_ID = "c24c1ffc2b76"
 _FIXED = dict(method="finite_student", width=0, lr=.05, T=.3, rank=32, penalty=.001,
               initialization="teacher_balanced", alpha=.3, inner_loss_weighting="uniform",
-              mass_mode="free", mixing=.05, finite_student_schema=1,
+              mass_mode="free", mixing=.05, finite_student_schema=2,
               finite_model_steps=5, finite_model_lr=.1, finite_model_hidden=256,
-              finite_model_seed=0, finite_model_weight_decay=.001)
+              finite_model_seed=0, finite_model_weight_decay=.001,
+              finite_graph_backend="dense_original_S", finite_native_policy="deterministic_cuda_v1")
 _SOURCE_FIELD = "finite_student_source_digest"
 _ROUTES = ("sgc_mlp", "gcn")
 
@@ -127,16 +128,37 @@ def canonical_candidate(candidate):
     return result
 
 
+def _runtime_precision_guard():
+    """Assert the frozen native policy without repairing changed runtime flags."""
+    _require(os.environ.get("CUBLAS_WORKSPACE_CONFIG") == ":4096:8"
+             and torch.are_deterministic_algorithms_enabled()
+             and not torch.is_deterministic_algorithms_warn_only_enabled()
+             and torch.get_float32_matmul_precision() == "highest"
+             and torch.get_default_dtype() == torch.float32
+             and not torch.is_autocast_enabled() and not torch.is_autocast_enabled("cpu")
+             and not torch.backends.cuda.matmul.allow_tf32 and not torch.backends.cudnn.allow_tf32,
+             "Finite deterministic CUDA precision/environment changed")
+
+
 def _native(device):
-    _require(device == "cuda" and torch.cuda.is_available() and torch.get_default_dtype() == torch.float32,
-             "First finite probe requires CUDA/nativeFP32/defaultFP32")
+    # Pin this in the fresh child environment before Python/CUDA initialization.
+    # Never attempt to repair a missing value after CUDA initialization.
+    _require(os.environ.get("CUBLAS_WORKSPACE_CONFIG") == ":4096:8",
+             "Set CUBLAS_WORKSPACE_CONFIG=:4096:8 before CUDA initialization")
+    _require(device == "cuda" and torch.get_default_dtype() == torch.float32,
+             "Finite probe requires CUDA/nativeFP32/defaultFP32")
     _require(not torch.is_autocast_enabled() and not torch.is_autocast_enabled("cpu"), "Finite probe forbids external AMP")
-    # This is the explicit fixed native precision policy, as in the existing
-    # source_linear worker branch; no caller-supplied precision option exists.
+    torch.use_deterministic_algorithms(True, warn_only=False)
+    torch.set_float32_matmul_precision("highest")
     torch.backends.cuda.matmul.allow_tf32 = False
     torch.backends.cudnn.allow_tf32 = False
+    _runtime_precision_guard()
+    _require(torch.cuda.is_available(), "Finite probe requires available CUDA")
     return dict(device=str(torch.device("cuda", torch.cuda.current_device())), GPU=torch.cuda.get_device_name(),
-                torch=str(torch.__version__), default_dtype=str(torch.get_default_dtype()), AMP=False, TF32=False)
+                torch=str(torch.__version__), cuda_runtime=str(torch.version.cuda), default_dtype=str(torch.get_default_dtype()),
+                AMP=False, TF32=False, deterministic_algorithms=True, deterministic_warn_only=False,
+                float32_matmul_precision="highest", CUBLAS_WORKSPACE_CONFIG=":4096:8",
+                finite_graph_backend="dense_original_S", finite_native_policy="deterministic_cuda_v1")
 
 
 def _scalar(value, message):
@@ -176,6 +198,21 @@ def _frozen_transform(transform):
             for key, value in vars(transform).items()}
 
 
+def _frozen_original_dense_S(original):
+    """Materialize existing CSR coefficients only; preserve the original graph."""
+    _require(torch.is_tensor(original) and original.layout == torch.sparse_csr
+             and original.dtype == torch.float32 and original.ndim == 2
+             and original.shape[0] == original.shape[1] and original.shape[0] > 0
+             and not original.requires_grad and bool(torch.isfinite(original.values()).all())
+             and bool((original.values() != 0).all()),
+             "Require frozen finite original FP32 CSR graph without explicit zeros")
+    dense = original.detach().to_dense().clone().contiguous()
+    _require(dense.device == original.device and dense.dtype == torch.float32 and not dense.requires_grad
+             and _seal(dense.to_sparse_csr()) == _seal(original),
+             "Dense graph differs from exact original CSR entries or zero edges")
+    return dense
+
+
 def _load_source(dataset, ratio, output_dir, candidate, condensation_seed, data_dir, device, citation_features, stop):
     repo = Path(__file__).resolve().parents[1]
     _require(dataset == "cora" and type(ratio) in (int, float) and ratio == .026
@@ -211,8 +248,10 @@ def _load_source(dataset, ratio, output_dir, candidate, condensation_seed, data_
              and z.shape == (2708, 1433) and q.shape == (2708, 7), "Original Cora70 source dimensions/partition changed")
     model_initial = geom_uniform_initial(1433, 7, hidden=256, dtype=torch.float32, device=device)
     u, v = initialize_factors(hard, 70, 32, 0)
+    original_S = graph["adj"]
+    dense_S = _frozen_original_dense_S(original_S)
     buffers = dict(z=z.detach(), q=q.detach(), h=h.float().detach(), hard=hard.detach(), transform=_frozen_transform(transform),
-                   x=graph["x"].detach(), S=graph["adj"].detach(), model_initial=model_initial, initial=[u.detach(), v.detach()],
+                   x=graph["x"].detach(), S=dense_S, original_S=original_S.detach(), model_initial=model_initial, initial=[u.detach(), v.detach()],
                    graph=graph, train=train, val=val[1], config=config, ghost=ghost, source=source, root=root, pins=pins)
     _checked_files(pins)
     _stop(stop)
@@ -294,16 +333,21 @@ def _context(candidate, buffers, environment, reference):
     return dict(schema=SCHEMA, candidate=candidate, numerical_source=numerical_source(), native_environment=environment,
                 implementation=implementation_provenance(),
                 dataset_config=buffers["config"], ghost_source=buffers["source"], source_pins=buffers["pins"],
-                source_buffers=_digest({key: buffers[key] for key in ("x", "S", "h", "q", "z", "hard", "transform")}),
+                source_buffers=_digest({key: buffers[key] for key in ("x", "S", "original_S", "h", "q", "z", "hard", "transform")}),
                 source_initial=_digest(buffers["initial"]), model_initial=_digest(buffers["model_initial"]), reference=reference,
                 factory_seed=0, outer_optimizer=dict(name="Adam", lr=.05, betas=[.9, .999], eps=1e-12, weight_decay=0, foreach=False, fused=False),
                 inner_policy=dict(name="functionalfullbatchSGD", steps=5, lr=.1, weight_decay=.001, all_parameters=True,
                                   hidden=256, dropout=0, identity_adjacency=True, uniform_CE=True, reset_every_P=True),
-                source_H_graph_S="independent original SciPyH /PyGgraphS; no equality/recompute claim",
+                graph_backend=dict(kind="dense_original_S", original_CSR=_digest(buffers["original_S"]),
+                                   runtime_dense_S=_digest(buffers["S"]), exact_CSR_roundtrip=True,
+                                   dtype=str(buffers["S"].dtype), device=str(buffers["S"].device),
+                                   normalization_or_synthesized_edges=False),
+                source_H_graph_S="independent original SciPyH /exactdenseoriginalPyGgraphS; no H equality/recompute claim",
                 own_J0_scale="positive frozen initial selected-route teacherCE", allowed_steps=[0, 1], student_fits=0)
 
 
 def _source_unchanged(context):
+    _runtime_precision_guard()
     from src.research_loop import implementation_provenance
     _require(numerical_source() == context["numerical_source"] and implementation_provenance() == context["implementation"],
              "Finite numerical source or recorded Git lineage changed")
@@ -311,6 +355,7 @@ def _source_unchanged(context):
 
 def _evaluate(buffers, candidate, context, parameters, step, scale, stop):
     _stop(stop)
+    _runtime_precision_guard()
     current = [parameter.detach().clone().requires_grad_(True) for parameter in parameters]
     moments = _moments(buffers, current)
     result = finite_student_outer_partials(moments, buffers["transform"], buffers["model_initial"],
@@ -555,4 +600,4 @@ def prepare_probe(dataset, ratio, output_dir, candidate, condensation_seed=0, da
                             finite_inner_model_steps_per_objective=5, finite_inner_objective_unrolls_this_invocation=2,
                             finite_inner_functional_SGD_steps_this_invocation=10, linear_head_or_CG_solves=0,
                             cached_source_reference_linear_certificate_gradient_checks=1),
-                caveat="Finite5SGD is not finalAdam/convergedhead; .001 active allparameterinnerWD vsreferenceλ1e-4; sourceH/S distinct; explicitouterAdamforeachFalse/fusedFalse differsfromlegacyreferencebackend; no full25 integration orpromotion.")
+                caveat="Finite5SGD is not finalAdam/convergedhead; .001 active allparameterinnerWD vsreferenceλ1e-4; sourceH/S distinct; explicitouterAdamforeachFalse/fusedFalse differsfromlegacyreferencebackend; schema2strictdeterministicdenseoriginalS; oldschema1incompatible; no full25 integration orpromotion.")
