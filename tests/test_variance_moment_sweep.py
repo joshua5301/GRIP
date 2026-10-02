@@ -34,19 +34,31 @@ def test_selection_averages_all_seed_pairs_and_ignores_test():
 
 
 @pytest.mark.parametrize(
-    "dataset,ratio,kernel,dropout,cells",
-    [("cora", 0.013, "relu", 0.9, 35), ("citeseer", 0.009, "erf", 0.5, 30)],
+    "dataset,ratio,kernel,dropout,cells,inductive",
+    [
+        ("cora", 0.013, "relu", 0.9, 35, False),
+        ("citeseer", 0.009, "erf", 0.5, 30, False),
+        ("arxiv", 0.0005, "relu", 0.5, 90, False),
+        ("flickr", 0.001, "relu", 0.5, 44, True),
+        ("reddit", 0.0005, "erf", 0.5, 77, True),
+    ],
 )
 def test_sweep_uniform_evaluation_selection_and_restart(
-    tmp_path, monkeypatch, dataset, ratio, kernel, dropout, cells
+    tmp_path, monkeypatch, dataset, ratio, kernel, dropout, cells, inductive
 ):
-    h = torch.arange(80, dtype=torch.float32).reshape(40, 2)
-    graph = dict(x=h, y=torch.arange(40) % 2, adj=torch.eye(40).to_sparse_csr())
-    train, val, test = (torch.arange(40) < 10), (torch.arange(40) == 10), (torch.arange(40) > 10)
+    h = torch.arange(320, dtype=torch.float32).reshape(160, 2)
+    graph = dict(x=h, y=torch.arange(160) % 2, adj=torch.eye(160).to_sparse_csr())
+    train, val, test = (torch.arange(160) < 10), (torch.arange(160) == 10), (torch.arange(160) > 10)
+    val_graph, test_graph = graph, graph
+    if inductive:
+        train = torch.ones(160, dtype=torch.bool)
+        val_graph = dict(x=h[:6] + 1000, y=graph["y"][:6], adj=torch.eye(6).to_sparse_csr())
+        test_graph = dict(x=h[:8] + 2000, y=graph["y"][:8], adj=torch.eye(8).to_sparse_csr())
+        val, test = None, None
 
     def prepare(name, *args):
         assert name == dataset
-        return graph, train, (graph, val), (graph, test), h
+        return graph, train, (val_graph, val), (test_graph, test), h
 
     monkeypatch.setattr(experiment, "_prepare_dataset", prepare)
     solves, fits = [], []
@@ -72,8 +84,14 @@ def test_sweep_uniform_evaluation_selection_and_restart(
         assert kind == kernel
         return x.double()
 
+    def kernel_values(a, b, kind):
+        assert kind == kernel
+        assert b.max() <= h.max()
+        return torch.exp(-torch.cdist(a, b).square())
+
     teacher = dict(
         get_kernel_features=features,
+        get_kernel_values=kernel_values,
         fit_logistic=lambda x, y, gamma: torch.zeros(x.shape[1], y.shape[1], dtype=x.dtype),
     )
     monkeypatch.setattr(
@@ -91,6 +109,12 @@ def test_sweep_uniform_evaluation_selection_and_restart(
         if path.exists():
             return json.loads(path.read_text())
         assert kwargs["dropout"] == dropout
+        if inductive:
+            assert masks["train"][0] is graph and masks["val"][0] is val_graph
+            if "test" in masks:
+                assert masks["test"][0] is test_graph
+        else:
+            assert masks["val"] is val
         torch.testing.assert_close(mass / mass.sum(), torch.full_like(mass, 1 / len(mass)))
         B = round(float(x[0, 0]), 1)
         condensation_seed = int(folder.parent.name.split("_")[1])
@@ -118,6 +142,7 @@ def test_sweep_uniform_evaluation_selection_and_restart(
     assert summary.iloc[0].dataset == dataset and summary.iloc[0].nodes == cells
     config = json.loads((root / "config.json").read_text())
     assert config["teacher_kernel"] == kernel
+    assert config["protocol"] == ("inductive" if inductive else "transductive")
     assert summary.iloc[0].B == 1
     assert len(solves) == 6 and len(fits) == 18
     assert all(B == 1 and seed >= 100 for B, _, seed, testing in fits if testing)
@@ -130,3 +155,37 @@ def test_sweep_uniform_evaluation_selection_and_restart(
     repeated = run(**options)
     assert repeated[-1] == root and before == (len(fits), len(solves))
     pd.testing.assert_frame_equal(summary, repeated[0])
+
+
+def test_inductive_teacher_uses_training_anchors_and_shared_mapping():
+    h = torch.tensor([[0.0], [1.0], [2.0]], dtype=torch.double)
+    graph = dict(x=h)
+    val_graph = dict(
+        x=torch.tensor([[4.0], [5.0]], dtype=torch.double), adj=torch.eye(2).to_sparse_csr().double()
+    )
+    calls = []
+
+    def kernel(a, b, kind):
+        calls.append((a.clone(), b.clone()))
+        return torch.exp(-torch.cdist(a, b).square())
+
+    phi, val_phi = experiment._teacher_features(
+        h, graph, (val_graph, None), {"get_kernel_values": kernel}, "relu", 3
+    )
+    gram = torch.exp(-torch.cdist(h, h).square())
+    chol = torch.linalg.cholesky(gram + 1e-8 * torch.eye(3, dtype=h.dtype))
+    expected = torch.linalg.solve_triangular(
+        chol, torch.exp(-torch.cdist(val_graph["x"], h).square()).T, upper=False
+    ).T
+    torch.testing.assert_close(val_phi, expected)
+    torch.testing.assert_close(phi @ phi.T, gram, atol=1e-7, rtol=1e-7)
+    assert all(torch.equal(anchors, h) for _, anchors in calls)
+
+
+def test_digest_includes_inductive_validation_graph():
+    graph = dict(x=torch.ones(3, 2), y=torch.zeros(3, dtype=torch.long), adj=torch.eye(3).to_sparse_csr())
+    validation = {key: value.clone() for key, value in graph.items()}
+    splits = dict(train=(graph, None), val=(validation, None))
+    before = experiment._data_digest(splits)
+    validation["x"][0, 0] += 1
+    assert before != experiment._data_digest(splits)

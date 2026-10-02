@@ -1,4 +1,4 @@
-# Historical variance-moment grid: Cora and Citeseer
+# Historical variance-moment grid
 
 `src.variance_moment_sweep.run_risk_sweep` runs one density per session. Select
 `dataset="cora"` with ratio 0.013 (35 representatives), 0.026 (70), or 0.052 (140),
@@ -53,3 +53,35 @@ Do not let two sessions write to the same density/run concurrently.
 
 Tests are in `tests/test_variance_moment_sweep.py`, intended for Colab. No local
 training or numerical smoke tests are required.
+
+## Flickr, Reddit and Arxiv
+
+The same `run_risk_sweep` supports `dataset="flickr"`, `"reddit"` and `"arxiv"`.
+Use three sessions, each selecting one column of this table, and run its three
+dataset/density pairs sequentially:
+
+| Dataset | Session 0 | Session 1 | Session 2 |
+| --- | --- | --- | --- |
+| Flickr | 0.001 / 44 nodes | 0.005 / 223 nodes | 0.01 / 446 nodes |
+| Reddit | 0.0005 / 77 nodes | 0.001 / 153 nodes | 0.002 / 307 nodes |
+| Arxiv | 0.0005 / 90 nodes | 0.0025 / 454 nodes | 0.005 / 909 nodes |
+
+Each uses gamma `[0.001, 0.01, 0.1, 1]`, T `[0.2, 0.5, 1, 2]`, B
+`[0.1, 0.3, 1, 3, 10]`, and fixed GCN dropout 0.5. The teacher kernel is ReLU
+for Flickr/Arxiv and erf for Reddit. The other settings and selection protocol
+are unchanged. Per session this is 720 condensations, 2160 search GCN fits and
+90 final GCN fits. All 80 candidates use all nine search seed pairs; no pruning
+or teacher-accuracy preselection is applied.
+
+Flickr and Reddit use the existing inductive data loader: only their training
+graphs supply condensation features, teacher fitting labels and kernel anchors.
+Validation features propagate on the separate validation graph and use the same
+training-anchor kernel mapping. Teacher caches store training and validation
+logits. Student validation and final testing run on their respective separate
+graphs; search evaluation receives no test split. Arxiv is transductive and
+retains its original train/validation/test masks on the shared graph.
+
+Graph fingerprints include each separate graph and mask. Use a distinct dataset
+subdirectory under the results root; session aggregate CSVs and temporary folders
+must also have different session names. As before, changed runner code changes
+the run fingerprint; completed files in older run folders are retained.

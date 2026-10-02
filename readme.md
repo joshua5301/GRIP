@@ -237,3 +237,6 @@ the previous `run_cora_risk_sweep` name remains supported.
 All three condensation seeds select one common setting through uniform-CE GCN
 validation. Completed condensations and student fits are cached; only the winner
 receives final test evaluation. See [the protocol](docs/variance_moment_sweep.md).
+The runner also supports Flickr, Reddit and Arxiv. Inductive Flickr/Reddit use
+training-only teacher anchors and separate validation/test graphs. Three sessions
+can each process one density per dataset, with separate result and temporary paths.

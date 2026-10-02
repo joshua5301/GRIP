@@ -65,6 +65,53 @@ def _select(search):
     return search.sort_values(["search_val", "candidate"], ascending=[False, True]).iloc[0].to_dict()
 
 
+def _data_digest(splits):
+    graphs, result = {}, {}
+    for name, (graph, mask) in splits.items():
+        key = id(graph)
+        if key not in graphs:
+            adjacency = graph["adj"]
+            graphs[key] = array_digest(
+                *[
+                    value.cpu().numpy()
+                    for value in (
+                        graph["x"],
+                        graph["y"],
+                        adjacency.crow_indices(),
+                        adjacency.col_indices(),
+                        adjacency.values(),
+                    )
+                ]
+            )
+        result[name] = dict(
+            graph=graphs[key], mask=None if mask is None else array_digest(mask.cpu().numpy())
+        )
+    return _fingerprint(result)
+
+
+def _teacher_features(h, graph, validation, teacher, kernel, basis):
+    val_graph, mask = validation
+    if val_graph is graph:
+        phi = teacher["get_kernel_features"](h, kernel, basis)
+        return phi, phi[mask]
+    x = h.double()
+    anchors = x if basis >= len(x) else x[torch.randperm(len(x))[:basis]]
+    values = teacher["get_kernel_values"]
+    gram = values(anchors, anchors, kernel)
+    gram = (gram + gram.T) / 2
+    eye = torch.eye(len(anchors), dtype=x.dtype, device=x.device)
+    chol = torch.linalg.cholesky(gram + 1e-8 * gram.diagonal().mean() * eye)
+    mapping = torch.linalg.solve_triangular(chol, eye, upper=False).T
+
+    def project(features):
+        return torch.cat(
+            [values(block.double(), anchors, kernel) @ mapping for block in features.split(8192)]
+        )
+
+    val_h = torch.sparse.mm(val_graph["adj"], torch.sparse.mm(val_graph["adj"], val_graph["x"]))
+    return project(x), project(val_h if mask is None else val_h[mask])
+
+
 def run_risk_sweep(
     ratio,
     output_dir,
@@ -86,13 +133,14 @@ def run_risk_sweep(
     device="cuda",
     dataset="cora",
 ):
-    if dataset not in ("cora", "citeseer") or (dataset, ratio) not in BUDGET:
-        raise ValueError("Use a configured Cora or Citeseer ratio")
-    kernel = "relu" if dataset == "cora" else "erf"
+    if (dataset, ratio) not in BUDGET:
+        raise ValueError("Use a configured dataset and ratio")
+    kernel = "erf" if dataset in ("citeseer", "reddit") else "relu"
     if dropout is None:
         dropout = 0.9 if dataset == "cora" else 0.5
     if space is None:
-        space = dict(DEFAULT_SPACE, B=DEFAULT_SPACE["B"] if dataset == "cora" else [0.03, 0.1, 0.3, 1.0, 3.0])
+        bounds = {"cora": DEFAULT_SPACE["B"], "citeseer": [0.03, 0.1, 0.3, 1.0, 3.0]}
+        space = dict(DEFAULT_SPACE, B=bounds.get(dataset, [0.1, 0.3, 1.0, 3.0, 10.0]))
     if set(space) != {"gamma", "T", "B"}:
         raise ValueError("Use grid keys gamma, T, B")
     candidates = grid_rows(space)
@@ -112,21 +160,12 @@ def run_risk_sweep(
     sources, modules = _load_reference()
     solver, teacher = modules["risk_partition"]["risk_partition"], modules["teacher"]
     graph, train, validation, testing, h = _prepare_dataset(dataset, data_dir, device)
-    masks = dict(train=train, val=validation[1], test=testing[1])
-    adjacency = graph["adj"]
-    data_digest = array_digest(
-        *[
-            value.cpu().numpy()
-            for value in (
-                graph["x"],
-                graph["y"],
-                adjacency.crow_indices(),
-                adjacency.col_indices(),
-                adjacency.values(),
-                *masks.values(),
-            )
-        ]
-    )
+    splits = dict(train=(graph, train), val=validation, test=testing)
+    inductive = validation[0] is not graph
+    masks = splits if inductive else {name: split[1] for name, split in splits.items()}
+    data_digest = _data_digest(splits)
+    val_graph, val_mask = validation
+    val_labels = val_graph["y"] if val_mask is None else val_graph["y"][val_mask]
     settings = dict(
         epochs=epochs,
         eval_every=eval_every,
@@ -164,6 +203,7 @@ def run_risk_sweep(
         basis=basis,
         teacher_seed=teacher_seed,
         teacher_kernel=kernel,
+        protocol="inductive" if inductive else "transductive",
         student=settings,
         loss_weighting="uniform",
         layers=2,
@@ -185,29 +225,30 @@ def run_risk_sweep(
 
     teacher_dir = root / "teachers"
     teacher_dir.mkdir(exist_ok=True)
-    logits, teacher_rows, phi = {}, [], None
+    logits, teacher_rows, phi, val_phi, weights = {}, [], None, None, None
     for gamma in tqdm(list(dict.fromkeys(space["gamma"])), desc="Teacher gamma cache"):
         path = teacher_dir / f"{_fingerprint(dict(gamma=gamma))}.pt"
         if path.exists():
-            scores = torch.load(path, map_location=device, weights_only=True)
+            saved = torch.load(path, map_location=device, weights_only=True)
+            scores, val_scores = saved["logits"], saved["validation_logits"]
         else:
             if phi is None:
                 seed_everything(teacher_seed)
-                phi = teacher["get_kernel_features"](h, kernel, basis)
+                phi, val_phi = _teacher_features(h, graph, validation, teacher, kernel, basis)
             targets = F.one_hot(graph["y"][train], int(graph["y"].max()) + 1).to(phi)
             weights = teacher["fit_logistic"](phi[train], targets, gamma)
             scores = (phi @ weights).detach()
-            save_state(scores, path)
+            val_scores = (val_phi @ weights).detach()
+            save_state(dict(logits=scores, validation_logits=val_scores), path)
         logits[gamma] = scores
         teacher_rows.append(
             dict(
                 gamma=gamma,
-                val_acc=100
-                * float((scores[masks["val"]].argmax(1) == graph["y"][masks["val"]]).double().mean()),
-                val_ce=float(F.cross_entropy(scores[masks["val"]], graph["y"][masks["val"]])),
+                val_acc=100 * float((val_scores.argmax(1) == val_labels).double().mean()),
+                val_ce=float(F.cross_entropy(val_scores, val_labels)),
             )
         )
-    del phi
+    del phi, val_phi, weights
     write_table(pd.DataFrame(teacher_rows), root / "teacher_grid.csv")
 
     rows, diagnostics = [], []
