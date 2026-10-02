@@ -43,3 +43,22 @@ Completed condensation trials and student runs are cached, so rerunning the
 same cell skips them. Interrupted individual condensations restart from step 0;
 there is no optimizer-state resume within a trial. This is a full-matrix small
 graph experiment, not a scalable Flickr/Reddit implementation.
+
+## Distance initialization with alternating updates
+
+Set `optimizer_comparison=True` to run distance_joint, distance_alternating,
+annealed_joint and annealed_alternating instead of the random/multistart arms.
+All four use the same projected features and distance initialization per seed.
+`block_steps=50` alternates 50 Adam updates of U with V frozen, then 50 of V
+with U frozen. Separate Adam states persist between blocks. Cell moments are
+recomputed and differentiated at every update. This is fixed-block coordinate
+Adam, not a converged block solve or closed-form ALS; unlike the earlier
+moment_alternating experiment, it has no block rollback or early block stopping.
+This isolates the update schedule without introducing block acceptance rules
+for the changing entropy objective.
+
+Each arm uses the same total gradient-step budget and global-step entropy
+schedule. Joint steps update both factors; alternating steps update one, so
+per-factor update counts differ. Report wall time as well as update count.
+All four return the minimum unregularized J, not the minimum annealed objective.
+Completed trials are cached; changing code or settings creates a new run hash.

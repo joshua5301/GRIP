@@ -74,7 +74,11 @@ def optimize_initialization(
     temperature=1.0,
     entropy_fraction=0.0,
     anneal_fraction=0.8,
+    optimizer_mode="joint",
+    block_steps=50,
 ):
+    if optimizer_mode not in ("joint", "alternating") or block_steps < 1:
+        raise ValueError("Invalid optimizer mode or block length")
     if initialization not in ("random", "distance") or not 0 < anneal_fraction < 1:
         raise ValueError("Invalid initialization or annealing schedule")
     if (
@@ -101,10 +105,19 @@ def optimize_initialization(
         projected = project_features(x, rank) if projected is None else projected
         u, v = distance_factors(projected, cells, rank, seed, temperature)
     u, v = torch.nn.Parameter(u), torch.nn.Parameter(v)
-    optimizer = torch.optim.Adam([u, v], lr=lr)
+    optimizers = (
+        [torch.optim.Adam([u, v], lr=lr)]
+        if optimizer_mode == "joint"
+        else [torch.optim.Adam([u], lr=lr), torch.optim.Adam([v], lr=lr)]
+    )
     energy, original = x.square().sum(1).mean(), x.T @ q / n
     history, best, best_stats, beta0 = [], math.inf, None, None
     for step in range(steps + 1):
+        active = (step // block_steps) % 2
+        u.requires_grad_(optimizer_mode == "joint" or active == 0)
+        v.requires_grad_(optimizer_mode == "joint" or active == 1)
+        parameters = [u, v] if optimizer_mode == "joint" else ([u] if active == 0 else [v])
+        optimizer = optimizers[0 if optimizer_mode == "joint" else active]
         optimizer.zero_grad(set_to_none=True)
         logp = (u @ v.T / rank**0.5).log_softmax(1)
         p = logp.exp()
@@ -133,13 +146,14 @@ def optimize_initialization(
                 best_J=best,
                 entropy=float(entropy.detach()),
                 beta=beta,
+                next_update="UV" if optimizer_mode == "joint" else ("U" if active == 0 else "V"),
                 seconds=perf_counter() - started,
             )
         )
         if step == steps:
             break
         (smooth - beta * entropy).backward()
-        if not all(bool(torch.isfinite(t.grad).all()) for t in (u, v)):
+        if not all(bool(torch.isfinite(t.grad).all()) for t in parameters):
             raise FloatingPointError(f"Nonfinite gradient at step {step}")
         optimizer.step()
     mass, sx, sq = best_stats
@@ -157,6 +171,7 @@ def optimize_initialization(
         history=history,
         seed=seed,
         initialization=initialization,
+        optimizer_mode=optimizer_mode,
     )
 
 
@@ -173,6 +188,8 @@ def run_initialization_comparison(
     anneal_fraction=0.8,
     data_dir="/content/data/",
     device="cuda",
+    optimizer_comparison=False,
+    block_steps=50,
 ):
     if starts < 2 or len(set(condensation_seeds)) != len(condensation_seeds):
         raise ValueError("Require multiple starts and distinct condensation seeds")
@@ -209,6 +226,8 @@ def run_initialization_comparison(
         temperature=temperature,
         entropy_fraction=entropy_fraction,
         anneal_fraction=anneal_fraction,
+        optimizer_comparison=optimizer_comparison,
+        block_steps=block_steps,
         h_digest=feature_config["h_digest"],
         q_digest=array_digest(q.cpu().numpy()),
         torch=str(torch.__version__),
@@ -249,15 +268,25 @@ def run_initialization_comparison(
     masks = dict(train=train, val=validation[1], test=test[1])
     seed_set = set(condensation_seeds)
     for seed in tqdm(condensation_seeds, desc="Initialization comparison"):
-        trials = []
-        for restart in range(starts):
-            trial_seed = seed if restart == 0 else 1_000_000 + seed * starts + restart
-            if restart and trial_seed in seed_set:
-                raise ValueError("Restart seed overlaps a baseline seed")
-            trials.append((f"random_{restart}", trial_seed, "random", 0.0))
-        trials += [("distance", seed, "distance", 0.0), ("annealed", seed, "distance", entropy_fraction)]
+        if optimizer_comparison:
+            trials = [
+                (f"{name}_{mode}", seed, "distance", entropy, mode)
+                for name, entropy in (("distance", 0.0), ("annealed", entropy_fraction))
+                for mode in ("joint", "alternating")
+            ]
+        else:
+            trials = []
+            for restart in range(starts):
+                trial_seed = seed if restart == 0 else 1_000_000 + seed * starts + restart
+                if restart and trial_seed in seed_set:
+                    raise ValueError("Restart seed overlaps a baseline seed")
+                trials.append((f"random_{restart}", trial_seed, "random", 0.0, "joint"))
+            trials += [
+                ("distance", seed, "distance", 0.0, "joint"),
+                ("annealed", seed, "distance", entropy_fraction, "joint"),
+            ]
         outcomes = {}
-        for name, trial_seed, initialization, entropy in trials:
+        for name, trial_seed, initialization, entropy, mode in trials:
             folder = root / f"seed_{seed}" / name
             folder.mkdir(parents=True, exist_ok=True)
             path = folder / "condensed.pt"
@@ -265,7 +294,14 @@ def run_initialization_comparison(
                 result = torch.load(path, map_location="cpu", weights_only=True)
             else:
                 result = optimize_initialization(
-                    h, q, seed=trial_seed, initialization=initialization, entropy_fraction=entropy, **options
+                    h,
+                    q,
+                    seed=trial_seed,
+                    initialization=initialization,
+                    entropy_fraction=entropy,
+                    optimizer_mode=mode,
+                    block_steps=block_steps,
+                    **options,
                 )
                 save_state(result, path)
             outcomes[name] = result
@@ -278,12 +314,20 @@ def run_initialization_comparison(
                 )
             )
             histories.extend(dict(condensation_seed=seed, trial=name, **row) for row in result["history"])
-        winner = min(range(starts), key=lambda k: outcomes[f"random_{k}"]["J_final"])
-        methods = dict(
-            random=outcomes["random_0"],
-            distance=outcomes["distance"],
-            annealed=outcomes["annealed"],
-            multistart=outcomes[f"random_{winner}"],
+        winner = (
+            None
+            if optimizer_comparison
+            else min(range(starts), key=lambda k: outcomes[f"random_{k}"]["J_final"])
+        )
+        methods = (
+            outcomes
+            if optimizer_comparison
+            else dict(
+                random=outcomes["random_0"],
+                distance=outcomes["distance"],
+                annealed=outcomes["annealed"],
+                multistart=outcomes[f"random_{winner}"],
+            )
         )
         for method, result in methods.items():
             seconds = (
