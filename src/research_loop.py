@@ -37,6 +37,9 @@ def dispatch(job, stop):
         ranking, root = run_screen(**options, stop=stop)
         return dict(root=str(root.resolve()), ranking=ranking.to_dict("records"),
                     validation_only=True)
+    if job["kind"] == "citation_source_linear_probe":
+        from src.source_linear_assignment import prepare_probe
+        return prepare_probe(**options, stop=stop)
     if job["kind"] == "citation_mlp_centered_probe":
         from src.mlp_source_centering import prepare_probe
         return prepare_probe(**job["options"], stop=stop)

@@ -39,6 +39,10 @@ def fixed_propagated_features(h, config, root):
 
 
 def _assignment_mass_mode(identity):
+    if identity.get("method") == "source_linear":
+        from src.source_linear_assignment import candidate_controls
+        candidate_controls(identity)
+        return "free"
     if "mass_mode" in identity and identity["method"] not in ("low_rank", "mlp", "nystrom"):
         raise ValueError("mass_mode is supported only by low_rank, mlp and nystrom assignments")
     mode = identity.get("mass_mode", "free")
@@ -64,6 +68,10 @@ def _nystrom_inner_weighting(identity):
 def _candidate_nystrom_mass(candidate):
     """Preload validation; only balanced candidates gain effective controls."""
     candidate = dict(candidate)
+    if candidate.get("method") == "source_linear" or any(
+            isinstance(key, str) and key.startswith(("source_linear", "assignment_coordinate")) for key in candidate):
+        from src.source_linear_assignment import candidate_controls
+        return candidate_controls(candidate)
     if set(candidate) & {"mlp_output_centering", "mlp_source_centering_schema", "mlp_source_centering_source_digest"}:
         from src.mlp_source_centering import candidate_controls
         return candidate_controls(candidate)
@@ -319,6 +327,18 @@ def run_screen(dataset, ratio, output_dir, candidates, steps=50,
                epochs=500, data_dir="data", device="cuda", checkpoints=None, input_scale=1.0,
                citation_features="default", stop=lambda: False, student_settings=None,
                report_routes=False, teacher_kernel="relu", teacher_backend=None, initialization_source=None):
+    from src.source_linear_assignment import active as source_linear_active
+    from src.source_linear_assignment import candidate_controls as source_linear_controls
+    if any(source_linear_active(candidate) for candidate in candidates):
+        from src.source_linear_assignment import native_environment
+        native_environment()
+        for candidate in candidates:
+            source_linear_controls(candidate)
+        if teacher_backend is not None or initialization_source is not None or teacher_kernel != "relu" or len(candidates) != 1:
+            raise ValueError("Source linear requires one candidate with its original ReLU source")
+        if type(steps) is not int or steps not in (0, 1, 25) or any(
+                type(step) is not int or step not in (0, 1, 25) or step > steps for step in (checkpoints or [])):
+            raise ValueError("Source linear supports original0, probe1 and fixed25 only")
     if teacher_backend is not None or initialization_source is not None or any(
             set(candidate) & {"teacher_backend", "initialization_source", "teacher_type", "initialization_policy",
                               "gcn_teacher_epochs", "gcn_teacher_seed"} for candidate in candidates):
@@ -371,6 +391,21 @@ def run_screen(dataset, ratio, output_dir, candidates, steps=50,
         selected, config, (_, frozen_inputs, pinned_assignment), _ = validate_root(
             root, graph, train, validation, h, stop=stop)
         logits, gamma = selected["logits"].to(device).double(), None
+    elif candidates[0].get("method") == "source_linear":
+        from src.source_linear_assignment import cached_source as linear_cached_source
+        from src.source_linear_assignment import validate_folder as linear_validate_folder
+        root = source_root
+        if not (root / "teacher.pt").is_file():
+            raise ValueError("Source linear requires its prepared immutable ReLU teacher")
+        teacher = torch.load(root / "teacher.pt", map_location=device, weights_only=False)
+        if not isinstance(teacher, dict) or not torch.is_tensor(teacher.get("logits")):
+            raise ValueError("Malformed original source-linear teacher")
+        logits = teacher["logits"]
+        current_q = training_refined_targets(logits, candidates[0]["T"], graph["y"], train, 0)
+        h, frozen_z, frozen_transform, frozen_assignment, source_coordinates, linear_source = linear_cached_source(
+            root, candidates[0], condensation_seed, h, current_q, config)
+        linear_validate_folder(root, candidates[0], condensation_seed, frozen_z, current_q,
+                               frozen_assignment, source_coordinates, linear_source, steps)
     elif teacher_kernel == "relu" and candidates[0].get("method") == "mlp" and (candidates[0].get("mass_mode") == "initial" or candidates[0].get("mlp_output_centering") == "source_mean_v1"):
         from src.mlp_initial_mass import cached_source, validate_folder
         if candidates[0].get("mlp_output_centering") == "source_mean_v1":
@@ -403,7 +438,9 @@ def run_screen(dataset, ratio, output_dir, candidates, steps=50,
                                            val_mask=validation[1], val_labels=val_labels, device=device, stop=stop)
         logits, gamma = selected["logits"].to(device), selected["gamma"]
     inputs_path = root / f"inputs_{condensation_seed}.pt"
-    if candidates[0].get("method") == "mlp" and (candidates[0].get("mass_mode") == "initial" or candidates[0].get("mlp_output_centering") == "source_mean_v1"):
+    if candidates[0].get("method") == "source_linear":
+        z, transform, assignment = frozen_z, frozen_transform, frozen_assignment
+    elif candidates[0].get("method") == "mlp" and (candidates[0].get("mass_mode") == "initial" or candidates[0].get("mlp_output_centering") == "source_mean_v1"):
         z, transform, assignment = frozen_z, frozen_transform, frozen_assignment
     elif teacher_backend is not None:
         z = frozen_inputs["z"].to(device)
@@ -459,6 +496,9 @@ def run_screen(dataset, ratio, output_dir, candidates, steps=50,
                                          condensation_seed=condensation_seed, device=device, h=h, q=current_q)
         if identity["method"] == "mlp" and (mass_mode == "initial" or identity.get("mlp_output_centering") == "source_mean_v1"):
             validate_folder(root, identity, condensation_seed, z, current_q, frozen_assignment, mlp_source, steps)
+        if identity["method"] == "source_linear":
+            linear_validate_folder(root, identity, condensation_seed, z, current_q,
+                                   frozen_assignment, source_coordinates, linear_source, steps)
         if teacher_backend is not None:
             from src.citation_gcn_teacher import validate_condensation
             current_q = training_refined_targets(logits, identity["T"], graph["y"], train, 0)
@@ -468,7 +508,7 @@ def run_screen(dataset, ratio, output_dir, candidates, steps=50,
         q = training_refined_targets(logits, identity["T"], graph["y"], train,
                                      identity.get("train_target_mix", 0.0))
         assignment = feature_assignment
-        if teacher_backend is None and identity.get("initialization", "feature") != "feature":
+        if teacher_backend is None and identity["method"] != "source_linear" and identity.get("initialization", "feature") != "feature":
             from src.partition_initialization import teacher_aware_kmeans, teacher_balanced_kmeans
             init_config = dict(mode=identity["initialization"], alpha=identity.get("alpha", 1.0),
                                T=identity["T"], seed=condensation_seed)
@@ -529,6 +569,11 @@ def run_screen(dataset, ratio, output_dir, candidates, steps=50,
                     seed=condensation_seed, mass_scaling=identity.get("mass_scaling", False),
                     inner_loss_weighting=identity.get("inner_loss_weighting", "mass"),
                     folder=folder, checkpoint_steps=checks, resume_state=state, stop=stop)
+            elif identity["method"] == "source_linear":
+                from src.source_linear_assignment import citation_core_kwargs
+                optimize_ce_assignment(z, q, assignment, steps=steps, folder=folder, checkpoint_steps=checks,
+                    resume_state=state, stop=stop,
+                    **citation_core_kwargs(identity, condensation_seed, source_coordinates, linear_source))
             else:
                 if identity["method"] not in ("low_rank", "mlp"):
                     raise ValueError("Unknown assignment method")
@@ -585,6 +630,9 @@ def run_screen(dataset, ratio, output_dir, candidates, steps=50,
                                            q=q if mass_mode == "initial" or identity.get("surrogate_kernel") is not None else None)
             if identity["method"] == "mlp" and (mass_mode == "initial" or identity.get("mlp_output_centering") == "source_mean_v1"):
                 validate_folder(root, identity, condensation_seed, z, q, assignment, mlp_source, steps, snapshot)
+            if identity["method"] == "source_linear":
+                linear_validate_folder(root, identity, condensation_seed, z, q, assignment,
+                                       source_coordinates, linear_source, steps, snapshot)
             temperature_diagnostic = (_temperature_diagnostics(snapshot, state, step)
                                       if identity.get("learn_temperature", False) else {})
             if identity["method"] == "coarsening":
@@ -635,7 +683,7 @@ def run_screen(dataset, ratio, output_dir, candidates, steps=50,
     keys = ["method", "width", "lr", "T", "rank", "penalty", "step", "candidate_path"]
     keys += [key for key in ("initialization", "alpha", "inner_loss_weighting", "mass_mode", "mass_scaling",
                             "metric_input", "metric_alpha", "strength", "train_target_mix", "mixing",
-                            "learn_temperature", "temperature_lr", "balance_steps", "balance_tol", "balance_backend", "initial_mass_schema", "mlp_initial_mass_schema", "mlp_initial_mass_source_digest", "mlp_output_centering", "mlp_source_centering_schema", "mlp_source_centering_source_digest", "surrogate_kernel", "surrogate_schema", "surrogate_source_digest",
+                            "learn_temperature", "temperature_lr", "balance_steps", "balance_tol", "balance_backend", "initial_mass_schema", "mlp_initial_mass_schema", "mlp_initial_mass_source_digest", "mlp_output_centering", "mlp_source_centering_schema", "mlp_source_centering_source_digest", "assignment_coordinates", "source_linear_schema", "source_linear_source_digest", "surrogate_kernel", "surrogate_schema", "surrogate_source_digest",
                             "ntk_angle_guard", "ntk_norm_guard", "ntk_jitter") if key in frame.columns]
     keys += ["dropout", "input_scale", "epochs", "student_recipe"]
     grouped = frame.groupby(keys, dropna=False)
@@ -672,6 +720,15 @@ def selected_test(root, choice, condensation_seeds=(0, 1, 2), student_seeds=(100
     # Validate every supplied non-null kernel control before the row whitelist.
     raw = {key: value for key, value in choice.items() if pd.notna(value)}
     _candidate_surrogate(raw)
+    if raw.get("method") == "source_linear" or any(
+            key.startswith(("source_linear", "assignment_coordinate")) for key in raw):
+        from src.source_linear_assignment import candidate_controls
+        metadata = {"step", "candidate_path", "dropout", "input_scale", "epochs", "student_recipe", "mean", "std", "count",
+                    "gcn_val_acc_mean", "gcn_val_acc_std", "mlp_val_acc_mean", "mlp_val_acc_std",
+                    "gcn_val_ce_mean", "gcn_val_ce_std", "mlp_val_ce_mean", "mlp_val_ce_std"}
+        candidate_controls({key: value for key, value in raw.items() if key not in metadata})
+        if not isinstance(raw.get("source_linear_source_digest"), str) or type(choice.get("step")) is not int or choice["step"] not in (0, 1, 25):
+            raise ValueError("Selected source-linear row must retain its source token/integer endpoint")
     if set(raw) & {"mlp_output_centering", "mlp_source_centering_schema", "mlp_source_centering_source_digest"}:
         from src.mlp_source_centering import candidate_controls
         candidate_controls(raw)
@@ -702,6 +759,10 @@ def selected_test(root, choice, condensation_seeds=(0, 1, 2), student_seeds=(100
                 raise ValueError("Selected row lost its recorded initial MLP identity")
             if recorded.get("mlp_output_centering") is not None and raw.get("mlp_output_centering") != recorded["mlp_output_centering"]:
                 raise ValueError("Selected row lost its recorded source centering identity")
+            if recorded.get("method") == "source_linear" and (raw.get("method") != "source_linear"
+                    or raw.get("assignment_coordinates") != recorded.get("assignment_coordinates")
+                    or raw.get("source_linear_source_digest") != recorded.get("source_linear_source_digest")):
+                raise ValueError("Selected row lost its recorded source-linear identity")
             if recorded.get("surrogate_kernel") is not None and raw.get("surrogate_kernel") != recorded["surrogate_kernel"]:
                 raise ValueError("Selected row lost its recorded NTK kernel identity")
     candidate = {key: choice[key] for key in ("method", "width", "lr", "T", "rank", "penalty")}
@@ -722,7 +783,7 @@ def selected_test(root, choice, condensation_seeds=(0, 1, 2), student_seeds=(100
         candidate["nystrom_schema"] = 3
     candidate.update({key: choice[key] for key in ("initialization", "alpha", "inner_loss_weighting", "mass_mode", "mass_scaling",
                                                   "metric_input", "metric_alpha", "strength", "train_target_mix",
-                                                  "balance_steps", "balance_tol", "balance_backend", "initial_mass_schema", "mlp_initial_mass_schema", "mlp_initial_mass_source_digest", "mlp_output_centering", "mlp_source_centering_schema", "mlp_source_centering_source_digest", "surrogate_kernel", "surrogate_schema", "surrogate_source_digest",
+                                                  "balance_steps", "balance_tol", "balance_backend", "initial_mass_schema", "mlp_initial_mass_schema", "mlp_initial_mass_source_digest", "mlp_output_centering", "mlp_source_centering_schema", "mlp_source_centering_source_digest", "assignment_coordinates", "source_linear_schema", "source_linear_source_digest", "surrogate_kernel", "surrogate_schema", "surrogate_source_digest",
                                                   "ntk_angle_guard", "ntk_norm_guard", "ntk_jitter") if key in choice
                       and pd.notna(choice[key])})
     if "mixing" in choice:
@@ -748,6 +809,9 @@ def selected_test(root, choice, condensation_seeds=(0, 1, 2), student_seeds=(100
     if candidate.get("mlp_output_centering") == "source_mean_v1" and "candidate_path" in raw:
         if Path(raw["candidate_path"]).resolve() != (root / _fingerprint(candidate)).resolve() or recorded != candidate:
             raise ValueError("Selected centered row differs from its recorded candidate/root")
+    if candidate["method"] == "source_linear" and "candidate_path" in raw:
+        if Path(raw["candidate_path"]).resolve() != (root / _fingerprint(candidate)).resolve() or recorded != candidate:
+            raise ValueError("Selected source-linear row differs from its recorded candidate/root")
     for key in ("lr", "T", "penalty"):
         candidate[key] = float(candidate[key])
     _assignment_mass_mode(candidate)
@@ -791,7 +855,7 @@ def selected_test(root, choice, condensation_seeds=(0, 1, 2), student_seeds=(100
                                                           config.get("citation_features", "default"))
     if dataset_digest(graph, train, validation, testing) != config["data_digest"]:
         raise ValueError("Graph or splits differ from the selected source screen")
-    if config.get("teacher_backend") is None:
+    if config.get("teacher_backend") is None and candidate["method"] != "source_linear":
         h = fixed_propagated_features(h, config, root)
     if config.get("teacher_backend") is not None:
         from src.citation_gcn_teacher import validate_condensation, validate_root
@@ -805,7 +869,7 @@ def selected_test(root, choice, condensation_seeds=(0, 1, 2), student_seeds=(100
         labels, val_labels = teacher_inputs(graph, train, validation[1])
         validate_root(root, h=h, train_mask=train, train_labels=labels, val_mask=validation[1],
                       val_labels=val_labels, device=device, stop=stop)
-    if candidate.get("mass_mode") != "initial" and candidate.get("surrogate_kernel") is None and candidate.get("mlp_output_centering") is None:
+    if candidate["method"] != "source_linear" and candidate.get("mass_mode") != "initial" and candidate.get("surrogate_kernel") is None and candidate.get("mlp_output_centering") is None:
         save_json(selection, root / "selected.json")
         save_json(selection, root / f"selected_{selection_key}.json")
     logits = torch.load(root / "teacher.pt", map_location=device, weights_only=False)["logits"]
@@ -830,6 +894,16 @@ def selected_test(root, choice, condensation_seeds=(0, 1, 2), student_seeds=(100
         for cond_seed in condensation_seeds:
             _, current_z, _, current_assignment, current_source = cached_source(root, candidate, cond_seed, h, q, config)
             validate_folder(root, candidate, cond_seed, current_z, q, current_assignment, current_source, step)
+        save_json(selection, root / "selected.json")
+        save_json(selection, root / f"selected_{selection_key}.json")
+    if candidate["method"] == "source_linear":
+        from src.source_linear_assignment import cached_source as linear_cached_source
+        from src.source_linear_assignment import validate_folder as linear_validate_folder
+        for cond_seed in condensation_seeds:
+            _, current_z, _, current_assignment, current_inputs, current_source = linear_cached_source(
+                root, candidate, cond_seed, h, q, config)
+            linear_validate_folder(root, candidate, cond_seed, current_z, q, current_assignment,
+                                   current_inputs, current_source, step)
         save_json(selection, root / "selected.json")
         save_json(selection, root / f"selected_{selection_key}.json")
     records = []
@@ -862,6 +936,11 @@ def selected_test(root, choice, condensation_seeds=(0, 1, 2), student_seeds=(100
         if candidate["method"] == "mlp" and (candidate.get("mass_mode") == "initial" or candidate.get("mlp_output_centering") == "source_mean_v1"):
             _, current_z, _, current_assignment, current_source = cached_source(root, candidate, cond_seed, h, q, config)
             validate_folder(root, candidate, cond_seed, current_z, q, current_assignment, current_source, step, snapshot)
+        if candidate["method"] == "source_linear":
+            _, current_z, _, current_assignment, current_inputs, current_source = linear_cached_source(
+                root, candidate, cond_seed, h, q, config)
+            linear_validate_folder(root, candidate, cond_seed, current_z, q, current_assignment,
+                                   current_inputs, current_source, step, snapshot)
         if candidate["method"] == "coarsening":
             from src.coarsening_ce import gcn_inputs
             x, y, mass, training_adj = gcn_inputs(snapshot, device)

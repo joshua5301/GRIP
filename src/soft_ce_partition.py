@@ -575,7 +575,8 @@ def optimize_ce_assignment(
         )
     }
     if set(mlp_initial_options) - {"mlp_initial_mass_schema", "mlp_initial_mass_source",
-                                   "mlp_output_centering", "mlp_source_centering_schema", "mlp_source_centering_source"}:
+                                   "mlp_output_centering", "mlp_source_centering_schema", "mlp_source_centering_source",
+                                   "source_linear_coordinates", "source_linear_schema", "source_linear_source", "source_linear_inputs"}:
         raise ValueError("Unknown MLP initial-mass control")
     mlp_initial_mass_schema = mlp_initial_options.get("mlp_initial_mass_schema")
     mlp_initial_mass_source = mlp_initial_options.get("mlp_initial_mass_source")
@@ -583,6 +584,11 @@ def optimize_ce_assignment(
     centering_schema = mlp_initial_options.get("mlp_source_centering_schema")
     centering_source = mlp_initial_options.get("mlp_source_centering_source")
     centered_active = centering_mode is not None
+    source_linear_mode = mlp_initial_options.get("source_linear_coordinates")
+    source_linear_schema = mlp_initial_options.get("source_linear_schema")
+    source_linear_source = mlp_initial_options.get("source_linear_source")
+    source_linear_inputs = mlp_initial_options.get("source_linear_inputs")
+    source_linear_active = source_linear_mode is not None
     if inner_loss_weighting == "mass":
         resume_config.pop("inner_loss_weighting")
     if outer_targets is not None:
@@ -698,10 +704,25 @@ def optimize_ce_assignment(
                              mlp_source_centering_source=centering_source)
     elif centering_schema is not None or centering_source is not None:
         raise ValueError("Source centering provenance requires its explicit output mode")
+    if source_linear_active:
+        if (source_linear_mode not in ("raw_rms", "nystrom_relu") or type(source_linear_schema) is not int
+                or source_linear_schema != 1 or torch.get_default_dtype() != torch.float32
+                or assignment_input != "features" or assignment_encoder != "linear" or assignment_rank is None
+                or mass_mode != "free" or inner_loss_weighting != "uniform" or solver_mode != "exact"
+                or node_weighting or temperature_logits is not None or outer_targets is not None
+                or outer_indices is not None or implicit_solver is not None or inner_solver is not None
+                or cache_assignment or save_assignment or not save_resume or mixing != .05 or centered_active
+                or not isinstance(source_linear_source, dict)
+                or source_linear_source.get("coordinate_mode") != source_linear_mode):
+            raise ValueError("Source linear requires fixed source coordinates/free mass/uniform exact CE")
+        resume_config.update(source_linear_coordinates=source_linear_mode, source_linear_schema=source_linear_schema,
+                             source_linear_source=source_linear_source)
+    elif any(value is not None for value in (source_linear_schema, source_linear_source, source_linear_inputs)):
+        raise ValueError("Source linear provenance/input requires its explicit coordinate mode")
     checkpoints = set(checkpoint_steps)
     if any((not isinstance(step, (int, np.integer)) or not 0 <= step <= steps for step in checkpoints)):
         raise ValueError("Checkpoint steps must be integers within the optimization budget")
-    if checkpoints or mass_mode == "initial" or centered_active:
+    if checkpoints or mass_mode == "initial" or centered_active or source_linear_active:
         checkpoints.update((0, steps))
     snapshots = {}
     _check_assignment_stop(stop)
@@ -713,7 +734,21 @@ def optimize_ce_assignment(
         raise ValueError("Outer loss requires at least one node")
     full_features = augmented(outer_z)
     clusters = int(assignment.max()) + 1
-    if assignment_rank is None:
+    if source_linear_active:
+        from src.source_linear_assignment import original_context as linear_context
+        from src.source_linear_assignment import validate_resume as validate_linear_resume
+        source_context, source_initial = linear_context(
+            z, q, assignment, source_linear_inputs, assignment_rank, factor_seed, mixing, chunk_size,
+            resume_config, source_linear_source)
+        encoder_parameters = [p.detach().clone().requires_grad_() for p in source_initial[:-1]]
+        v = source_initial[-1].detach().clone().requires_grad_()
+        inputs, parameters = source_linear_inputs, [*encoder_parameters, v]
+        if resume_state is not None:
+            validate_linear_resume(resume_state, z, q, assignment, inputs, source_context,
+                                   source_initial, steps, folder)
+        elif folder is not None and any((Path(folder) / "checkpoints").glob("step_*.pt")):
+            raise ValueError("Source-linear cached checkpoints require a verifiable resume")
+    elif assignment_rank is None:
         logits = initial_logits(assignment, clusters, mixing).requires_grad_()
         parameters = [logits]
     elif assignment_input != "node":
@@ -827,7 +862,10 @@ def optimize_ce_assignment(
                 raise FloatingPointError("Nonfinite or nonpositive learned temperature")
             material = make_material(z, temperature_labels(temperature_logits, log_temperature))
         if assignment_input != "node":
-            if centered_active:
+            if source_linear_active:
+                from src.source_linear_assignment import linear_nodes
+                u = linear_nodes(inputs, encoder_parameters)
+            elif centered_active:
                 from src.mlp_source_centering import centered_nodes
                 u, centering_mean, centering_diagnostic = centered_nodes(inputs, encoder_parameters)
             else:
@@ -1098,6 +1136,9 @@ def optimize_ce_assignment(
             if centered_active:
                 from src.mlp_source_centering import attach as attach_centered
                 attach_centered(snapshot, centering_context, parameters, u, centering_mean, centering_diagnostic)
+            if source_linear_active:
+                from src.source_linear_assignment import attach as attach_linear
+                attach_linear(snapshot, source_context, parameters, u)
             snapshots[step] = snapshot
             if folder is not None:
                 checkpoint_dir = folder / "checkpoints"
@@ -1133,6 +1174,9 @@ def optimize_ce_assignment(
             if centered_active:
                 from src.mlp_source_centering import attach as attach_centered
                 attach_centered(state, centering_context)
+            if source_linear_active:
+                from src.source_linear_assignment import attach as attach_linear
+                attach_linear(state, source_context)
             if folder is not None:
                 torch.save(state, folder / "resume.tmp.pt")
                 (folder / "resume.tmp.pt").replace(folder / "resume.pt")
