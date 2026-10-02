@@ -32,6 +32,15 @@ def implementation_provenance():
 
 def dispatch(job, stop):
     options = dict(job["options"])
+    if job["kind"] == "citeseer_finite_student_v2_prepare":
+        from src.citeseer_finite_student_v2 import prepare
+        return prepare(**options, stop=stop)
+    if job["kind"] == "citeseer_finite_student_v2_certify":
+        from src.citeseer_finite_student_v2 import certify
+        return certify(**options, stop=stop)
+    if job["kind"] == "citeseer_finite_student_v2_validate":
+        from src.citeseer_finite_student_v2 import validate
+        return validate(**options, stop=stop)
     if job["kind"] == "citeseer_finite_student_prepare":
         from src.citeseer_finite_student import prepare
         return prepare(**options, stop=stop)
