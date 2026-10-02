@@ -32,6 +32,9 @@ def implementation_provenance():
 
 def dispatch(job, stop):
     options = dict(job["options"])
+    if job["kind"] == "citation_source_provenance":
+        from src.citation_source_provenance import prepare_provenance
+        return prepare_provenance(**options, stop=stop)
     if job["kind"] == "citation_source_preflight":
         from src.citation_source_preflight import prepare_preflight
         return prepare_preflight(**options, stop=stop)
