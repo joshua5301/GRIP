@@ -43,7 +43,7 @@ def test_selection_averages_all_seed_pairs_and_ignores_test():
         ("reddit", 0.0005, "erf", 0.5, 77, True),
     ],
 )
-@pytest.mark.parametrize("method", ["variance_moment", "variance_kl"])
+@pytest.mark.parametrize("method", ["variance_moment", "variance_kl", "variance_moment_low_rank"])
 def test_sweep_uniform_evaluation_selection_and_restart(
     tmp_path, monkeypatch, dataset, ratio, kernel, dropout, cells, inductive, method
 ):
@@ -104,6 +104,7 @@ def test_sweep_uniform_evaluation_selection_and_restart(
         ),
     )
     monkeypatch.setattr(experiment, "variance_kl_partition", partition)
+    monkeypatch.setattr(experiment, "low_rank_partition", partition)
 
     def evaluate(x, y, mass, graph, q, masks, seed, folder, **kwargs):
         folder.mkdir(parents=True, exist_ok=True)

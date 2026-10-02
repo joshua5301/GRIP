@@ -245,3 +245,7 @@ Pass `method="variance_kl"` for the matched variance + forward-label-KL Lloyd
 control, using `B² V/2 + 8 KL` and identical historical initialization. Optional
 `shared_run` reuses verified features and teachers from a variance-moment run.
 See [the objective and timing protocol](docs/variance_kl.md).
+
+`method="variance_moment_low_rank"` optimizes the original variance–moment
+objective through soft low-rank assignment logits, without bilevel optimization.
+See [the initialization and sweep protocol](docs/variance_moment_low_rank.md).

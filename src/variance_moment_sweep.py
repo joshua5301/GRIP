@@ -19,6 +19,7 @@ from src.evaluation import fit_gcn_diagnostic
 from src.io import _fingerprint, array_digest, save_json, save_state, write_table
 from src.sweep_utils import grid_rows
 from src.variance_kl import variance_kl_partition
+from src.variance_moment_low_rank import low_rank_partition
 
 REFERENCE = "12ceec5810e2c709f98f8aa518d401cd04390168"
 DEFAULT_SPACE = dict(
@@ -140,9 +141,13 @@ def run_risk_sweep(
     dataset="cora",
     method="variance_moment",
     shared_run=None,
+    assignment_rank=8,
+    assignment_steps=1000,
+    assignment_lr=0.01,
+    assignment_mixing=0.05,
 ):
-    if method not in ("variance_moment", "variance_kl"):
-        raise ValueError("Use variance_moment or variance_kl")
+    if method not in ("variance_moment", "variance_kl", "variance_moment_low_rank"):
+        raise ValueError("Unknown partition method")
     if (dataset, ratio) not in BUDGET:
         raise ValueError("Use a configured dataset and ratio")
     kernel = "erf" if dataset in ("citeseer", "reddit") else "relu"
@@ -171,6 +176,15 @@ def run_risk_sweep(
     solver, teacher = modules["risk_partition"]["risk_partition"], modules["teacher"]
     if method == "variance_kl":
         solver = partial(variance_kl_partition, seed_partition=modules["risk_partition"]["seed_partition"])
+    if method == "variance_moment_low_rank":
+        solver = partial(
+            low_rank_partition,
+            seed_partition=modules["risk_partition"]["seed_partition"],
+            rank=assignment_rank,
+            steps=assignment_steps,
+            lr=assignment_lr,
+            mixing=assignment_mixing,
+        )
     graph, train, validation, testing, h = _prepare_dataset(dataset, data_dir, device)
     splits = dict(train=(graph, train), val=validation, test=testing)
     inductive = validation[0] is not graph
@@ -191,6 +205,7 @@ def run_risk_sweep(
         for name in (
             "variance_moment_sweep.py",
             "variance_kl.py",
+            "variance_moment_low_rank.py",
             "evaluation.py",
             "models.py",
             "data.py",
@@ -225,6 +240,10 @@ def run_risk_sweep(
         torch=str(torch.__version__),
     )
     config["method"] = method
+    if method == "variance_moment_low_rank":
+        config["assignment"] = dict(
+            rank=assignment_rank, steps=assignment_steps, lr=assignment_lr, mixing=assignment_mixing
+        )
     if method == "variance_kl":
         config["objective"] = "B**2/2 * variance + 8 * mean_forward_label_KL"
     if shared_run is not None:
@@ -336,6 +355,7 @@ def run_risk_sweep(
                     variance=partition["V"],
                     moment_error=partition["moment_error"],
                     label_kl=partition.get("label_kl", float("nan")),
+                    best_step=partition.get("best_step", float("nan")),
                     sweeps=partition["sweeps"],
                     converged=partition["converged"],
                     partition_seconds=partition["seconds"],
