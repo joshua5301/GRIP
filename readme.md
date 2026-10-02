@@ -225,3 +225,7 @@ preserved; appended penalty candidates start fresh.
 For rank comparisons, pass the completed run directory as `shared_teacher_path`.
 The runner verifies the graph digest, teacher basis, seed, gamma grid and kernel
 before reusing its teacher logits and validation grid.
+Set `assignment_mode="dense"`, `initialization="none"` and `rank` equal to the
+representative count for a matched direct-logit control. Its initial logits
+come from seeded full-rank Gaussian factors with the same logit scaling as the
+low-rank runs; subsequent optimization updates every node-by-cell logit.

@@ -17,7 +17,7 @@ from src.low_rank_assignment import (
     initialize_dual_mlp,
     initialize_factors,
 )
-from src.moments import make_material
+from src.moments import AssignmentMoments, make_material
 from src.multiseed_sweep import aggregate_search
 from src.soft_ce_partition import optimize_ce_assignment
 from src.sweep_utils import grid_rows, representative
@@ -80,6 +80,7 @@ def run_soft_init_sweep(
     dataset="cora",
     teacher_kernel="relu",
     teacher_selection="condensation",
+    assignment_mode="low_rank",
 ):
     if initialization not in ("kmeans", "random", "none"):
         raise ValueError("Unknown initialization")
@@ -94,6 +95,10 @@ def run_soft_init_sweep(
         raise ValueError("Assignment floor requires dual feature MLP widths")
     if teacher_selection not in ("condensation", "accuracy"):
         raise ValueError("Unknown teacher selection")
+    if assignment_mode not in ("low_rank", "dense") or (
+        assignment_mode == "dense" and (initialization != "none" or assignment_widths is not None)
+    ):
+        raise ValueError("Dense assignments require no fixed cost or feature encoder")
     values = [*gammas, *temperatures, *taus, *penalties, *(finetune_temperatures or ())]
     if any(not v for v in (gammas, temperatures, taus, penalties)) or any(
         not np.isfinite(v) or v <= 0 for v in values
@@ -130,6 +135,8 @@ def run_soft_init_sweep(
         config.pop("teacher_kernel")
     if teacher_selection == "condensation":
         config.pop("teacher_selection")
+    if assignment_mode == "low_rank":
+        config.pop("assignment_mode")
     normalized = finetune_temperatures is not None
     torch.backends.cuda.matmul.allow_tf32 = False
     torch.backends.cudnn.allow_tf32 = False
@@ -242,6 +249,13 @@ def run_soft_init_sweep(
             base = random_cost_base(len(z), cells, seed, tau, device, z.dtype)
         else:
             base = z.new_zeros(len(z), cells)
+        if assignment_mode == "dense":
+            u, v = initialize_factors(assignments[seed], cells, rank, seed, 1.0)
+            logits = (u @ (v * (-1 / tau if normalized else 1.0)).T / rank**0.5).detach()
+            with torch.no_grad():
+                moments = AssignmentMoments.apply(logits, make_material(z, q), 4096)
+                probability = logits.double().softmax(1)
+            return logits, moments, probability
         if assignment_widths is not None:
             inputs = z.detach().float() * z.shape[1]**0.5
             node_parameters, cell_parameters, anchors = initialize_dual_mlp(
@@ -317,19 +331,24 @@ def run_soft_init_sweep(
             if not completed.exists() or json.loads(completed.read_text())["steps"] < steps:
                 resume = folder / "resume.pt"
                 state = torch.load(resume, map_location="cpu", weights_only=False) if resume.exists() else None
-                result = optimize_ce_assignment(
-                    z, q, assignments[seed], penalty=penalty, steps=steps, lr=assignment_lr,
-                    assignment_rank=rank, factor_seed=seed, base_logits=base,
-                    correction_scale=-1 / t if normalized else 1.0,
-                    factor_initial_std=1.0 if initialization == "none" and width is None else 0.0,
-                    assignment_input="features" if width is not None else "node",
-                    assignment_encoder="dual_mlp" if width is not None else "linear",
-                    encoder_hidden=width or 64,
-                    probability_floor=assignment_floor,
+                options = dict(
+                    penalty=penalty, steps=steps, lr=assignment_lr, factor_seed=seed,
                     checkpoint_steps=checkpoints, folder=folder, resume_state=state,
                     save_resume=True, save_assignment=False, inner_method="newton_first",
                     implicit_warm_start=True, inner_loss_weighting="mass", cg_max_iter=512,
                 )
+                if assignment_mode == "dense":
+                    options.update(initial_dense_logits=base)
+                else:
+                    options.update(
+                        assignment_rank=rank, base_logits=base,
+                        correction_scale=-1 / t if normalized else 1.0,
+                        factor_initial_std=1.0 if initialization == "none" and width is None else 0.0,
+                        assignment_input="features" if width is not None else "node",
+                        assignment_encoder="dual_mlp" if width is not None else "linear",
+                        encoder_hidden=width or 64, probability_floor=assignment_floor,
+                    )
+                result = optimize_ce_assignment(z, q, assignments[seed], **options)
                 del result, state
                 save_json(dict(steps=steps), folder / "complete.json")
             for step in checkpoints:
@@ -405,6 +424,8 @@ def run_soft_init_sweep(
         summary["step"] = summary.phase.map(dict(selection_initial=0, initial=0, selected=int(selected["step"])))
         summary["search_val"] = summary.phase.map(dict(selection_initial=chosen["val"], initial=initial_score, selected=selected["val"]))
     summary["initialization"] = initialization
+    if assignment_mode == "dense":
+        summary["assignment_mode"] = assignment_mode
     if assignment_widths is not None:
         summary["width"] = selected["width"]
     for name, table in (("summary", summary), ("by_seed", by_seed), ("final_students", final)):

@@ -525,6 +525,7 @@ def optimize_ce_assignment(
     correction_scale=1.0,
     factor_initial_std=0.0,
     probability_floor=0.0,
+    initial_dense_logits=None,
 ):
     if feature_control != "joint" or initial_representatives is not None:
         raise ValueError("Only clustering-derived features and labels are supported")
@@ -559,6 +560,7 @@ def optimize_ce_assignment(
             "temperature_logits",
             "outer_targets",
             "base_logits",
+            "initial_dense_logits",
         )
     }
     if base_logits is not None:
@@ -572,6 +574,13 @@ def optimize_ce_assignment(
             raise ValueError("Invalid base logits")
         base_logits = base_logits.detach().to(z)
         resume_config["base_logits_digest"] = array_digest(base_logits.cpu().numpy())
+    if initial_dense_logits is not None:
+        if (assignment_rank is not None or assignment_input != "node" or mass_mode != "free"
+                or node_weighting or sparse_k is not None or base_logits is not None
+                or initial_dense_logits.shape != (len(z), int(assignment.max()) + 1)
+                or not bool(torch.isfinite(initial_dense_logits).all())):
+            raise ValueError("Invalid dense assignment initialization")
+        resume_config["initial_dense_logits_digest"] = array_digest(initial_dense_logits.cpu().numpy())
     if correction_scale == 1.0:
         resume_config.pop("correction_scale")
     elif base_logits is None or not np.isfinite(correction_scale) or correction_scale == 0:
@@ -719,7 +728,11 @@ def optimize_ce_assignment(
         prototypes = initialize_prototypes(inputs, assignment, clusters)
         parameters = [prototypes]
     elif assignment_rank is None:
-        logits = initial_logits(assignment, clusters, mixing).requires_grad_()
+        logits = (
+            initial_logits(assignment, clusters, mixing)
+            if initial_dense_logits is None
+            else initial_dense_logits.detach().to(device=z.device, dtype=torch.float32).clone()
+        ).requires_grad_()
         parameters = [logits]
     elif assignment_input != "node":
         inputs = assignment_inputs(z, q, assignment_input)

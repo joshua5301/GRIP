@@ -10,6 +10,7 @@ from src.low_rank_assignment import (
     saved_encoder_cells,
     saved_encoder_nodes,
 )
+from src.moments import AssignmentMoments, make_material
 from src.soft_ce_partition import optimize_ce_assignment
 from src.soft_init_sweep import distance_base, extended_candidate_grid, random_cost_base
 
@@ -28,6 +29,19 @@ def test_penalty_expansion_preserves_candidate_indices():
         (0.3, 3e-5), (0.3, 3e-4), (1.0, 3e-5), (1.0, 3e-4),
         (0.3, 3e-6), (0.3, 1e-5), (1.0, 3e-6), (1.0, 1e-5),
     ]
+
+
+def test_dense_logits_preserve_soft_initialization(tmp_path):
+    z, q, assignment = problem()
+    u, v = initialize_factors(assignment, 3, 3, seed=7, u_std=1.0)
+    logits = (u @ v.T / 3**0.5).detach()
+    expected = AssignmentMoments.apply(logits, make_material(z, q), 5)
+    result = optimize_ce_assignment(
+        z, q, assignment, initial_dense_logits=logits,
+        penalty=0.2, inner_method="newton_first", inner_tol=1e-8,
+        steps=1, checkpoint_steps=(0, 1), folder=tmp_path,
+    )
+    torch.testing.assert_close(result["checkpoints"][0]["moments"], expected)
 
 
 def test_random_cost_initialization():
