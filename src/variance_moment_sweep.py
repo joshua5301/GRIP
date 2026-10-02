@@ -59,7 +59,7 @@ def _search_scores(rows, condensation_seeds, search_seeds):
         records.append(
             dict(
                 candidate=int(candidate),
-                **{key: float(group.iloc[0][key]) for key in ("gamma", "T", "B")},
+                **{key: float(group.iloc[0][key]) for key in ("gamma", "T", "B", "lambda") if key in group},
                 **({"rank": int(group.iloc[0]["rank"])} if "rank" in group else {}),
                 search_val=float(means.mean()),
                 condensation_val_std=float(means.std()),
@@ -159,10 +159,11 @@ def run_risk_sweep(
         bounds = {"cora": DEFAULT_SPACE["B"], "citeseer": [0.03, 0.1, 0.3, 1.0, 3.0]}
         space = dict(DEFAULT_SPACE, B=bounds.get(dataset, [0.1, 0.3, 1.0, 3.0, 10.0]))
     keys = set(space)
-    if keys != {"gamma", "T", "B"} and not (
-        method == "variance_moment_low_rank" and keys == {"gamma", "T", "B", "rank"}
-    ):
-        raise ValueError("Use gamma, T, B; low-rank also supports rank")
+    required = {"gamma", "T", "lambda" if "lambda" in keys else "B"}
+    if keys != required and not (method == "variance_moment_low_rank" and keys == required | {"rank"}):
+        raise ValueError("Use gamma, T and B or lambda; low-rank also supports rank")
+    if "lambda" in keys and (method != "variance_moment_low_rank" or assignment_initialization != "random"):
+        raise ValueError("Lambda grid requires random low-rank optimization")
     candidates = grid_rows(space)
     if "rank" in space and any(isinstance(r, bool) or not isinstance(r, int) or r < 1 for r in space["rank"]):
         raise ValueError("Ranks must be positive integers")
@@ -248,6 +249,8 @@ def run_risk_sweep(
         torch=str(torch.__version__),
     )
     config["method"] = method
+    if "lambda" in space:
+        config["objective"] = "variance + lambda * global_moment_norm"
     if method == "variance_moment_low_rank":
         config["assignment"] = dict(
             rank=space.get("rank", assignment_rank),
@@ -348,11 +351,12 @@ def run_risk_sweep(
                     h,
                     q,
                     config["nodes"],
-                    candidate["B"],
+                    candidate.get("B"),
                     seed=seed,
                     max_sweeps=max_sweeps,
                     block_size=block_size,
                     **({"rank": candidate["rank"]} if "rank" in candidate else {}),
+                    **({"moment_weight": candidate["lambda"]} if "lambda" in candidate else {}),
                 )
                 save_state(partition, artifact)
                 gc.collect()

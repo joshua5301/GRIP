@@ -33,6 +33,9 @@ def test_selection_averages_all_seed_pairs_and_ignores_test():
         experiment._search_scores(rows + rows[:1], (0, 1, 2), (0, 1))
     ranked = [dict(row, rank=4 if row["candidate"] == 0 else 8) for row in rows]
     assert experiment._select(experiment._search_scores(ranked, (0, 1, 2), (0, 1)))["rank"] == 8
+    weighted = [{**{k: v for k, v in row.items() if k != "B"}, "lambda": 8 / row["B"]} for row in ranked]
+    selected = experiment._select(experiment._search_scores(weighted, (0, 1, 2), (0, 1)))
+    assert selected["lambda"] == 4 and "B" not in selected
 
 
 @pytest.mark.parametrize(

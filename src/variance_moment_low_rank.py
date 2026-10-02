@@ -6,14 +6,15 @@ import torch
 from src.io import array_digest
 
 
-def moment_objective(statistics, energy, original_moment, B, epsilon=1e-12):
+def moment_objective(statistics, energy, original_moment, B, epsilon=1e-12, moment_weight=None):
     mass, features, labels = statistics
     centers = features / mass[:, None]
     variance = (energy - (features * centers).sum()).clamp_min(0)
     moment = original_moment - centers.T @ labels
     norm = moment.norm()
-    exact = B * B / 4 * variance + 2 * B * norm
-    smooth = B * B / 4 * variance + 2 * B * ((moment.square().sum() + epsilon**2).sqrt() - epsilon)
+    alpha, beta = (B * B / 4, 2 * B) if moment_weight is None else (1.0, moment_weight)
+    exact = alpha * variance + beta * norm
+    smooth = alpha * variance + beta * ((moment.square().sum() + epsilon**2).sqrt() - epsilon)
     return smooth, exact, variance, norm
 
 
@@ -31,11 +32,15 @@ def low_rank_partition(
     lr=0.01,
     mixing=0.05,
     initialization="historical",
+    moment_weight=None,
 ):
     if initialization not in ("historical", "random"):
         raise ValueError("Use historical or random initialization")
-    if not 1 <= m <= len(H) or not math.isfinite(B) or B <= 0:
-        raise ValueError("Require 1 <= m <= N and finite B > 0")
+    coefficient = B if moment_weight is None else moment_weight
+    if not 1 <= m <= len(H) or not math.isfinite(coefficient) or coefficient <= 0:
+        raise ValueError("Require 1 <= m <= N and a finite positive objective coefficient")
+    if moment_weight is not None and initialization != "random":
+        raise ValueError("Lambda objective requires random initialization")
     if (
         (initialization == "historical" and not 0 < mixing < 1)
         or min(rank, block_size, steps) < 1
@@ -93,7 +98,9 @@ def low_rank_partition(
         if not all(bool(torch.isfinite(s).all()) for s in statistics) or bool((statistics[0] <= 0).any()):
             raise FloatingPointError(f"Invalid cell statistics at step {step}")
         statistics = [s.requires_grad_() for s in statistics]
-        smooth, exact, variance, moment = moment_objective(statistics, energy, original, B)
+        smooth, exact, variance, moment = moment_objective(
+            statistics, energy, original, B, moment_weight=moment_weight
+        )
         value = float(exact.detach())
         if not math.isfinite(value):
             raise FloatingPointError(f"Nonfinite objective at step {step}")
@@ -112,7 +119,7 @@ def low_rank_partition(
             raise FloatingPointError(f"Nonfinite gradient at step {step}")
         optimizer.step()
     mass, features, labels = best
-    _, exact, variance, moment = moment_objective(best, energy, original, B)
+    _, exact, variance, moment = moment_objective(best, energy, original, B, moment_weight=moment_weight)
     if H.is_cuda:
         torch.cuda.synchronize(H.device)
     return dict(
@@ -131,7 +138,7 @@ def low_rank_partition(
         mixing=mixing if initialization == "historical" else None,
         initialization=initialization,
         lr=lr,
-        B=B,
+        **({"B": B} if moment_weight is None else {"lambda": moment_weight}),
         seed=seed,
         initial_assignment_digest=initial_digest,
         seconds=perf_counter() - started,

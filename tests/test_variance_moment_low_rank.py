@@ -67,3 +67,19 @@ def test_random_initialization_has_no_partition_or_fixed_cost(rank):
     assert result["initial_assignment_digest"] is None
     assert result["mixing"] is None
     assert result["J"] <= result["history"][0]
+
+
+def test_lambda_objective_and_optimizer_use_unscaled_variance():
+    g = torch.Generator().manual_seed(3)
+    x = torch.randn(12, 4, generator=g, dtype=torch.double)
+    q = torch.randn(12, 3, generator=g, dtype=torch.double).softmax(1)
+    p = torch.randn(12, 3, generator=g, dtype=torch.double).softmax(1)
+    stats = p.mean(0), p.T @ x / len(x), p.T @ q / len(x)
+    energy, original = x.square().sum(1).mean(), x.T @ q / len(x)
+    _, old, _, _ = moment_objective(stats, energy, original, 3.0)
+    _, new, variance, moment = moment_objective(stats, energy, original, None, moment_weight=8 / 3)
+    torch.testing.assert_close(new, old / (9 / 4))
+    torch.testing.assert_close(new, variance + (8 / 3) * moment)
+    result = low_rank_partition(x, q, 3, None, None, initialization="random", steps=2, moment_weight=2.0)
+    assert "B" not in result and result["lambda"] == 2.0
+    assert result["J"] == pytest.approx(result["V"] + 2 * result["moment_error"])

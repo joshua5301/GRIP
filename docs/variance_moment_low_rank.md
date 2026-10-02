@@ -43,3 +43,10 @@ factor initialization; it is independent of gamma/T/B. Supply `rank` as an
 additional grid key to select gamma/T/B/rank jointly by mean GCN validation.
 The 1/sqrt(rank) scaling standardizes initial logit variance, not optimization
 dynamics. The historical initialization remains available as the default.
+
+For random initialization, replace grid key `B` with `lambda` to optimize
+`variance + lambda * global_moment_norm` directly, including in gradients and
+checkpoint selection. `lambda=8/B` maps the old objective up to a positive overall
+factor, preserving minimizers but not necessarily finite-step Adam trajectories.
+The lambda and B grids are mutually exclusive. No label-variance normalization
+is introduced; the existing centered, RMS-normalized feature space is retained.
