@@ -240,3 +240,8 @@ receives final test evaluation. See [the protocol](docs/variance_moment_sweep.md
 The runner also supports Flickr, Reddit and Arxiv. Inductive Flickr/Reddit use
 training-only teacher anchors and separate validation/test graphs. Three sessions
 can each process one density per dataset, with separate result and temporary paths.
+
+Pass `method="variance_kl"` for the matched variance + forward-label-KL Lloyd
+control, using `B² V/2 + 8 KL` and identical historical initialization. Optional
+`shared_run` reuses verified features and teachers from a variance-moment run.
+See [the objective and timing protocol](docs/variance_kl.md).

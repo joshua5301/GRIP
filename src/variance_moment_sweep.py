@@ -1,8 +1,12 @@
 import gc
 import hashlib
+import json
 import math
+import shutil
 import subprocess
+from functools import partial
 from pathlib import Path
+from time import perf_counter
 
 import pandas as pd
 import torch
@@ -14,6 +18,7 @@ from src.data import BUDGET, _prepare_dataset
 from src.evaluation import fit_gcn_diagnostic
 from src.io import _fingerprint, array_digest, save_json, save_state, write_table
 from src.sweep_utils import grid_rows
+from src.variance_kl import variance_kl_partition
 
 REFERENCE = "12ceec5810e2c709f98f8aa518d401cd04390168"
 DEFAULT_SPACE = dict(
@@ -133,7 +138,11 @@ def run_risk_sweep(
     data_dir="/content/data/",
     device="cuda",
     dataset="cora",
+    method="variance_moment",
+    shared_run=None,
 ):
+    if method not in ("variance_moment", "variance_kl"):
+        raise ValueError("Use variance_moment or variance_kl")
     if (dataset, ratio) not in BUDGET:
         raise ValueError("Use a configured dataset and ratio")
     kernel = "erf" if dataset in ("citeseer", "reddit") else "relu"
@@ -160,6 +169,8 @@ def run_risk_sweep(
     torch.backends.cudnn.allow_tf32 = False
     sources, modules = _load_reference()
     solver, teacher = modules["risk_partition"]["risk_partition"], modules["teacher"]
+    if method == "variance_kl":
+        solver = partial(variance_kl_partition, seed_partition=modules["risk_partition"]["seed_partition"])
     graph, train, validation, testing, h = _prepare_dataset(dataset, data_dir, device)
     splits = dict(train=(graph, train), val=validation, test=testing)
     inductive = validation[0] is not graph
@@ -179,6 +190,7 @@ def run_risk_sweep(
         (Path(__file__).parent / name).read_bytes()
         for name in (
             "variance_moment_sweep.py",
+            "variance_kl.py",
             "evaluation.py",
             "models.py",
             "data.py",
@@ -212,12 +224,44 @@ def run_risk_sweep(
         initialization="historical_risk_surrogate",
         torch=str(torch.__version__),
     )
+    config["method"] = method
+    if method == "variance_kl":
+        config["objective"] = "B**2/2 * variance + 8 * mean_forward_label_KL"
+    if shared_run is not None:
+        shared_run = Path(shared_run)
+        previous = json.loads((shared_run / "config.json").read_text(encoding="utf-8"))
+        keys = (
+            "dataset",
+            "ratio",
+            "nodes",
+            "reference_digest",
+            "data_digest",
+            "basis",
+            "teacher_seed",
+            "teacher_kernel",
+            "protocol",
+            "torch",
+            "space",
+            "student",
+            "loss_weighting",
+            "condensation_seeds",
+            "search_seeds",
+            "final_seeds",
+            "max_sweeps",
+            "block_size",
+        )
+        changed = [key for key in keys if previous.get(key) != config[key]]
+        if changed:
+            raise ValueError(f"Shared comparison run differs: {changed}")
+        config["shared_run"] = str(shared_run.resolve())
     root = Path(output_dir) / f"ratio_{ratio:g}" / _fingerprint(config)
     root.mkdir(parents=True, exist_ok=True)
     save_json(config, root / "config.json")
     for name, source in sources.items():
         (root / f"reference_{name}.py").write_text(source, encoding="utf-8")
     feature_path = root / "features.pt"
+    if not feature_path.exists() and shared_run is not None:
+        shutil.copy2(shared_run / "features.pt", feature_path)
     if feature_path.exists():
         h = torch.load(feature_path, map_location=device, weights_only=True)
     else:
@@ -226,6 +270,11 @@ def run_risk_sweep(
 
     teacher_dir = root / "teachers"
     teacher_dir.mkdir(exist_ok=True)
+    if shared_run is not None:
+        for source in (shared_run / "teachers").glob("*.pt"):
+            target = teacher_dir / source.name
+            if not source.stem.endswith(".tmp") and not target.exists():
+                shutil.copy2(source, target)
     logits, teacher_rows, phi, val_phi, weights = {}, [], None, None, None
     for gamma in tqdm(list(dict.fromkeys(space["gamma"])), desc="Teacher gamma cache"):
         path = teacher_dir / f"{_fingerprint(dict(gamma=gamma))}.pt"
@@ -253,7 +302,7 @@ def run_risk_sweep(
     write_table(pd.DataFrame(teacher_rows), root / "teacher_grid.csv")
 
     rows, diagnostics = [], []
-    progress = tqdm(enumerate(candidates), total=len(candidates), desc=f"{dataset} {ratio:g}: risk grid")
+    progress = tqdm(enumerate(candidates), total=len(candidates), desc=f"{dataset} {ratio:g}: {method}")
     for index, candidate in progress:
         q = (logits[candidate["gamma"]] / candidate["T"]).softmax(1)
         for seed in condensation_seeds:
@@ -286,6 +335,7 @@ def run_risk_sweep(
                     J_final=partition["J"],
                     variance=partition["V"],
                     moment_error=partition["moment_error"],
+                    label_kl=partition.get("label_kl", float("nan")),
                     sweeps=partition["sweeps"],
                     converged=partition["converged"],
                     partition_seconds=partition["seconds"],
@@ -295,6 +345,10 @@ def run_risk_sweep(
             x, y = partition["x"].to(device), partition["y"].to(device)
             uniform = torch.ones(len(x), device=device)
             for student_seed in search_seeds:
+                cached = (folder / "search" / f"seed_{student_seed}.json").exists()
+                if x.is_cuda:
+                    torch.cuda.synchronize(x.device)
+                started = perf_counter()
                 score = fit_gcn_diagnostic(
                     x,
                     y,
@@ -306,12 +360,17 @@ def run_risk_sweep(
                     folder=folder / "search",
                     **settings,
                 )
+                if x.is_cuda:
+                    torch.cuda.synchronize(x.device)
+                elapsed = perf_counter() - started
                 rows.append(
                     dict(
                         **score,
                         candidate=index,
                         condensation_seed=seed,
                         student_seed=student_seed,
+                        evaluation_seconds=elapsed if not cached else float("nan"),
+                        evaluation_cached=cached,
                         **candidate,
                     )
                 )
@@ -362,6 +421,7 @@ def run_risk_sweep(
         [
             dict(
                 dataset=dataset,
+                method=method,
                 ratio=ratio,
                 nodes=config["nodes"],
                 **selected,

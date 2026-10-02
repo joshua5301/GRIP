@@ -43,8 +43,9 @@ def test_selection_averages_all_seed_pairs_and_ignores_test():
         ("reddit", 0.0005, "erf", 0.5, 77, True),
     ],
 )
+@pytest.mark.parametrize("method", ["variance_moment", "variance_kl"])
 def test_sweep_uniform_evaluation_selection_and_restart(
-    tmp_path, monkeypatch, dataset, ratio, kernel, dropout, cells, inductive
+    tmp_path, monkeypatch, dataset, ratio, kernel, dropout, cells, inductive, method
 ):
     h = torch.arange(320, dtype=torch.float32).reshape(160, 2)
     graph = dict(x=h, y=torch.arange(160) % 2, adj=torch.eye(160).to_sparse_csr())
@@ -99,9 +100,10 @@ def test_sweep_uniform_evaluation_selection_and_restart(
         "_load_reference",
         lambda: (
             {"risk_partition": "fake", "teacher": "fake"},
-            {"risk_partition": {"risk_partition": partition}, "teacher": teacher},
+            {"risk_partition": {"risk_partition": partition, "seed_partition": None}, "teacher": teacher},
         ),
     )
+    monkeypatch.setattr(experiment, "variance_kl_partition", partition)
 
     def evaluate(x, y, mass, graph, q, masks, seed, folder, **kwargs):
         folder.mkdir(parents=True, exist_ok=True)
@@ -130,6 +132,7 @@ def test_sweep_uniform_evaluation_selection_and_restart(
     options = dict(
         ratio=ratio,
         dataset=dataset,
+        method=method,
         output_dir=tmp_path,
         space=dict(gamma=[0.01], T=[1.0], B=[0.3, 1.0]),
         search_seeds=(0, 1),
@@ -155,6 +158,14 @@ def test_sweep_uniform_evaluation_selection_and_restart(
     repeated = run(**options)
     assert repeated[-1] == root and before == (len(fits), len(solves))
     pd.testing.assert_frame_equal(summary, repeated[0])
+    with pytest.raises(ValueError, match="basis"):
+        run(**dict(options, shared_run=root, basis=7))
+    shared = run(**dict(options, shared_run=root, output_dir=tmp_path / "comparison"))
+    torch.testing.assert_close(
+        torch.load(root / "features.pt", weights_only=True),
+        torch.load(shared[-1] / "features.pt", weights_only=True),
+    )
+    assert shared[0].iloc[0].test_mean == summary.iloc[0].test_mean
 
 
 def test_inductive_teacher_uses_training_anchors_and_shared_mapping():
