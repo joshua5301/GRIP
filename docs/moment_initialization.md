@@ -62,3 +62,22 @@ schedule. Joint steps update both factors; alternating steps update one, so
 per-factor update counts differ. Report wall time as well as update count.
 All four return the minimum unregularized J, not the minimum annealed objective.
 Completed trials are cached; changing code or settings creates a new run hash.
+
+## SGD comparison
+
+`optimizer_candidates` accepts dictionaries with name, optimizer (`adam` or
+`sgd`), lr and optional momentum. This runs distance initialization with joint
+updates for every candidate, using entropy_fraction (set 0 to disable annealing).
+No weight decay, learning-rate schedule, Nesterov, clipping or gradient rescaling
+is applied. SGD here is full-batch gradient descent through the original J,
+using PyTorch's SGD optimizer; it is not minibatch stochastic training. The GCN
+student optimizer remains Adam and its uniform CE protocol is unchanged.
+
+All candidate results are returned for comparison. This function does not select
+an optimizer using test results. Use search student seeds to choose SGD settings
+by mean validation across all condensation seeds, then evaluate fixed choices on
+separate final student seeds. Candidate names must uniquely encode their settings.
+Numerically divergent candidates are recorded in failures.json and excluded from
+summary if any condensation seed fails; surviving subsets must not be ranked.
+The same immutable run skips recorded failures on rerun. Changed settings create
+a different run directory. No silent Adam fallback is used.

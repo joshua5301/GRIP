@@ -116,3 +116,40 @@ def test_alternating_schedule_and_matched_initialization(entropy):
         "V"
     ] * 3
     assert alternating["J_final"] <= alternating["J_initial"]
+
+
+@pytest.mark.parametrize("momentum", [0.0, 0.9])
+def test_joint_sgd_matches_explicit_updates(momentum):
+    x, q = example()
+    z = x - x.mean(0)
+    z = z / z.square().sum(1).mean().sqrt()
+    projected = z[:, :3]
+    u, v = [torch.nn.Parameter(t) for t in distance_factors(projected, 6, 4, 2)]
+    optimizer = torch.optim.SGD([u, v], lr=1.0, momentum=momentum)
+    best = float("inf")
+    for step in range(5):
+        optimizer.zero_grad()
+        p = (u @ v.T / 2).softmax(1)
+        stats = p.mean(0), p.T @ z / len(z), p.T @ q / len(z)
+        loss, exact, _, _ = moment_objective(
+            stats, z.square().sum(1).mean(), z.T @ q / len(z), None, moment_weight=0.8
+        )
+        best = min(best, float(exact.detach()))
+        if step < 4:
+            loss.backward()
+            optimizer.step()
+    result = optimize_initialization(
+        x,
+        q,
+        6,
+        0.8,
+        rank=4,
+        seed=2,
+        steps=4,
+        lr=1.0,
+        initialization="distance",
+        projected=projected,
+        optimizer_name="sgd",
+        momentum=momentum,
+    )
+    assert result["J_final"] == pytest.approx(best, abs=1e-10)

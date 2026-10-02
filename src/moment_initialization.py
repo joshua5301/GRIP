@@ -76,7 +76,13 @@ def optimize_initialization(
     anneal_fraction=0.8,
     optimizer_mode="joint",
     block_steps=50,
+    optimizer_name="adam",
+    momentum=0.0,
 ):
+    if optimizer_name not in ("adam", "sgd") or not 0 <= momentum < 1:
+        raise ValueError("Use adam or sgd with momentum in [0, 1)")
+    if optimizer_name == "adam" and momentum != 0:
+        raise ValueError("Momentum is an SGD option")
     if optimizer_mode not in ("joint", "alternating") or block_steps < 1:
         raise ValueError("Invalid optimizer mode or block length")
     if initialization not in ("random", "distance") or not 0 < anneal_fraction < 1:
@@ -105,10 +111,16 @@ def optimize_initialization(
         projected = project_features(x, rank) if projected is None else projected
         u, v = distance_factors(projected, cells, rank, seed, temperature)
     u, v = torch.nn.Parameter(u), torch.nn.Parameter(v)
+
+    def make_optimizer(parameters):
+        return (
+            torch.optim.Adam(parameters, lr=lr)
+            if optimizer_name == "adam"
+            else torch.optim.SGD(parameters, lr=lr, momentum=momentum)
+        )
+
     optimizers = (
-        [torch.optim.Adam([u, v], lr=lr)]
-        if optimizer_mode == "joint"
-        else [torch.optim.Adam([u], lr=lr), torch.optim.Adam([v], lr=lr)]
+        [make_optimizer([u, v])] if optimizer_mode == "joint" else [make_optimizer([u]), make_optimizer([v])]
     )
     energy, original = x.square().sum(1).mean(), x.T @ q / n
     history, best, best_stats, beta0 = [], math.inf, None, None
@@ -172,6 +184,8 @@ def optimize_initialization(
         seed=seed,
         initialization=initialization,
         optimizer_mode=optimizer_mode,
+        optimizer_name=optimizer_name,
+        momentum=momentum,
     )
 
 
@@ -190,7 +204,18 @@ def run_initialization_comparison(
     device="cuda",
     optimizer_comparison=False,
     block_steps=50,
+    optimizer_candidates=None,
 ):
+    if optimizer_candidates is not None:
+        if optimizer_comparison or not optimizer_candidates:
+            raise ValueError("Use optimizer candidates separately from alternating comparison")
+        if len({c["name"] for c in optimizer_candidates}) != len(optimizer_candidates):
+            raise ValueError("Optimizer candidate names must be unique")
+        for c in optimizer_candidates:
+            if not c["name"].replace("_", "").isalnum() or c["name"] in ("random", "multistart"):
+                raise ValueError("Use a unique alphanumeric candidate name")
+            if c["optimizer"] not in ("adam", "sgd") or not math.isfinite(c["lr"]) or c["lr"] <= 0:
+                raise ValueError("Invalid optimizer candidate")
     if starts < 2 or len(set(condensation_seeds)) != len(condensation_seeds):
         raise ValueError("Require multiple starts and distinct condensation seeds")
     previous = Path(previous_run)
@@ -228,6 +253,7 @@ def run_initialization_comparison(
         anneal_fraction=anneal_fraction,
         optimizer_comparison=optimizer_comparison,
         block_steps=block_steps,
+        optimizer_candidates=optimizer_candidates,
         h_digest=feature_config["h_digest"],
         q_digest=array_digest(q.cpu().numpy()),
         torch=str(torch.__version__),
@@ -263,12 +289,14 @@ def run_initialization_comparison(
         temperature=temperature,
         anneal_fraction=anneal_fraction,
     )
-    records, evaluations, histories = [], [], []
+    records, evaluations, histories, failures = [], [], [], []
     settings = old["student"]
     masks = dict(train=train, val=validation[1], test=test[1])
     seed_set = set(condensation_seeds)
     for seed in tqdm(condensation_seeds, desc="Initialization comparison"):
-        if optimizer_comparison:
+        if optimizer_candidates is not None:
+            trials = [(c["name"], seed, "distance", entropy_fraction, "joint") for c in optimizer_candidates]
+        elif optimizer_comparison:
             trials = [
                 (f"{name}_{mode}", seed, "distance", entropy, mode)
                 for name, entropy in (("distance", 0.0), ("annealed", entropy_fraction))
@@ -290,19 +318,39 @@ def run_initialization_comparison(
             folder = root / f"seed_{seed}" / name
             folder.mkdir(parents=True, exist_ok=True)
             path = folder / "condensed.pt"
+            failure_path = folder / "failure.json"
+            if optimizer_candidates is not None and failure_path.exists():
+                failures.append(json.loads(failure_path.read_text()))
+                continue
             if path.exists():
                 result = torch.load(path, map_location="cpu", weights_only=True)
             else:
-                result = optimize_initialization(
-                    h,
-                    q,
-                    seed=trial_seed,
-                    initialization=initialization,
-                    entropy_fraction=entropy,
-                    optimizer_mode=mode,
-                    block_steps=block_steps,
-                    **options,
-                )
+                candidate_options = dict(options)
+                if optimizer_candidates is not None:
+                    candidate = next(c for c in optimizer_candidates if c["name"] == name)
+                    candidate_options.update(
+                        lr=candidate["lr"],
+                        optimizer_name=candidate["optimizer"],
+                        momentum=candidate.get("momentum", 0.0),
+                    )
+                try:
+                    result = optimize_initialization(
+                        h,
+                        q,
+                        seed=trial_seed,
+                        initialization=initialization,
+                        entropy_fraction=entropy,
+                        optimizer_mode=mode,
+                        block_steps=block_steps,
+                        **candidate_options,
+                    )
+                except FloatingPointError as error:
+                    if optimizer_candidates is None:
+                        raise
+                    failure = dict(method=name, condensation_seed=seed, reason=str(error))
+                    save_json(failure, failure_path)
+                    failures.append(failure)
+                    continue
                 save_state(result, path)
             outcomes[name] = result
             records.append(
@@ -316,12 +364,12 @@ def run_initialization_comparison(
             histories.extend(dict(condensation_seed=seed, trial=name, **row) for row in result["history"])
         winner = (
             None
-            if optimizer_comparison
+            if optimizer_comparison or optimizer_candidates is not None
             else min(range(starts), key=lambda k: outcomes[f"random_{k}"]["J_final"])
         )
         methods = (
             outcomes
-            if optimizer_comparison
+            if optimizer_comparison or optimizer_candidates is not None
             else dict(
                 random=outcomes["random_0"],
                 distance=outcomes["distance"],
@@ -369,6 +417,9 @@ def run_initialization_comparison(
         write_table(pd.DataFrame(records), root / "trials.csv")
         write_table(pd.DataFrame(histories), root / "history.csv")
         write_table(pd.DataFrame(evaluations), root / "students.csv")
+        save_json(failures, root / "failures.json")
+    if not evaluations:
+        raise RuntimeError(f"All optimizer candidates failed; inspect {root / 'failures.json'}")
     students = pd.DataFrame(evaluations)
     by_seed = students.groupby(["method", "condensation_seed"], as_index=False).agg(
         J_initial=("J_initial", "first"),
@@ -379,14 +430,20 @@ def run_initialization_comparison(
         test_mean=("test_acc", "mean"),
         test_std=("test_acc", "std"),
     )
-    summary = by_seed.groupby("method", as_index=False).agg(
-        J_final=("J_final", "mean"),
-        J_std=("J_final", "std"),
-        seconds=("seconds", "mean"),
-        val_mean=("val_mean", "mean"),
-        val_seed_std=("val_mean", "std"),
-        test_mean=("test_mean", "mean"),
-        test_seed_std=("test_mean", "std"),
+    complete = by_seed.groupby("method").condensation_seed.nunique()
+    valid_methods = complete[complete == len(condensation_seeds)].index
+    summary = (
+        by_seed[by_seed.method.isin(valid_methods)]
+        .groupby("method", as_index=False)
+        .agg(
+            J_final=("J_final", "mean"),
+            J_std=("J_final", "std"),
+            seconds=("seconds", "mean"),
+            val_mean=("val_mean", "mean"),
+            val_seed_std=("val_mean", "std"),
+            test_mean=("test_mean", "mean"),
+            test_seed_std=("test_mean", "std"),
+        )
     )
     write_table(by_seed, root / "by_seed.csv")
     write_table(summary, root / "summary.csv")
