@@ -32,6 +32,9 @@ def implementation_provenance():
 
 def dispatch(job, stop):
     options = dict(job["options"])
+    if job["kind"] == "citation_macro_teacher_probe":
+        from src.citation_macro_probe import prepare_probe
+        return prepare_probe(**options, stop=stop)
     if job["kind"] == "citeseer_finite_student_v2_prepare":
         from src.citeseer_finite_student_v2 import prepare
         return prepare(**options, stop=stop)
