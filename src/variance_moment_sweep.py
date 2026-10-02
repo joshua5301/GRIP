@@ -59,7 +59,11 @@ def _search_scores(rows, condensation_seeds, search_seeds):
         records.append(
             dict(
                 candidate=int(candidate),
-                **{key: float(group.iloc[0][key]) for key in ("gamma", "T", "B", "lambda") if key in group},
+                **{
+                    key: float(group.iloc[0][key])
+                    for key in ("gamma", "T", "B", "lambda", "assignment_lr")
+                    if key in group
+                },
                 **({"rank": int(group.iloc[0]["rank"])} if "rank" in group else {}),
                 search_val=float(means.mean()),
                 condensation_val_std=float(means.std()),
@@ -175,8 +179,9 @@ def run_risk_sweep(
     if teacher_selection == "validation_ce" and space.get("T") != [1.0]:
         raise ValueError("Teacher CE preselection requires T=[1.0]")
     required = {"gamma", "T", "lambda" if "lambda" in keys else "B"}
-    if keys != required and not (method == "variance_moment_low_rank" and keys == required | {"rank"}):
-        raise ValueError("Use gamma, T and B or lambda; low-rank also supports rank")
+    optional = {"rank", "assignment_lr"} if method == "variance_moment_low_rank" else set()
+    if not required <= keys or not keys <= required | optional:
+        raise ValueError("Use gamma, T and B or lambda; low-rank also supports rank and assignment_lr")
     if "lambda" in keys and (
         method != "variance_moment_low_rank" or assignment_initialization not in ("random", "distance")
     ):
@@ -282,7 +287,7 @@ def run_risk_sweep(
         config["assignment"] = dict(
             rank=space.get("rank", assignment_rank),
             steps=assignment_steps,
-            lr=assignment_lr,
+            lr=space.get("assignment_lr", assignment_lr),
             mixing=assignment_mixing if assignment_initialization == "historical" else None,
             initialization=assignment_initialization,
             backend=assignment_backend,
@@ -395,6 +400,7 @@ def run_risk_sweep(
                     max_sweeps=max_sweeps,
                     block_size=block_size,
                     **({"rank": candidate["rank"]} if "rank" in candidate else {}),
+                    **({"lr": candidate["assignment_lr"]} if "assignment_lr" in candidate else {}),
                     **({"moment_weight": candidate["lambda"]} if "lambda" in candidate else {}),
                     **(
                         {"initialization_cache": root / "initializations"}

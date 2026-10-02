@@ -45,6 +45,9 @@ def test_selection_averages_all_seed_pairs_and_ignores_test():
     weighted = [{**{k: v for k, v in row.items() if k != "B"}, "lambda": 8 / row["B"]} for row in ranked]
     selected = experiment._select(experiment._search_scores(weighted, (0, 1, 2), (0, 1)))
     assert selected["lambda"] == 4 and "B" not in selected
+    rates = [dict(row, assignment_lr=0.01 if row["candidate"] == 0 else 0.1) for row in weighted]
+    selected = experiment._select(experiment._search_scores(rates, (0, 1, 2), (0, 1)))
+    assert selected["assignment_lr"] == 0.1
 
 
 @pytest.mark.parametrize(
@@ -79,6 +82,8 @@ def test_sweep_uniform_evaluation_selection_and_restart(
     solves, fits = [], []
 
     def partition(features, labels, cells, B, seed, **kwargs):
+        if method == "variance_moment_low_rank":
+            assert kwargs["lr"] == 0.1
         solves.append((B, seed))
         counts = torch.ones(cells, dtype=torch.long)
         counts[-1] += len(features) - cells
@@ -158,10 +163,12 @@ def test_sweep_uniform_evaluation_selection_and_restart(
     run = experiment.run_cora_risk_sweep if dataset == "cora" else experiment.run_risk_sweep
     if method == "variance_moment_low_rank":
         options["space"]["rank"] = [8]
+        options["space"]["assignment_lr"] = [0.1]
         options["assignment_initialization"] = "random"
     summary, by_seed, search, root = run(**options)
     if method == "variance_moment_low_rank":
         assert summary.iloc[0]["rank"] == 8
+        assert summary.iloc[0]["assignment_lr"] == 0.1
     assert summary.iloc[0].dataset == dataset and summary.iloc[0].nodes == cells
     config = json.loads((root / "config.json").read_text())
     assert config["teacher_kernel"] == kernel

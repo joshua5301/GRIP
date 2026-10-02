@@ -80,6 +80,10 @@ optimizer state continuation is not implemented. Compare stage winners by search
 validation and invoke final evaluation only on the winning stage.
 # Distance initialization across datasets
 
+The low-rank sweep grid also accepts `assignment_lr`, e.g. [0.01, 0.1].
+It overrides the fixed assignment_lr argument for each candidate and is retained
+in search, selected and final tables. Student learning rate remains independent.
+
 `run_risk_sweep(..., assignment_initialization="distance")` supports the lambda
 objective on all configured datasets. It uses the same PCA, k-means++ seeding,
 20 Lloyd updates and balanced distance-logit factors as moment_initialization.
