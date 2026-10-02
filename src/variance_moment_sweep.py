@@ -73,6 +73,13 @@ def _select(search):
     return search.sort_values(["search_val", "candidate"], ascending=[False, True]).iloc[0].to_dict()
 
 
+def _select_teacher_ce(rows):
+    frame = pd.DataFrame(rows)
+    if frame.empty or not frame.val_ce.map(math.isfinite).all():
+        raise ValueError("Teacher validation CE must be finite")
+    return frame.sort_values(["val_ce", "gamma"]).iloc[0].to_dict()
+
+
 def _data_digest(splits):
     graphs, result = {}, {}
     for name, (graph, mask) in splits.items():
@@ -148,7 +155,10 @@ def run_risk_sweep(
     assignment_mixing=0.05,
     assignment_initialization="historical",
     assignment_backend="auto",
+    teacher_selection="grid",
 ):
+    if teacher_selection not in ("grid", "validation_ce"):
+        raise ValueError("Use grid or validation_ce teacher selection")
     if method not in ("variance_moment", "variance_kl", "variance_moment_low_rank"):
         raise ValueError("Unknown partition method")
     if (dataset, ratio) not in BUDGET:
@@ -160,6 +170,8 @@ def run_risk_sweep(
         bounds = {"cora": DEFAULT_SPACE["B"], "citeseer": [0.03, 0.1, 0.3, 1.0, 3.0]}
         space = dict(DEFAULT_SPACE, B=bounds.get(dataset, [0.1, 0.3, 1.0, 3.0, 10.0]))
     keys = set(space)
+    if teacher_selection == "validation_ce" and space.get("T") != [1.0]:
+        raise ValueError("Teacher CE preselection requires T=[1.0]")
     required = {"gamma", "T", "lambda" if "lambda" in keys else "B"}
     if keys != required and not (method == "variance_moment_low_rank" and keys == required | {"rank"}):
         raise ValueError("Use gamma, T and B or lambda; low-rank also supports rank")
@@ -242,6 +254,7 @@ def run_risk_sweep(
         basis=basis,
         teacher_seed=teacher_seed,
         teacher_kernel=kernel,
+        teacher_selection=teacher_selection,
         protocol="inductive" if inductive else "transductive",
         student=settings,
         loss_weighting="uniform",
@@ -338,6 +351,13 @@ def run_risk_sweep(
         )
     del phi, val_phi, weights
     write_table(pd.DataFrame(teacher_rows), root / "teacher_grid.csv")
+    if teacher_selection == "validation_ce":
+        selected_teacher = _select_teacher_ce(teacher_rows)
+        save_json(selected_teacher, root / "selected_teacher.json")
+        candidates = [
+            candidate for candidate in candidates if candidate["gamma"] == selected_teacher["gamma"]
+        ]
+        logits = {selected_teacher["gamma"]: logits[selected_teacher["gamma"]]}
 
     rows, diagnostics = [], []
     progress = tqdm(enumerate(candidates), total=len(candidates), desc=f"{dataset} {ratio:g}: {method}")

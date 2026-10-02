@@ -8,6 +8,15 @@ from src import variance_moment_sweep as experiment
 from src.io import save_json
 
 
+def test_teacher_preselection_uses_ce_not_accuracy():
+    rows = [dict(gamma=0.1, val_ce=0.4, val_acc=90), dict(gamma=0.01, val_ce=0.3, val_acc=80)]
+    assert experiment._select_teacher_ce(rows)["gamma"] == 0.01
+    rows.append(dict(gamma=0.001, val_ce=0.3, val_acc=75))
+    assert experiment._select_teacher_ce(rows)["gamma"] == 0.001
+    with pytest.raises(ValueError):
+        experiment._select_teacher_ce([dict(gamma=0.1, val_ce=float("nan"))])
+
+
 def test_selection_averages_all_seed_pairs_and_ignores_test():
     rows = []
     for candidate, values in enumerate(([95, 60, 60], [80, 80, 80])):

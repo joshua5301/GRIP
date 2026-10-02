@@ -59,3 +59,12 @@ It preserves the objective, float64 arithmetic and optimizer, apart from floatin
 point accumulation differences. This threshold is a heuristic, not a GPU memory
 guarantee. Nonfinite checks aggregate device flags before host synchronization.
 Tests compare both backends' trajectories and representatives in Colab.
+
+`teacher_selection="validation_ce"` requires T=[1.0]. Fit every requested gamma
+on training labels, select the lowest hard-label validation CE (smaller gamma
+breaks exact ties), then condense only that gamma's rank/lambda grid. The teacher
+choice is saved in selected_teacher.json before any condensation. Teacher accuracy
+is diagnostic only and no test labels are used for selection. Default `grid`
+continues to tune gamma jointly with condensation parameters. Teacher preselection
+and student selection share validation, so validation is not an independent holdout
+estimate. Final test is evaluated only for the selected condensation setting.
