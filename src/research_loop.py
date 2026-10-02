@@ -32,6 +32,15 @@ def implementation_provenance():
 
 def dispatch(job, stop):
     options = dict(job["options"])
+    if job["kind"] == "citation_gradient_fixed25_prepare":
+        from src.citation_gradient_fixed25 import prepare
+        return prepare(**options, stop=stop)
+    if job["kind"] == "citation_gradient_fixed25_certify":
+        from src.citation_gradient_fixed25 import certify
+        return certify(**options, stop=stop)
+    if job["kind"] == "citation_gradient_fixed25_validate":
+        from src.citation_gradient_fixed25 import validate
+        return validate(**options, stop=stop)
     if job["kind"] == "citation_gradient_probe":
         from src.citation_gradient_probe import prepare_probe
         return prepare_probe(**options, stop=stop)
