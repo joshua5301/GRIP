@@ -32,6 +32,9 @@ def implementation_provenance():
 
 def dispatch(job, stop):
     options = dict(job["options"])
+    if job["kind"] == "citation_cora_node_reference_certify":
+        from src.cora_node_reference_certificate import certify
+        return certify(**options, stop=stop)
     if job["kind"] == "citation_cora_node_reference_prepare":
         from src.cora_node_reference import prepare
         return prepare(**options, stop=stop)
