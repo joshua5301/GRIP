@@ -1,3 +1,4 @@
+import gc
 import hashlib
 import math
 import subprocess
@@ -272,6 +273,7 @@ def run_risk_sweep(
                     block_size=block_size,
                 )
                 save_state(partition, artifact)
+                gc.collect()
             if not math.isfinite(partition["J"]) or partition["J"] > partition["history"][0] + 1e-8:
                 raise RuntimeError("Partition objective is invalid")
             diagnostics.append(
