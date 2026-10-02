@@ -35,3 +35,11 @@ The initialization is identical to the historical hard partition before mixing,
 but its soft objective at step zero is not the historical hard initial objective.
 Rank, mixing, learning rate and step budget are fixed controls, not swept by the
 gamma/T/B grid. Tests are intended to run in Colab, not locally.
+
+Set `assignment_initialization="random"` to remove the historical seed partition
+and all fixed logits. Independent standard-normal U and V produce
+P=softmax(UVᵀ/sqrt(rank)). Mixing is unused. The condensation seed controls only
+factor initialization; it is independent of gamma/T/B. Supply `rank` as an
+additional grid key to select gamma/T/B/rank jointly by mean GCN validation.
+The 1/sqrt(rank) scaling standardizes initial logit variance, not optimization
+dynamics. The historical initialization remains available as the default.

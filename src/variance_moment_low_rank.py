@@ -30,10 +30,18 @@ def low_rank_partition(
     steps=1000,
     lr=0.01,
     mixing=0.05,
+    initialization="historical",
 ):
+    if initialization not in ("historical", "random"):
+        raise ValueError("Use historical or random initialization")
     if not 1 <= m <= len(H) or not math.isfinite(B) or B <= 0:
         raise ValueError("Require 1 <= m <= N and finite B > 0")
-    if not 0 < mixing < 1 or min(rank, block_size, steps) < 1 or not math.isfinite(lr) or lr <= 0:
+    if (
+        (initialization == "historical" and not 0 < mixing < 1)
+        or min(rank, block_size, steps) < 1
+        or not math.isfinite(lr)
+        or lr <= 0
+    ):
         raise ValueError("Invalid low-rank settings")
     if H.is_cuda:
         torch.cuda.synchronize(H.device)
@@ -47,19 +55,28 @@ def low_rank_partition(
     n, d = X.shape
     classes = Q.shape[1]
     generator = torch.Generator(device=X.device).manual_seed(seed)
-    assignment = seed_partition(X, Q, m, B, generator, block_size)
-    initial_digest = array_digest(assignment.cpu().numpy())
+    assignment, initial_digest = None, None
+    if initialization == "historical":
+        assignment = seed_partition(X, Q, m, B, generator, block_size)
+        initial_digest = array_digest(assignment.cpu().numpy())
     energy, original = X.square().sum(1).mean(), X.T @ Q / n
-    bias = math.log((1 - mixing + mixing / m) / (mixing / m))
-    U = torch.nn.Parameter(
-        torch.randn(n, rank, generator=generator, device=X.device, dtype=X.dtype) / rank**0.5
-    )
-    V = torch.nn.Parameter(X.new_zeros(m, rank))
+    bias = math.log((1 - mixing + mixing / m) / (mixing / m)) if assignment is not None else None
+    U = torch.nn.Parameter(torch.randn(n, rank, generator=generator, device=X.device, dtype=X.dtype))
+    if initialization == "random":
+        V = torch.nn.Parameter(torch.randn(m, rank, generator=generator, device=X.device, dtype=X.dtype))
+    else:
+        U.data.div_(rank**0.5)
+        V = torch.nn.Parameter(X.new_zeros(m, rank))
     optimizer = torch.optim.Adam([U, V], lr=lr)
 
     def probabilities(start, end):
         logits = U[start:end] @ V.T
-        logits = logits.scatter_add(1, assignment[start:end, None], logits.new_full((end - start, 1), bias))
+        if assignment is None:
+            logits = logits / rank**0.5
+        else:
+            logits = logits.scatter_add(
+                1, assignment[start:end, None], logits.new_full((end - start, 1), bias)
+            )
         return logits.softmax(1)
 
     def chunk_statistics(start, end):
@@ -111,7 +128,8 @@ def low_rank_partition(
         status="fixed_step_budget",
         best_step=best_step,
         rank=rank,
-        mixing=mixing,
+        mixing=mixing if initialization == "historical" else None,
+        initialization=initialization,
         lr=lr,
         B=B,
         seed=seed,

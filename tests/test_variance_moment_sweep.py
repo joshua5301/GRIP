@@ -31,6 +31,8 @@ def test_selection_averages_all_seed_pairs_and_ignores_test():
         experiment._search_scores(rows[:-1], (0, 1, 2), (0, 1))
     with pytest.raises(ValueError):
         experiment._search_scores(rows + rows[:1], (0, 1, 2), (0, 1))
+    ranked = [dict(row, rank=4 if row["candidate"] == 0 else 8) for row in rows]
+    assert experiment._select(experiment._search_scores(ranked, (0, 1, 2), (0, 1)))["rank"] == 8
 
 
 @pytest.mark.parametrize(
@@ -142,7 +144,12 @@ def test_sweep_uniform_evaluation_selection_and_restart(
         epochs=10,
     )
     run = experiment.run_cora_risk_sweep if dataset == "cora" else experiment.run_risk_sweep
+    if method == "variance_moment_low_rank":
+        options["space"]["rank"] = [8]
+        options["assignment_initialization"] = "random"
     summary, by_seed, search, root = run(**options)
+    if method == "variance_moment_low_rank":
+        assert summary.iloc[0]["rank"] == 8
     assert summary.iloc[0].dataset == dataset and summary.iloc[0].nodes == cells
     config = json.loads((root / "config.json").read_text())
     assert config["teacher_kernel"] == kernel

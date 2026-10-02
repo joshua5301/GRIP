@@ -60,6 +60,7 @@ def _search_scores(rows, condensation_seeds, search_seeds):
             dict(
                 candidate=int(candidate),
                 **{key: float(group.iloc[0][key]) for key in ("gamma", "T", "B")},
+                **({"rank": int(group.iloc[0]["rank"])} if "rank" in group else {}),
                 search_val=float(means.mean()),
                 condensation_val_std=float(means.std()),
                 student_val_std=float(group.groupby("condensation_seed").val_acc.std().mean()),
@@ -145,6 +146,7 @@ def run_risk_sweep(
     assignment_steps=1000,
     assignment_lr=0.01,
     assignment_mixing=0.05,
+    assignment_initialization="historical",
 ):
     if method not in ("variance_moment", "variance_kl", "variance_moment_low_rank"):
         raise ValueError("Unknown partition method")
@@ -156,9 +158,14 @@ def run_risk_sweep(
     if space is None:
         bounds = {"cora": DEFAULT_SPACE["B"], "citeseer": [0.03, 0.1, 0.3, 1.0, 3.0]}
         space = dict(DEFAULT_SPACE, B=bounds.get(dataset, [0.1, 0.3, 1.0, 3.0, 10.0]))
-    if set(space) != {"gamma", "T", "B"}:
-        raise ValueError("Use grid keys gamma, T, B")
+    keys = set(space)
+    if keys != {"gamma", "T", "B"} and not (
+        method == "variance_moment_low_rank" and keys == {"gamma", "T", "B", "rank"}
+    ):
+        raise ValueError("Use gamma, T, B; low-rank also supports rank")
     candidates = grid_rows(space)
+    if "rank" in space and any(isinstance(r, bool) or not isinstance(r, int) or r < 1 for r in space["rank"]):
+        raise ValueError("Ranks must be positive integers")
     if any(not math.isfinite(value) or value <= 0 for row in candidates for value in row.values()):
         raise ValueError("Grid values must be finite and positive")
     if any(
@@ -184,6 +191,7 @@ def run_risk_sweep(
             steps=assignment_steps,
             lr=assignment_lr,
             mixing=assignment_mixing,
+            initialization=assignment_initialization,
         )
     graph, train, validation, testing, h = _prepare_dataset(dataset, data_dir, device)
     splits = dict(train=(graph, train), val=validation, test=testing)
@@ -242,8 +250,13 @@ def run_risk_sweep(
     config["method"] = method
     if method == "variance_moment_low_rank":
         config["assignment"] = dict(
-            rank=assignment_rank, steps=assignment_steps, lr=assignment_lr, mixing=assignment_mixing
+            rank=space.get("rank", assignment_rank),
+            steps=assignment_steps,
+            lr=assignment_lr,
+            mixing=assignment_mixing if assignment_initialization == "historical" else None,
+            initialization=assignment_initialization,
         )
+        config["initialization"] = assignment_initialization
     if method == "variance_kl":
         config["objective"] = "B**2/2 * variance + 8 * mean_forward_label_KL"
     if shared_run is not None:
@@ -339,6 +352,7 @@ def run_risk_sweep(
                     seed=seed,
                     max_sweeps=max_sweeps,
                     block_size=block_size,
+                    **({"rank": candidate["rank"]} if "rank" in candidate else {}),
                 )
                 save_state(partition, artifact)
                 gc.collect()
