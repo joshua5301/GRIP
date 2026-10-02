@@ -32,6 +32,9 @@ def implementation_provenance():
 
 def dispatch(job, stop):
     options = dict(job["options"])
+    if job["kind"] == "citation_source_preflight":
+        from src.citation_source_preflight import prepare_preflight
+        return prepare_preflight(**options, stop=stop)
     if job["kind"] == "citation_screen":
         from src.citation_search import run_screen
         ranking, root = run_screen(**options, stop=stop)
