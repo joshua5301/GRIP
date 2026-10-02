@@ -17,7 +17,7 @@ from src.low_rank_assignment import (
     initialize_dual_mlp,
     initialize_factors,
 )
-from src.moments import AssignmentMoments, make_material
+from src.moments import AssignmentMoments, initial_logits, make_material
 from src.multiseed_sweep import aggregate_search
 from src.soft_ce_partition import optimize_ce_assignment
 from src.sweep_utils import grid_rows, representative
@@ -82,7 +82,7 @@ def run_soft_init_sweep(
     teacher_selection="condensation",
     assignment_mode="low_rank",
 ):
-    if initialization not in ("kmeans", "random", "none"):
+    if initialization not in ("kmeans", "kmeans_mix", "random", "none"):
         raise ValueError("Unknown initialization")
     if initialization in ("random", "none") and finetune_temperatures is None:
         raise ValueError("Non-geometric assignments require the normalized cost sweep")
@@ -222,7 +222,7 @@ def run_soft_init_sweep(
     else:
         z, transform = fit_transform(h.double(), kind="rms")
         assignments = {
-            s: feature_kmeans(h.cpu(), cells, s).to(device) if initialization == "kmeans"
+            s: feature_kmeans(h.cpu(), cells, s).to(device) if initialization in ("kmeans", "kmeans_mix")
             else torch.arange(len(z), device=device) % cells
             for s in condensation_seeds
         }
@@ -243,7 +243,9 @@ def run_soft_init_sweep(
         ) for seed in (final_seeds if final else search_seeds)]
 
     def initial_state(seed, tau, q, width=None):
-        if initialization == "kmeans":
+        if initialization == "kmeans_mix":
+            base = initial_logits(assignments[seed], cells, 0.05, z.dtype)
+        elif initialization == "kmeans":
             base = distance_base(z, assignments[seed], tau, normalized=normalized)
         elif initialization == "random":
             base = random_cost_base(len(z), cells, seed, tau, device, z.dtype)
@@ -290,7 +292,7 @@ def run_soft_init_sweep(
             save_json(dict(
                 entropy=float(-(probability * probability.clamp_min(1e-300).log()).sum(1).mean()),
                 agreement=(float((probability.argmax(1) == assignments[seed]).double().mean())
-                           if initialization == "kmeans" else None),
+                           if initialization in ("kmeans", "kmeans_mix") else None),
                 min_mass=float(moments[:, 0].min()),
             ), folder / "assignment.json")
             records.extend(dict(candidate=index, **params, step=0, condensation_seed=seed, **row)
@@ -367,7 +369,7 @@ def run_soft_init_sweep(
                             t=t,
                             entropy=float(-(probability * probability.clamp_min(1e-300).log()).sum(1).mean()),
                             agreement=(float((probability.argmax(1) == assignments[seed]).double().mean())
-                                       if initialization == "kmeans" else None),
+                                       if initialization in ("kmeans", "kmeans_mix") else None),
                             min_mass=float(initial[:, 0].min()),
                         ), cache.parent / "assignment.json")
                 else:
