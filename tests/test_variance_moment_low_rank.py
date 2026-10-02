@@ -31,7 +31,10 @@ def test_chunked_optimizer_and_initial_mass_conservation():
     g = torch.Generator().manual_seed(5)
     h = torch.randn(15, 4, generator=g, dtype=torch.double)
     q = torch.randn(15, 3, generator=g, dtype=torch.double).softmax(1)
-    outputs = [low_rank_partition(h, q, 3, 1.0, initialize, steps=4, block_size=b) for b in (4, 15)]
+    outputs = [
+        low_rank_partition(h, q, 3, 1.0, initialize, steps=4, block_size=b, backend="chunked")
+        for b in (4, 15)
+    ]
     for result in outputs:
         assert result["J"] <= result["history"][0]
         assert result["J"] == min(result["history"])
@@ -83,3 +86,20 @@ def test_lambda_objective_and_optimizer_use_unscaled_variance():
     result = low_rank_partition(x, q, 3, None, None, initialization="random", steps=2, moment_weight=2.0)
     assert "B" not in result and result["lambda"] == 2.0
     assert result["J"] == pytest.approx(result["V"] + 2 * result["moment_error"])
+
+
+@pytest.mark.parametrize("initialization", ["historical", "random"])
+def test_full_and_chunked_backends_match(initialization):
+    g = torch.Generator().manual_seed(8)
+    h = torch.randn(21, 6, generator=g, dtype=torch.double)
+    q = torch.randn(21, 3, generator=g, dtype=torch.double).softmax(1)
+    options = dict(initialization=initialization, steps=5, rank=4, block_size=7)
+    if initialization == "random":
+        options["moment_weight"] = 3.0
+    full = low_rank_partition(h, q, 4, 1.0, initialize, backend="full", **options)
+    chunked = low_rank_partition(h, q, 4, 1.0, initialize, backend="chunked", **options)
+    torch.testing.assert_close(
+        torch.tensor(full["history"]), torch.tensor(chunked["history"]), atol=1e-6, rtol=1e-6
+    )
+    torch.testing.assert_close(full["x"], chunked["x"], atol=1e-6, rtol=1e-6)
+    torch.testing.assert_close(full["y"], chunked["y"], atol=1e-6, rtol=1e-6)

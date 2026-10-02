@@ -147,6 +147,7 @@ def run_risk_sweep(
     assignment_lr=0.01,
     assignment_mixing=0.05,
     assignment_initialization="historical",
+    assignment_backend="auto",
 ):
     if method not in ("variance_moment", "variance_kl", "variance_moment_low_rank"):
         raise ValueError("Unknown partition method")
@@ -193,6 +194,7 @@ def run_risk_sweep(
             lr=assignment_lr,
             mixing=assignment_mixing,
             initialization=assignment_initialization,
+            backend=assignment_backend,
         )
     graph, train, validation, testing, h = _prepare_dataset(dataset, data_dir, device)
     splits = dict(train=(graph, train), val=validation, test=testing)
@@ -258,6 +260,7 @@ def run_risk_sweep(
             lr=assignment_lr,
             mixing=assignment_mixing if assignment_initialization == "historical" else None,
             initialization=assignment_initialization,
+            backend=assignment_backend,
         )
         config["initialization"] = assignment_initialization
     if method == "variance_kl":

@@ -50,3 +50,12 @@ checkpoint selection. `lambda=8/B` maps the old objective up to a positive overa
 factor, preserving minimizers but not necessarily finite-step Adam trajectories.
 The lambda and B grids are mutually exclusive. No label-variance normalization
 is introduced; the existing centered, RMS-normalized feature space is retained.
+
+`assignment_backend="auto"` uses a single full-assignment autograd pass when
+N*K <= 2,000,000 (including Cora/Citeseer), and the two-pass chunked calculation
+otherwise. Explicit `full` and `chunked` overrides support timing comparisons.
+Full avoids recomputing probabilities and sufficient statistics for backward.
+It preserves the objective, float64 arithmetic and optimizer, apart from floating
+point accumulation differences. This threshold is a heuristic, not a GPU memory
+guarantee. Nonfinite checks aggregate device flags before host synchronization.
+Tests compare both backends' trajectories and representatives in Colab.

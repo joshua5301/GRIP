@@ -33,7 +33,10 @@ def low_rank_partition(
     mixing=0.05,
     initialization="historical",
     moment_weight=None,
+    backend="auto",
 ):
+    if backend not in ("auto", "full", "chunked"):
+        raise ValueError("Use auto, full or chunked backend")
     if initialization not in ("historical", "random"):
         raise ValueError("Use historical or random initialization")
     coefficient = B if moment_weight is None else moment_weight
@@ -58,6 +61,7 @@ def low_rank_partition(
     scale = scale if float(scale) > 0 else X.new_tensor(1.0)
     X = X / scale
     n, d = X.shape
+    backend = ("full" if n * m <= 2_000_000 else "chunked") if backend == "auto" else backend
     classes = Q.shape[1]
     generator = torch.Generator(device=X.device).manual_seed(seed)
     assignment, initial_digest = None, None
@@ -90,14 +94,19 @@ def low_rank_partition(
 
     history, best, best_value, best_step = [], None, math.inf, 0
     for step in range(steps + 1):
-        with torch.no_grad():
-            statistics = [X.new_zeros(m), X.new_zeros(m, d), X.new_zeros(m, classes)]
-            for start in range(0, n, block_size):
-                for total, chunk in zip(statistics, chunk_statistics(start, min(start + block_size, n))):
-                    total.add_(chunk)
-        if not all(bool(torch.isfinite(s).all()) for s in statistics) or bool((statistics[0] <= 0).any()):
+        optimizer.zero_grad(set_to_none=True)
+        if backend == "full":
+            statistics = chunk_statistics(0, n)
+        else:
+            with torch.no_grad():
+                statistics = [X.new_zeros(m), X.new_zeros(m, d), X.new_zeros(m, classes)]
+                for start in range(0, n, block_size):
+                    for total, chunk in zip(statistics, chunk_statistics(start, min(start + block_size, n))):
+                        total.add_(chunk)
+            statistics = [s.requires_grad_() for s in statistics]
+        valid = torch.stack([torch.isfinite(s).all() for s in statistics] + [(statistics[0] > 0).all()]).all()
+        if not bool(valid):
             raise FloatingPointError(f"Invalid cell statistics at step {step}")
-        statistics = [s.requires_grad_() for s in statistics]
         smooth, exact, variance, moment = moment_objective(
             statistics, energy, original, B, moment_weight=moment_weight
         )
@@ -110,12 +119,14 @@ def low_rank_partition(
             best = [s.detach().clone() for s in statistics]
         if step == steps:
             break
-        derivatives = torch.autograd.grad(smooth, statistics)
-        optimizer.zero_grad(set_to_none=True)
-        for start in range(0, n, block_size):
-            chunks = chunk_statistics(start, min(start + block_size, n))
-            sum((s * g).sum() for s, g in zip(chunks, derivatives)).backward()
-        if not all(bool(torch.isfinite(p.grad).all()) for p in (U, V)):
+        if backend == "full":
+            smooth.backward()
+        else:
+            derivatives = torch.autograd.grad(smooth, statistics)
+            for start in range(0, n, block_size):
+                chunks = chunk_statistics(start, min(start + block_size, n))
+                sum((s * g).sum() for s, g in zip(chunks, derivatives)).backward()
+        if not bool(torch.stack([torch.isfinite(p.grad).all() for p in (U, V)]).all()):
             raise FloatingPointError(f"Nonfinite gradient at step {step}")
         optimizer.step()
     mass, features, labels = best
@@ -133,6 +144,7 @@ def low_rank_partition(
         sweeps=steps,
         converged=False,
         status="fixed_step_budget",
+        backend=backend,
         best_step=best_step,
         rank=rank,
         mixing=mixing if initialization == "historical" else None,
