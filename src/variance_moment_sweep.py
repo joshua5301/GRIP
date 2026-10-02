@@ -156,6 +156,8 @@ def run_risk_sweep(
     assignment_initialization="historical",
     assignment_backend="auto",
     teacher_selection="grid",
+    candidate_subset=None,
+    evaluate_test=True,
 ):
     if teacher_selection not in ("grid", "validation_ce"):
         raise ValueError("Use grid or validation_ce teacher selection")
@@ -178,6 +180,11 @@ def run_risk_sweep(
     if "lambda" in keys and (method != "variance_moment_low_rank" or assignment_initialization != "random"):
         raise ValueError("Lambda grid requires random low-rank optimization")
     candidates = grid_rows(space)
+    if candidate_subset is not None:
+        if not candidate_subset or any(candidate not in candidates for candidate in candidate_subset):
+            raise ValueError("Candidate subset must be nonempty and belong to the supplied grid")
+        if len({_fingerprint(candidate) for candidate in candidate_subset}) != len(candidate_subset):
+            raise ValueError("Candidate subset must not contain duplicates")
     if "rank" in space and any(isinstance(r, bool) or not isinstance(r, int) or r < 1 for r in space["rank"]):
         raise ValueError("Ranks must be positive integers")
     if any(not math.isfinite(value) or value <= 0 for row in candidates for value in row.values()):
@@ -264,6 +271,8 @@ def run_risk_sweep(
         torch=str(torch.__version__),
     )
     config["method"] = method
+    if candidate_subset is not None:
+        config["candidate_subset"] = candidate_subset
     if "lambda" in space:
         config["objective"] = "variance + lambda * global_moment_norm"
     if method == "variance_moment_low_rank":
@@ -358,6 +367,10 @@ def run_risk_sweep(
             candidate for candidate in candidates if candidate["gamma"] == selected_teacher["gamma"]
         ]
         logits = {selected_teacher["gamma"]: logits[selected_teacher["gamma"]]}
+    if candidate_subset is not None:
+        candidates = [candidate for candidate in candidates if candidate in candidate_subset]
+        if not candidates:
+            raise ValueError("No requested candidates remain after teacher preselection")
 
     rows, diagnostics = [], []
     progress = tqdm(enumerate(candidates), total=len(candidates), desc=f"{dataset} {ratio:g}: {method}")
@@ -445,6 +458,8 @@ def run_risk_sweep(
     index = int(selected["candidate"])
     selected["candidate"] = index
     save_json(selected, root / "selected.json")
+    if not evaluate_test:
+        return pd.DataFrame(), pd.DataFrame(), search, root
     final = []
     for seed in tqdm(condensation_seeds, desc="Selected setting: final GCNs"):
         folder = root / f"candidate_{index:04d}" / f"seed_{seed}"

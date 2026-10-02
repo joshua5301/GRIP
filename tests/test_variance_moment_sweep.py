@@ -186,6 +186,16 @@ def test_sweep_uniform_evaluation_selection_and_restart(
         torch.load(shared[-1] / "features.pt", weights_only=True),
     )
     assert shared[0].iloc[0].test_mean == summary.iloc[0].test_mean
+    candidate = {key: values[0] for key, values in options["space"].items()}
+    before = len(fits)
+    screening = run(**dict(options, candidate_subset=[candidate], evaluate_test=False))
+    assert screening[0].empty and screening[1].empty and len(screening[2]) == 1
+    assert len(fits) - before == 6
+    assert not (screening[-1] / "final_students.csv").exists()
+    screened_fits = len(fits)
+    completed = run(**dict(options, candidate_subset=[candidate], evaluate_test=True))
+    assert completed[-1] == screening[-1]
+    assert len(fits) - screened_fits == 6
 
 
 def test_inductive_teacher_uses_training_anchors_and_shared_mapping():

@@ -68,3 +68,13 @@ is diagnostic only and no test labels are used for selection. Default `grid`
 continues to tune gamma jointly with condensation parameters. Teacher preselection
 and student selection share validation, so validation is not an independent holdout
 estimate. Final test is evaluated only for the selected condensation setting.
+
+`evaluate_test=False` saves search tables and selected.json, and returns empty
+summary/by-seed frames without final students. Repeating the same run with True
+reuses its search/partition caches and evaluates its winner. `candidate_subset`
+accepts complete grid dictionaries for shortlisted settings; it is fingerprinted.
+This supports validation-only screening at 1000 updates followed by 2000/3000
+updates on the top settings. Use the initial run as shared_run to retain exact
+features and teacher logits. Larger budgets currently restart from the same seed;
+optimizer state continuation is not implemented. Compare stage winners by search
+validation and invoke final evaluation only on the winning stage.
