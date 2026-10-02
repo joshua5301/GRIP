@@ -574,10 +574,15 @@ def optimize_ce_assignment(
             "mlp_initial_options",
         )
     }
-    if set(mlp_initial_options) - {"mlp_initial_mass_schema", "mlp_initial_mass_source"}:
+    if set(mlp_initial_options) - {"mlp_initial_mass_schema", "mlp_initial_mass_source",
+                                   "mlp_output_centering", "mlp_source_centering_schema", "mlp_source_centering_source"}:
         raise ValueError("Unknown MLP initial-mass control")
     mlp_initial_mass_schema = mlp_initial_options.get("mlp_initial_mass_schema")
     mlp_initial_mass_source = mlp_initial_options.get("mlp_initial_mass_source")
+    centering_mode = mlp_initial_options.get("mlp_output_centering")
+    centering_schema = mlp_initial_options.get("mlp_source_centering_schema")
+    centering_source = mlp_initial_options.get("mlp_source_centering_source")
+    centered_active = centering_mode is not None
     if inner_loss_weighting == "mass":
         resume_config.pop("inner_loss_weighting")
     if outer_targets is not None:
@@ -680,10 +685,23 @@ def optimize_ce_assignment(
         resume_config.update(mlp_initial_mass_schema=1, mlp_initial_mass_source=mlp_initial_mass_source)
     elif mlp_initial_mass_schema is not None or mlp_initial_mass_source is not None:
         raise ValueError("MLP initial provenance controls require mass_mode='initial'")
+    if centered_active:
+        if (centering_mode != "source_mean_v1" or type(centering_schema) is not int or centering_schema != 1
+                or torch.get_default_dtype() != torch.float32 or assignment_input != "features"
+                or assignment_encoder != "mlp" or assignment_rank is None or mass_mode != "free"
+                or inner_loss_weighting != "uniform" or solver_mode != "exact" or node_weighting
+                or temperature_logits is not None or outer_targets is not None or outer_indices is not None
+                or implicit_solver is not None or inner_solver is not None or cache_assignment or save_assignment
+                or not save_resume or mixing != .05):
+            raise ValueError("Source centering requires native MLP/free-mass/uniform-CE verifiable checkpoints")
+        resume_config.update(mlp_output_centering=centering_mode, mlp_source_centering_schema=centering_schema,
+                             mlp_source_centering_source=centering_source)
+    elif centering_schema is not None or centering_source is not None:
+        raise ValueError("Source centering provenance requires its explicit output mode")
     checkpoints = set(checkpoint_steps)
     if any((not isinstance(step, (int, np.integer)) or not 0 <= step <= steps for step in checkpoints)):
         raise ValueError("Checkpoint steps must be integers within the optimization budget")
-    if checkpoints or mass_mode == "initial":
+    if checkpoints or mass_mode == "initial" or centered_active:
         checkpoints.update((0, steps))
     snapshots = {}
     _check_assignment_stop(stop)
@@ -725,6 +743,20 @@ def optimize_ce_assignment(
         elif folder is not None and (Path(folder) / "checkpoints").exists() and any(
                 (Path(folder) / "checkpoints").glob("step_*.pt")):
             raise ValueError("Initial-mass cached checkpoints require a verifiable resume state")
+    if centered_active:
+        from src.mlp_source_centering import original_context as centered_context
+        from src.mlp_source_centering import validate_resume as validate_centered_resume
+        centering_context, centering_initial = centered_context(
+            z, q, assignment, assignment_rank, encoder_hidden, factor_seed, mixing, chunk_size,
+            resume_config, centering_source)
+        if [array_digest(p.detach().cpu().numpy()) for p in parameters] != [
+                array_digest(p.detach().cpu().numpy()) for p in centering_initial]:
+            raise ValueError("Centered initializer differs from its native source provenance")
+        if resume_state is not None:
+            validate_centered_resume(resume_state, z, q, assignment, centering_context,
+                                     centering_initial, steps, folder)
+        elif folder is not None and any((Path(folder) / "checkpoints").glob("step_*.pt")):
+            raise ValueError("Centered cached checkpoints require a verifiable resume")
     if node_weighting:
         node_logits = z.new_zeros(len(z), dtype=torch.float32).requires_grad_()
         groups = [
@@ -795,7 +827,11 @@ def optimize_ce_assignment(
                 raise FloatingPointError("Nonfinite or nonpositive learned temperature")
             material = make_material(z, temperature_labels(temperature_logits, log_temperature))
         if assignment_input != "node":
-            u = encode_nodes(inputs, encoder_parameters)
+            if centered_active:
+                from src.mlp_source_centering import centered_nodes
+                u, centering_mean, centering_diagnostic = centered_nodes(inputs, encoder_parameters)
+            else:
+                u = encode_nodes(inputs, encoder_parameters)
         balance = dict(balance_iterations=0, row_residual=np.nan, column_residual=np.nan)
         if node_weighting:
             node_weights, weight_kl = normalized_node_weights(node_logits)
@@ -924,6 +960,8 @@ def optimize_ce_assignment(
             implicit_seconds=0.0,
             backward_seconds=0.0,
         )
+        if centered_active:
+            row.update(centering_diagnostic)
         if temperature_logits is not None:
             row["temperature"] = temperature
         if "benchmark_lbfgs_seconds" in fitted:
@@ -1057,6 +1095,9 @@ def optimize_ce_assignment(
                 from src.mlp_initial_mass import attach
                 snapshot["column_dual"] = dual.detach().cpu().clone()
                 attach(snapshot, mass_target, initial_mass_context, parameters)
+            if centered_active:
+                from src.mlp_source_centering import attach as attach_centered
+                attach_centered(snapshot, centering_context, parameters, u, centering_mean, centering_diagnostic)
             snapshots[step] = snapshot
             if folder is not None:
                 checkpoint_dir = folder / "checkpoints"
@@ -1089,6 +1130,9 @@ def optimize_ce_assignment(
             if mass_mode == "initial":
                 from src.mlp_initial_mass import attach
                 attach(state, mass_target, initial_mass_context)
+            if centered_active:
+                from src.mlp_source_centering import attach as attach_centered
+                attach_centered(state, centering_context)
             if folder is not None:
                 torch.save(state, folder / "resume.tmp.pt")
                 (folder / "resume.tmp.pt").replace(folder / "resume.pt")
@@ -1122,8 +1166,15 @@ def optimize_ce_assignment(
             row["log_temperature_gradient"] = float(log_temperature.grad)
         if mass_mode == "initial" and any(p.grad is None or not bool(torch.isfinite(p.grad).all()) for p in parameters):
             raise FloatingPointError("Missing or nonfinite constrained MLP gradient")
+        if centered_active:
+            if any(p.grad is None or not bool(torch.isfinite(p.grad).all()) for p in parameters):
+                raise FloatingPointError("Missing or nonfinite centered MLP gradient")
+            if bool(encoder_parameters[3].grad.ne(0).any()):
+                raise FloatingPointError("Centered output-bias gradient is not exactly zero")
         _check_assignment_stop(stop)
         optimizer.step()
+        if centered_active and bool(encoder_parameters[3].ne(0).any()):
+            raise FloatingPointError("Centered output bias left its zero gauge")
         row["backward_seconds"] = timestamp() - backward_start
         row["seconds"] = elapsed + time.perf_counter() - started
         if folder is not None and step % log_every == 0:

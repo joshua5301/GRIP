@@ -64,6 +64,9 @@ def _nystrom_inner_weighting(identity):
 def _candidate_nystrom_mass(candidate):
     """Preload validation; only balanced candidates gain effective controls."""
     candidate = dict(candidate)
+    if set(candidate) & {"mlp_output_centering", "mlp_source_centering_schema", "mlp_source_centering_source_digest"}:
+        from src.mlp_source_centering import candidate_controls
+        return candidate_controls(candidate)
     if candidate.get("method") == "mlp" and candidate.get("mass_mode") == "initial":
         from src.mlp_initial_mass import candidate_controls
         return candidate_controls(candidate)
@@ -338,6 +341,9 @@ def run_screen(dataset, ratio, output_dir, candidates, steps=50,
     if any(candidate.get("method") == "mlp" and candidate.get("mass_mode") == "initial" for candidate in candidates):
         if teacher_backend is not None or teacher_kernel != "relu" or len(candidates) != 1:
             raise ValueError("MLP initial-mass pilot requires one candidate and its original ReLU teacher")
+    if any(candidate.get("mlp_output_centering") == "source_mean_v1" for candidate in candidates):
+        if teacher_backend is not None or teacher_kernel != "relu" or len(candidates) != 1:
+            raise ValueError("Centered MLP requires one candidate and its original ReLU teacher")
     for candidate in candidates:
         if candidate.get("method", "low_rank") == "nystrom":
             _nystrom_inner_weighting(candidate)
@@ -365,8 +371,10 @@ def run_screen(dataset, ratio, output_dir, candidates, steps=50,
         selected, config, (_, frozen_inputs, pinned_assignment), _ = validate_root(
             root, graph, train, validation, h, stop=stop)
         logits, gamma = selected["logits"].to(device).double(), None
-    elif teacher_kernel == "relu" and candidates[0].get("method") == "mlp" and candidates[0].get("mass_mode") == "initial":
+    elif teacher_kernel == "relu" and candidates[0].get("method") == "mlp" and (candidates[0].get("mass_mode") == "initial" or candidates[0].get("mlp_output_centering") == "source_mean_v1"):
         from src.mlp_initial_mass import cached_source, validate_folder
+        if candidates[0].get("mlp_output_centering") == "source_mean_v1":
+            from src.mlp_source_centering import validate_folder
         root = source_root
         if not (root / "teacher.pt").is_file():
             raise ValueError("MLP initial-mass requires its existing original ReLU teacher")
@@ -395,7 +403,7 @@ def run_screen(dataset, ratio, output_dir, candidates, steps=50,
                                            val_mask=validation[1], val_labels=val_labels, device=device, stop=stop)
         logits, gamma = selected["logits"].to(device), selected["gamma"]
     inputs_path = root / f"inputs_{condensation_seed}.pt"
-    if candidates[0].get("method") == "mlp" and candidates[0].get("mass_mode") == "initial":
+    if candidates[0].get("method") == "mlp" and (candidates[0].get("mass_mode") == "initial" or candidates[0].get("mlp_output_centering") == "source_mean_v1"):
         z, transform, assignment = frozen_z, frozen_transform, frozen_assignment
     elif teacher_backend is not None:
         z = frozen_inputs["z"].to(device)
@@ -449,7 +457,7 @@ def run_screen(dataset, ratio, output_dir, candidates, steps=50,
                 cached = torch.load(cached_path, map_location="cpu", weights_only=False)
                 _check_nystrom_assignment(identity, cached, root=root,
                                          condensation_seed=condensation_seed, device=device, h=h, q=current_q)
-        if identity["method"] == "mlp" and mass_mode == "initial":
+        if identity["method"] == "mlp" and (mass_mode == "initial" or identity.get("mlp_output_centering") == "source_mean_v1"):
             validate_folder(root, identity, condensation_seed, z, current_q, frozen_assignment, mlp_source, steps)
         if teacher_backend is not None:
             from src.citation_gcn_teacher import validate_condensation
@@ -529,7 +537,12 @@ def run_screen(dataset, ratio, output_dir, candidates, steps=50,
                     temperature_options = dict(temperature_logits=logits.double(),
                         temperature_initial=identity["T"], temperature_lr=identity["temperature_lr"],
                         outer_targets=q.detach())
-                if mass_mode == "initial":
+                if identity.get("mlp_output_centering") == "source_mean_v1":
+                    from src.mlp_source_centering import citation_core_kwargs
+                    optimize_ce_assignment(z, q, assignment, steps=steps, folder=folder,
+                        checkpoint_steps=checks, resume_state=state, stop=stop,
+                        **citation_core_kwargs(identity, condensation_seed, mlp_source))
+                elif mass_mode == "initial":
                     from src.mlp_initial_mass import citation_core_kwargs
                     optimize_ce_assignment(z, q, assignment, steps=steps, folder=folder,
                         checkpoint_steps=checks, resume_state=state, stop=stop,
@@ -549,7 +562,7 @@ def run_screen(dataset, ratio, output_dir, candidates, steps=50,
                         save_resume=True, save_assignment=False, stop=stop, **temperature_options)
         if teacher_backend is not None:
             validate_condensation(root, identity, condensation_seed, z, q, pinned_assignment, steps, create=True)
-        if identity["method"] == "mlp" and mass_mode == "initial":
+        if identity["method"] == "mlp" and (mass_mode == "initial" or identity.get("mlp_output_centering") == "source_mean_v1"):
             validate_folder(root, identity, condensation_seed, z, q, assignment, mlp_source, steps)
         if identity.get("learn_temperature", False):
             if not resume.exists():
@@ -570,7 +583,7 @@ def run_screen(dataset, ratio, output_dir, candidates, steps=50,
                                            condensation_seed=condensation_seed, device=device, root=root,
                                            h=h if mass_mode == "initial" or identity.get("surrogate_kernel") is not None else None,
                                            q=q if mass_mode == "initial" or identity.get("surrogate_kernel") is not None else None)
-            if identity["method"] == "mlp" and mass_mode == "initial":
+            if identity["method"] == "mlp" and (mass_mode == "initial" or identity.get("mlp_output_centering") == "source_mean_v1"):
                 validate_folder(root, identity, condensation_seed, z, q, assignment, mlp_source, steps, snapshot)
             temperature_diagnostic = (_temperature_diagnostics(snapshot, state, step)
                                       if identity.get("learn_temperature", False) else {})
@@ -622,7 +635,7 @@ def run_screen(dataset, ratio, output_dir, candidates, steps=50,
     keys = ["method", "width", "lr", "T", "rank", "penalty", "step", "candidate_path"]
     keys += [key for key in ("initialization", "alpha", "inner_loss_weighting", "mass_mode", "mass_scaling",
                             "metric_input", "metric_alpha", "strength", "train_target_mix", "mixing",
-                            "learn_temperature", "temperature_lr", "balance_steps", "balance_tol", "balance_backend", "initial_mass_schema", "mlp_initial_mass_schema", "mlp_initial_mass_source_digest", "surrogate_kernel", "surrogate_schema", "surrogate_source_digest",
+                            "learn_temperature", "temperature_lr", "balance_steps", "balance_tol", "balance_backend", "initial_mass_schema", "mlp_initial_mass_schema", "mlp_initial_mass_source_digest", "mlp_output_centering", "mlp_source_centering_schema", "mlp_source_centering_source_digest", "surrogate_kernel", "surrogate_schema", "surrogate_source_digest",
                             "ntk_angle_guard", "ntk_norm_guard", "ntk_jitter") if key in frame.columns]
     keys += ["dropout", "input_scale", "epochs", "student_recipe"]
     grouped = frame.groupby(keys, dropna=False)
@@ -659,6 +672,13 @@ def selected_test(root, choice, condensation_seeds=(0, 1, 2), student_seeds=(100
     # Validate every supplied non-null kernel control before the row whitelist.
     raw = {key: value for key, value in choice.items() if pd.notna(value)}
     _candidate_surrogate(raw)
+    if set(raw) & {"mlp_output_centering", "mlp_source_centering_schema", "mlp_source_centering_source_digest"}:
+        from src.mlp_source_centering import candidate_controls
+        candidate_controls(raw)
+        if not isinstance(raw.get("mlp_source_centering_source_digest"), str):
+            raise ValueError("Selected centered row must retain its numerical source token")
+        if type(choice.get("step")) is not int or choice["step"] < 0:
+            raise ValueError("Selected centered checkpoint must be a nonnegative integer")
     if raw.get("method") == "mlp" and raw.get("mass_mode") == "initial":
         from src.mlp_initial_mass import candidate_controls
         candidate_controls(raw)
@@ -680,6 +700,8 @@ def selected_test(root, choice, condensation_seeds=(0, 1, 2), student_seeds=(100
             if recorded.get("method") == "mlp" and recorded.get("mass_mode") == "initial" and (
                     raw.get("mass_mode") != "initial" or raw.get("mlp_initial_mass_schema") != 1):
                 raise ValueError("Selected row lost its recorded initial MLP identity")
+            if recorded.get("mlp_output_centering") is not None and raw.get("mlp_output_centering") != recorded["mlp_output_centering"]:
+                raise ValueError("Selected row lost its recorded source centering identity")
             if recorded.get("surrogate_kernel") is not None and raw.get("surrogate_kernel") != recorded["surrogate_kernel"]:
                 raise ValueError("Selected row lost its recorded NTK kernel identity")
     candidate = {key: choice[key] for key in ("method", "width", "lr", "T", "rank", "penalty")}
@@ -700,7 +722,7 @@ def selected_test(root, choice, condensation_seeds=(0, 1, 2), student_seeds=(100
         candidate["nystrom_schema"] = 3
     candidate.update({key: choice[key] for key in ("initialization", "alpha", "inner_loss_weighting", "mass_mode", "mass_scaling",
                                                   "metric_input", "metric_alpha", "strength", "train_target_mix",
-                                                  "balance_steps", "balance_tol", "balance_backend", "initial_mass_schema", "mlp_initial_mass_schema", "mlp_initial_mass_source_digest", "surrogate_kernel", "surrogate_schema", "surrogate_source_digest",
+                                                  "balance_steps", "balance_tol", "balance_backend", "initial_mass_schema", "mlp_initial_mass_schema", "mlp_initial_mass_source_digest", "mlp_output_centering", "mlp_source_centering_schema", "mlp_source_centering_source_digest", "surrogate_kernel", "surrogate_schema", "surrogate_source_digest",
                                                   "ntk_angle_guard", "ntk_norm_guard", "ntk_jitter") if key in choice
                       and pd.notna(choice[key])})
     if "mixing" in choice:
@@ -723,6 +745,9 @@ def selected_test(root, choice, condensation_seeds=(0, 1, 2), student_seeds=(100
     if candidate.get("method") == "mlp" and candidate.get("mass_mode") == "initial" and "candidate_path" in raw:
         if Path(raw["candidate_path"]).resolve() != (root / _fingerprint(candidate)).resolve() or recorded != candidate:
             raise ValueError("Selected initial MLP row differs from its recorded candidate/root")
+    if candidate.get("mlp_output_centering") == "source_mean_v1" and "candidate_path" in raw:
+        if Path(raw["candidate_path"]).resolve() != (root / _fingerprint(candidate)).resolve() or recorded != candidate:
+            raise ValueError("Selected centered row differs from its recorded candidate/root")
     for key in ("lr", "T", "penalty"):
         candidate[key] = float(candidate[key])
     _assignment_mass_mode(candidate)
@@ -780,7 +805,7 @@ def selected_test(root, choice, condensation_seeds=(0, 1, 2), student_seeds=(100
         labels, val_labels = teacher_inputs(graph, train, validation[1])
         validate_root(root, h=h, train_mask=train, train_labels=labels, val_mask=validation[1],
                       val_labels=val_labels, device=device, stop=stop)
-    if candidate.get("mass_mode") != "initial" and candidate.get("surrogate_kernel") is None:
+    if candidate.get("mass_mode") != "initial" and candidate.get("surrogate_kernel") is None and candidate.get("mlp_output_centering") is None:
         save_json(selection, root / "selected.json")
         save_json(selection, root / f"selected_{selection_key}.json")
     logits = torch.load(root / "teacher.pt", map_location=device, weights_only=False)["logits"]
@@ -798,8 +823,10 @@ def selected_test(root, choice, condensation_seeds=(0, 1, 2), student_seeds=(100
                                              root=root, condensation_seed=cond_seed, device=device, h=h, q=q)
         save_json(selection, root / "selected.json")
         save_json(selection, root / f"selected_{selection_key}.json")
-    if candidate["method"] == "mlp" and candidate.get("mass_mode") == "initial":
+    if candidate["method"] == "mlp" and (candidate.get("mass_mode") == "initial" or candidate.get("mlp_output_centering") == "source_mean_v1"):
         from src.mlp_initial_mass import cached_source, validate_folder
+        if candidate.get("mlp_output_centering") == "source_mean_v1":
+            from src.mlp_source_centering import validate_folder
         for cond_seed in condensation_seeds:
             _, current_z, _, current_assignment, current_source = cached_source(root, candidate, cond_seed, h, q, config)
             validate_folder(root, candidate, cond_seed, current_z, q, current_assignment, current_source, step)
@@ -832,7 +859,7 @@ def selected_test(root, choice, condensation_seeds=(0, 1, 2), student_seeds=(100
             _check_nystrom_assignment(candidate, snapshot, root=root, condensation_seed=cond_seed, device=device,
                                       h=h if candidate.get("mass_mode") == "initial" or candidate.get("surrogate_kernel") is not None else None,
                                       q=q if candidate.get("mass_mode") == "initial" or candidate.get("surrogate_kernel") is not None else None)
-        if candidate["method"] == "mlp" and candidate.get("mass_mode") == "initial":
+        if candidate["method"] == "mlp" and (candidate.get("mass_mode") == "initial" or candidate.get("mlp_output_centering") == "source_mean_v1"):
             _, current_z, _, current_assignment, current_source = cached_source(root, candidate, cond_seed, h, q, config)
             validate_folder(root, candidate, cond_seed, current_z, q, current_assignment, current_source, step, snapshot)
         if candidate["method"] == "coarsening":
