@@ -32,6 +32,9 @@ def implementation_provenance():
 
 def dispatch(job, stop):
     options = dict(job["options"])
+    if job["kind"] == "citation_cora_csr_segment_isolation":
+        from src.cora_csr_segment_isolation import prepare_isolation
+        return prepare_isolation(**options, stop=stop)
     if job["kind"] == "citation_cora_csr_adjoint_isolation":
         from src.cora_csr_adjoint_isolation import prepare_isolation
         return prepare_isolation(**options, stop=stop)
