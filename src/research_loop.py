@@ -32,6 +32,9 @@ def implementation_provenance():
 
 def dispatch(job, stop):
     options = dict(job["options"])
+    if job["kind"] == "citation_cora_gradient_fixed25":
+        from src.cora_gradient_fixed25 import run
+        return run(**options, stop=stop)
     if job["kind"] == "citation_cora_gradient_probe":
         from src.cora_gradient_probe import prepare_probe
         return prepare_probe(**options, stop=stop)
