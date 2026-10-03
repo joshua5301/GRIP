@@ -579,7 +579,9 @@ def optimize_ce_assignment(
                                    "source_linear_coordinates", "source_linear_schema", "source_linear_source", "source_linear_inputs",
                                    "uniform_cell_q_prior_weight", "uniform_cell_q_prior_schema", "uniform_cell_q_prior_source",
                                    "assignment_kl_weight", "assignment_kl_schema", "assignment_kl_source", "assignment_kl_teacher_T",
-                                   "node_factor_mode", "node_factor_artifact", "node_factor_sha256", "node_factor_context"}:
+                                   "node_factor_mode", "node_factor_artifact", "node_factor_sha256", "node_factor_context",
+                                   "graph_assignment_kl_mode", "graph_assignment_kl_artifact",
+                                   "graph_assignment_kl_sha256", "graph_assignment_kl_context"}:
         raise ValueError("Unknown MLP initial-mass control")
     mlp_initial_mass_schema = mlp_initial_options.get("mlp_initial_mass_schema")
     mlp_initial_mass_source = mlp_initial_options.get("mlp_initial_mass_source")
@@ -663,6 +665,35 @@ def optimize_ce_assignment(
                              node_factor_sha256=node_factor_sha256, node_factor_context=node_factor_context)
     elif any(value is not None for value in (node_factor_artifact, node_factor_sha256, node_factor_context)):
         raise ValueError("Disabled NODE factor mode cannot carry an artifact or context")
+    # The graph prior is frozen in a separate native preparation namespace.
+    # It changes the outer objective, never the native factor factory or head.
+    graph_kl_mode = mlp_initial_options.get("graph_assignment_kl_mode")
+    graph_kl_active = graph_kl_mode is not None
+    graph_kl_artifact = mlp_initial_options.get("graph_assignment_kl_artifact")
+    graph_kl_sha256 = mlp_initial_options.get("graph_assignment_kl_sha256")
+    graph_kl_context = mlp_initial_options.get("graph_assignment_kl_context")
+    if graph_kl_active:
+        if (graph_kl_mode != "binary_rw_diffused_native_P0_v1"
+                or assignment_input != "node" or assignment_encoder != "linear"
+                or type(assignment_rank) is not int or assignment_rank < 1
+                or mass_mode != "free" or inner_loss_weighting != "uniform" or solver_mode != "exact"
+                or inner_method != "newton_first" or implicit_warm_start is not True
+                or node_weighting or temperature_logits is not None or outer_targets is not None
+                or outer_indices is not None or implicit_solver is not None or inner_solver is not None
+                or cache_assignment or centered_active or source_linear_active or prior_active or row_kl_active
+                or node_factor_active or mlp_initial_mass_schema is not None or mlp_initial_mass_source is not None
+                or save_assignment or not save_resume or mixing != .05 or torch.get_default_dtype() != torch.float32
+                or not isinstance(graph_kl_artifact, str) or not isinstance(graph_kl_sha256, str)
+                or not isinstance(graph_kl_context, dict)):
+            raise ValueError("Frozen graph KL requires original native free/uniform exact CE")
+        from src.frozen_graph_assignment_prior import load_frozen_prior
+        from src.initial_assignment_row_kl import InitialAssignmentKLMoments
+        resume_config.update(graph_assignment_kl_mode=graph_kl_mode,
+                             graph_assignment_kl_artifact=graph_kl_artifact,
+                             graph_assignment_kl_sha256=graph_kl_sha256,
+                             graph_assignment_kl_context=graph_kl_context)
+    elif any(value is not None for value in (graph_kl_artifact, graph_kl_sha256, graph_kl_context)):
+        raise ValueError("Disabled graph KL cannot carry an artifact or context")
     if inner_loss_weighting == "mass":
         resume_config.pop("inner_loss_weighting")
     if outer_targets is not None:
@@ -798,6 +829,8 @@ def optimize_ce_assignment(
         raise ValueError("Checkpoint steps must be integers within the optimization budget")
     if checkpoints or mass_mode == "initial" or centered_active or source_linear_active or row_kl_active or node_factor_active:
         checkpoints.update((0, steps))
+    if graph_kl_active:
+        checkpoints.update((0, steps))
     snapshots = {}
     _check_assignment_stop(stop)
     material = make_material(z, q)
@@ -902,6 +935,75 @@ def optimize_ce_assignment(
                 log_probability=saved_reference["log_probability"].detach().to(device=z.device).clone())
         elif folder is not None and any((Path(folder) / "checkpoints").glob("step_*.pt")):
             raise ValueError("Assignment KL cached checkpoints require a verifiable resume")
+    if graph_kl_active:
+        refs = graph_kl_context.get("source_refs", {})
+        if (refs.get("data_digest") != resume_config["data_digest"]
+                or refs.get("factor_seed") != factor_seed or refs.get("mixing") != mixing
+                or refs.get("chunk_size") != chunk_size):
+            raise ValueError("Frozen graph prior differs from native input/seed/mixing/chunk context")
+        graph_log_reference = load_frozen_prior(graph_kl_artifact, graph_kl_sha256,
+            dict(nodes=len(assignment), cells=clusters, rank=assignment_rank), z.device,
+            expected_context=graph_kl_context)
+        graph_initial_parameters = [p.detach().cpu().clone() for p in parameters]
+        def graph_parameter_digests(values):
+            if (not isinstance(values, (list, tuple)) or len(values) != 2
+                    or any(not torch.is_tensor(p) or p.dtype != torch.float32 or p.requires_grad
+                           or not bool(torch.isfinite(p).all()) for p in values)
+                    or values[0].shape != (len(assignment), assignment_rank)
+                    or values[1].shape != (clusters, assignment_rank)):
+                raise ValueError("Graph KL native parameter descriptors are invalid")
+            return [array_digest(p.detach().cpu().numpy()) for p in values]
+        if graph_parameter_digests(graph_initial_parameters) != graph_kl_context["native_parameter_digests"]:
+            raise ValueError("Graph KL native Gaussian initialization differs from its frozen source")
+        if resume_state is not None:
+            if (type(resume_state.get("step")) is not int or not 0 <= resume_state["step"] <= steps
+                    or resume_state.get("config") != resume_config
+                    or resume_state.get("graph_assignment_kl_context") != graph_kl_context
+                    or graph_parameter_digests(resume_state.get("graph_assignment_kl_initial_parameters"))
+                       != graph_kl_context["native_parameter_digests"]):
+                raise ValueError("Graph KL resume lost its immutable native/prior/config binding")
+            saved_snapshots = resume_state.get("snapshots", {})
+            if 0 not in saved_snapshots or resume_state["step"] not in saved_snapshots:
+                raise ValueError("Graph KL resume lacks its initial or terminal checkpoint")
+            if graph_parameter_digests(saved_snapshots[0].get("graph_assignment_kl_parameters")) != graph_kl_context["native_parameter_digests"]:
+                raise ValueError("Graph KL resume initial factors changed")
+            initial_anchor = resume_state.get("initial_moments")
+            if (not torch.is_tensor(initial_anchor)
+                    or not torch.equal(initial_anchor, saved_snapshots[0]["moments"])
+                    or not torch.equal(resume_state["theta"], saved_snapshots[resume_state["step"]]["theta"])):
+                raise ValueError("Graph KL resume initial moments or terminal head changed")
+            scale0 = max(saved_snapshots[0]["teacher_ce"], 1e-12)
+            if not np.isfinite(scale0) or resume_state.get("scale") != scale0:
+                raise ValueError("Graph KL resume changed its teacher-CE0-only scale")
+            for saved_step, snapshot in saved_snapshots.items():
+                if (type(saved_step) is not int or snapshot.get("step") != saved_step
+                        or not 0 <= saved_step <= resume_state["step"]
+                        or snapshot.get("graph_assignment_kl_context") != graph_kl_context
+                        or snapshot.get("graph_assignment_kl_config") != resume_config
+                        or snapshot.get("graph_assignment_kl_scale") != scale0):
+                    raise ValueError("Graph KL resume checkpoint differs from its bound prior/config/scale")
+                graph_parameter_digests(snapshot.get("graph_assignment_kl_parameters"))
+                if (not np.isfinite(snapshot.get("graph_assignment_kl_KL", np.nan))
+                        or not np.isfinite(snapshot.get("teacher_ce", np.nan))
+                        or snapshot.get("objective") != snapshot["teacher_ce"] + snapshot["graph_assignment_kl_KL"]):
+                    raise ValueError("Graph KL resume checkpoint objective lost its CE/KL binding")
+            if graph_parameter_digests(resume_state.get("parameters")) != graph_parameter_digests(
+                    saved_snapshots[resume_state["step"]].get("graph_assignment_kl_parameters")):
+                raise ValueError("Graph KL resume terminal factors differ from its checkpoint")
+            graph_history = resume_state.get("history", [])
+            if [entry.get("step") for entry in graph_history] != list(range(resume_state["step"] + 1)):
+                raise ValueError("Graph KL resume history lost its complete typed prefix")
+            for entry in graph_history:
+                if (type(entry.get("step")) is not int
+                        or not np.isfinite(entry.get("teacher_ce", np.nan))
+                        or not np.isfinite(entry.get("graph_assignment_kl_KL", np.nan))
+                        or entry.get("J") != entry["teacher_ce"]
+                        or entry.get("objective") != entry["teacher_ce"] + entry["graph_assignment_kl_KL"]
+                        or entry.get("graph_assignment_kl_scale") != scale0
+                        or entry.get("normalized_objective") != entry["objective"] / scale0):
+                    raise ValueError("Graph KL resume history changed its CE/KL/normalization binding")
+        elif folder is not None and any((Path(folder) / "checkpoints").glob("step_*.pt")):
+            raise ValueError("Graph KL cached checkpoints require a verifiable resume")
     if node_weighting:
         node_logits = z.new_zeros(len(z), dtype=torch.float32).requires_grad_()
         groups = [
@@ -1016,6 +1118,9 @@ def optimize_ce_assignment(
                 row_residual=float(diagnostic[1]),
                 column_residual=float(diagnostic[2]),
             )
+        elif graph_kl_active:
+            moments, graph_row_kl = InitialAssignmentKLMoments.apply(
+                u, v, assignment, material, mixing, chunk_size, graph_log_reference)
         elif row_kl_active:
             moments, row_kl = InitialAssignmentKLMoments.apply(
                 u, v, assignment, material, mixing, chunk_size, row_kl_reference["log_probability"])
@@ -1146,6 +1251,13 @@ def optimize_ce_assignment(
                 node_ess_fraction=float((1 / node_weights.square().mean()).detach()),
                 objective=objective,
             )
+        if graph_kl_active:
+            objective += float(graph_row_kl.detach())
+            if not np.isfinite(objective):
+                raise FloatingPointError("Nonfinite combined teacher CE/frozen graph KL objective")
+            row.update(graph_assignment_kl_KL=float(graph_row_kl.detach()), teacher_ce=value,
+                       objective=objective, objective_name="teacher_CE_plus_KL_current_to_frozen_graph_diffused_P0",
+                       teacher_CE_normalization_scale="max_teacher_CE_P0_1e-12")
         failure = None
         if refresh and (not fitted["inner_converged"]) or not np.isfinite(value):
             failure = "Inner CE did not converge; increase inner_max_iter or inspect inner_tol"
@@ -1155,6 +1267,8 @@ def optimize_ce_assignment(
                 scale = max(value, 1e-12)
             if row_kl_active:
                 row.update(assignment_kl_scale=scale, normalized_objective=objective / scale)
+            if graph_kl_active:
+                row.update(graph_assignment_kl_scale=scale, normalized_objective=objective / scale)
             if fitted["inner_converged"] and objective < best:
                 best, best_step = (objective, step)
                 best_moments, best_theta = (moments.detach().cpu(), theta.cpu())
@@ -1283,6 +1397,13 @@ def optimize_ce_assignment(
             if node_factor_active:
                 snapshot.update(node_factor_context=node_factor_context, node_factor_config=resume_config,
                                 node_factor_parameters=[p.detach().cpu().clone() for p in parameters])
+            if graph_kl_active:
+                snapshot.update(graph_assignment_kl_context=graph_kl_context,
+                                graph_assignment_kl_config=resume_config,
+                                graph_assignment_kl_parameters=[p.detach().cpu().clone() for p in parameters],
+                                graph_assignment_kl_KL=float(graph_row_kl.detach()), objective=objective,
+                                graph_assignment_kl_scale=scale,
+                                objective_name="teacher_CE_plus_KL_current_to_frozen_graph_diffused_P0")
             snapshots[step] = snapshot
             if folder is not None:
                 checkpoint_dir = folder / "checkpoints"
@@ -1325,6 +1446,9 @@ def optimize_ce_assignment(
                 attach_row_kl(state, row_kl_reference, row_kl_context, resume_config)
             if node_factor_active:
                 state["node_factor_context"] = node_factor_context
+            if graph_kl_active:
+                state.update(graph_assignment_kl_context=graph_kl_context,
+                             graph_assignment_kl_initial_parameters=graph_initial_parameters)
             if folder is not None:
                 torch.save(state, folder / "resume.tmp.pt")
                 (folder / "resume.tmp.pt").replace(folder / "resume.pt")
@@ -1348,6 +1472,8 @@ def optimize_ce_assignment(
                 )
             elif row_kl_active:
                 torch.autograd.backward((moments, row_kl), (direction / scale, row_kl.new_tensor(1 / scale)))
+            elif graph_kl_active:
+                torch.autograd.backward((moments, graph_row_kl), (direction / scale, graph_row_kl.new_tensor(1 / scale)))
             else:
                 moments.backward(direction / scale)
         except RuntimeError as error:
@@ -1407,6 +1533,9 @@ def optimize_ce_assignment(
                       objective_name="teacher_CE_plus_source_row_KL_current_to_initial")
     if node_factor_active:
         result.update(node_factor_mode=node_factor_mode, node_factor_context=node_factor_context)
+    if graph_kl_active:
+        result.update(graph_assignment_kl_context=graph_kl_context,
+                      objective_name="teacher_CE_plus_KL_current_to_frozen_graph_diffused_P0")
     if folder is not None and save_assignment:
         if assignment_rank is None:
             torch.save(best_parameters[0].cpu(), folder / "best_assignment_logits.pt")

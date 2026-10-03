@@ -32,6 +32,9 @@ def implementation_provenance():
 
 def dispatch(job, stop):
     options = dict(job["options"])
+    if job["kind"] == "citation_graph_prior":
+        from src.citation_graph_prior import run
+        return run(**options, stop=stop)
     if job["kind"] == "citation_factor_geometry":
         from src.citation_factor_geometry import run
         return run(**options, stop=stop)
