@@ -32,6 +32,9 @@ def implementation_provenance():
 
 def dispatch(job, stop):
     options = dict(job["options"])
+    if job["kind"] == "cora_whole_layer_probe":
+        from src.cora_whole_layer_probe import prepare
+        return prepare(**options, stop=stop)
     if job["kind"] == "citeseer_gradient_confirmation_prepare":
         from src.citeseer_gradient_confirmation import prepare
         return prepare(**options, stop=stop)
