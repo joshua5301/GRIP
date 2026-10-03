@@ -43,7 +43,10 @@ def distance_logits(h, q, assignment, alpha):
 def run_distance_finetune(source, output_dir, ranks=(4, 8, 16), taus=(0.1, 0.3, 1.0),
                           penalties=(1e-5, 1e-4, 1e-3), steps=300,
                           checkpoints=(0, 25, 50, 100, 200, 300), lr=0.01,
-                          inner_loss_weighting="mass", data_dir="/content/data/", device="cuda"):
+                          inner_loss_weighting="mass", data_dir="/content/data/", device="cuda",
+                          methods=("fixed_D", "svd_UV")):
+    if not methods or len(set(methods)) != len(methods) or any(m not in ("fixed_D", "svd_UV") for m in methods):
+        raise ValueError("Choose unique fixed_D and/or svd_UV methods")
     source = Path(source)
     config = json.loads((source / "config.json").read_text())
     selected = json.loads((source / "selected.json").read_text())
@@ -78,7 +81,7 @@ def run_distance_finetune(source, output_dir, ranks=(4, 8, 16), taus=(0.1, 0.3, 
     settings = dict(source=str(source.resolve()), source_config=config, selected=selected, ranks=list(ranks),
                     taus=list(taus), penalties=list(penalties), steps=steps, checkpoints=checkpoints, lr=lr,
                     inner_loss_weighting=inner_loss_weighting, distance_scale=distance_scale, code=code,
-                    cg_max_iter=2048, cg_rtol=1e-6, inner_method="newton_first")
+                    cg_max_iter=2048, cg_rtol=1e-6, inner_method="newton_first", methods=list(methods))
     root = Path(output_dir) / _fingerprint(settings)
     root.mkdir(parents=True, exist_ok=True)
     save_json(settings, root / "config.json")
@@ -100,15 +103,15 @@ def run_distance_finetune(source, output_dir, ranks=(4, 8, 16), taus=(0.1, 0.3, 
     baseline = evaluate(original["x"].to(device), original["y"].to(device), root / "hard" / "search", search_seeds)
     baseline_val = float(pd.DataFrame(baseline).val_acc.mean())
     init_cache = {}
-    grid = list(itertools.product(("fixed_D", "svd_UV"), ranks, taus, penalties))
+    grid = list(itertools.product(methods, ranks, taus, penalties))
     for candidate, (method, rank, tau, penalty) in enumerate(tqdm(grid, desc="Distance-initialized bilevel sweep")):
         key = (rank, tau)
-        if key not in init_cache:
+        if method == "svd_UV" and key not in init_cache:
             target = distance / tau
             factors = svd_factors(target, rank)
             reconstructed = factors[0].double() @ factors[1].double().T / rank**0.5
             init_cache[key] = (factors, float((reconstructed - target).norm() / target.norm().clamp_min(1e-30)))
-        factors, error = init_cache[key]
+        factors, error = init_cache[key] if method == "svd_UV" else (None, 0.0)
         base = distance / tau if method == "fixed_D" else torch.zeros_like(distance)
         folder = root / f"candidate_{candidate:04d}"
         folder.mkdir(exist_ok=True)
@@ -130,7 +133,11 @@ def run_distance_finetune(source, output_dir, ranks=(4, 8, 16), taus=(0.1, 0.3, 
         for step in checkpoints:
             moments = optimized["checkpoints"][step]["moments"]
             x, y, _ = representative(moments)
-            scores = pd.DataFrame(evaluate(x, y, folder / f"search_step_{step}", search_seeds))
+            evaluation_folder = folder / f"search_step_{step}"
+            if step == 0:
+                initial_key = f"{method}_tau_{tau}" + (f"_rank_{rank}" if method == "svd_UV" else "")
+                evaluation_folder = root / "initial_search" / initial_key
+            scores = pd.DataFrame(evaluate(x, y, evaluation_folder, search_seeds))
             rows.append(dict(candidate=candidate, method=method, rank=rank, tau=tau, penalty=penalty,
                              step=step, search_val=float(scores.val_acc.mean()),
                              search_val_std=float(scores.val_acc.std()),
@@ -150,7 +157,7 @@ def run_distance_finetune(source, output_dir, ranks=(4, 8, 16), taus=(0.1, 0.3, 
         pd.DataFrame(final_rows).to_csv(root / "summary.csv", index=False)
 
     report("hard", "stage_one", hard_scores, dict(rank=None, tau=None, penalty=None, step=0), baseline_val)
-    for method in ("fixed_D", "svd_UV"):
+    for method in methods:
         winner = search[search.method == method].sort_values(
             ["search_val", "step", "candidate"], ascending=[False, True, True]).iloc[0]
         candidate, step = int(winner.candidate), int(winner.step)

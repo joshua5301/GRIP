@@ -23,3 +23,8 @@ full-distance soft reference at the selected SVD temperature. Step zero is an
 eligible checkpoint. Citeseer stores only the small N-by-m base, not N-by-N
 distances; moments and their gradients use node chunks. Resume states are saved
 at checkpoints, and completed optimization/student artifacts are reused.
+
+The `methods` argument can restrict the sweep to fixed_D only. Initial GCN
+search evaluations are shared across ranks and penalties at fixed tau for
+fixed_D, and across penalties at fixed rank/tau for svd_UV. No SVD is computed
+in fixed_D-only runs.
