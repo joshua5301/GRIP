@@ -49,7 +49,9 @@ def move_deltas(x, q, source, state, n, weight):
     return delta
 
 
-def initialize(x, cells, seed, block_size, iterations=20):
+def initialize(x, cells, seed, block_size, iterations=20, return_info=False):
+    if iterations < 1:
+        raise ValueError("Initialization iterations must be positive")
     generator = torch.Generator(device=x.device).manual_seed(seed)
     index = int(torch.randint(len(x), (1,), generator=generator, device=x.device))
     selected = torch.zeros(len(x), device=x.device, dtype=torch.bool)
@@ -67,8 +69,9 @@ def initialize(x, cells, seed, block_size, iterations=20):
                 else int(torch.where(~selected)[0][0])
             )
     centers = x[indices].clone()
-    assignment = torch.zeros(len(x), device=x.device, dtype=torch.long)
-    for _ in range(iterations):
+    assignment = torch.full((len(x),), -1, device=x.device, dtype=torch.long)
+    converged = False
+    for step in range(iterations):
         previous = assignment.clone()
         distances = x.new_empty(len(x))
         for start in range(0, len(x), block_size):
@@ -86,8 +89,10 @@ def initialize(x, cells, seed, block_size, iterations=20):
             distances[donor] = -torch.inf
         centers = x.new_zeros(centers.shape).index_add_(0, assignment, x) / counts[:, None]
         if torch.equal(previous, assignment):
+            converged = True
             break
-    return assignment
+    info = dict(initialization_steps=step + 1, initialization_converged=converged)
+    return (assignment, info) if return_info else assignment
 
 
 @torch.no_grad()
@@ -103,11 +108,16 @@ def moment_lloyd_partition(
     mode="hybrid",
     atol=1e-12,
     rtol=1e-10,
+    initialization_steps=20,
+    require_initialization_convergence=False,
+    backtrack_steps=8,
 ):
-    if mode not in ("hybrid", "full_only") or not 1 <= m <= len(H):
+    if mode not in ("hybrid", "full_only", "filtered_batch") or not 1 <= m <= len(H):
         raise ValueError("Invalid mode or cell count")
     if not math.isfinite(moment_weight) or moment_weight < 0 or max_sweeps < 0 or block_size < 1:
         raise ValueError("Invalid weight or budget")
+    if backtrack_steps < 0:
+        raise ValueError("Backtracking budget must be nonnegative")
     if H.is_cuda:
         torch.cuda.synchronize(H.device)
     started = perf_counter()
@@ -117,7 +127,11 @@ def moment_lloyd_partition(
     scale = x.square().sum(1).mean().sqrt().clamp_min(1e-30)
     x = x / scale
     energy, original = x.square().sum(1).mean(), x.T @ q / len(x)
-    assignment = initialize(x, m, seed, block_size)
+    assignment, initialization_info = initialize(
+        x, m, seed, block_size, initialization_steps, return_info=True
+    )
+    if require_initialization_convergence and not initialization_info["initialization_converged"]:
+        raise RuntimeError("Initial k-means reached its iteration limit; increase initialization_steps")
     digest = array_digest(assignment.cpu().numpy())
 
     def aggregate(a):
@@ -142,6 +156,19 @@ def moment_lloyd_partition(
         ids = torch.where(proposed != assignment)[0]
         checks, accepted, kind = 0, None, "full"
 
+        def record(kind, moved, value):
+            records.append(
+                dict(
+                    sweep=sweep + 1,
+                    kind=kind,
+                    checks=checks,
+                    moves=moved,
+                    J=value,
+                    candidates=len(ids),
+                    accepted_fraction=moved / max(1, len(ids)),
+                )
+            )
+
         def acceptable(candidate):
             nonlocal checks
             checks += 1
@@ -152,13 +179,15 @@ def moment_lloyd_partition(
             accepted = acceptable(proposed)
         if accepted is None and mode == "full_only":
             status = "full_rejected" if len(ids) else "no_proposal"
-            records.append(dict(sweep=sweep + 1, kind=status, checks=checks, moves=0, J=history[-1]))
+            record(status, 0, history[-1])
             break
         if accepted is None:
             kind = "partial"
             ordered = ids[torch.argsort(gains[ids], descending=True, stable=True)]
             size = len(ordered) // 2
-            while size:
+            for _ in range(backtrack_steps):
+                if not size:
+                    break
                 candidate = assignment.clone()
                 chosen = ordered[:size]
                 candidate[chosen] = proposed[chosen]
@@ -167,6 +196,10 @@ def moment_lloyd_partition(
                     proposed = candidate
                     break
                 size //= 2
+        if accepted is None and mode == "filtered_batch":
+            status = "filtered_rejected" if len(ids) else "no_proposal"
+            record(status, 0, history[-1])
+            break
         if accepted is None:
             kind = "exact_single"
             for i in range(len(x)):
@@ -181,12 +214,12 @@ def moment_lloyd_partition(
                         break
             if accepted is None:
                 status, converged = "single_move_stationary", True
-                records.append(dict(sweep=sweep + 1, kind=status, checks=checks, moves=0, J=history[-1]))
+                record(status, 0, history[-1])
                 break
         moved = int((assignment != proposed).sum())
         assignment, state = proposed, accepted
         history.append(score(state))
-        records.append(dict(sweep=sweep + 1, kind=kind, checks=checks, moves=moved, J=history[-1]))
+        record(kind, moved, history[-1])
     counts, centers, labels, variance, moment = state
     if H.is_cuda:
         torch.cuda.synchronize(H.device)
@@ -196,6 +229,7 @@ def moment_lloyd_partition(
         counts=counts.long().cpu(),
         assignment=assignment.cpu(),
         initial_assignment_digest=digest,
+        **initialization_info,
         J=history[-1],
         V=float(variance),
         moment_error=float(moment.norm()),

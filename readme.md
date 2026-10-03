@@ -251,7 +251,8 @@ objective through soft low-rank assignment logits, without bilevel optimization.
 See [the initialization and sweep protocol](docs/variance_moment_low_rank.md).
 # Moment-corrected Lloyd
 
-`run_risk_sweep` supports `moment_lloyd_hybrid` and `moment_lloyd_full_only`
+`run_risk_sweep` supports `moment_lloyd_hybrid`, `moment_lloyd_full_only`
+and `moment_lloyd_filtered_batch`
 with a `lambda` grid. Both use the same full-feature k-means++ initialization,
 preserve the variance–moment objective, and evaluate uniform-CE GCN students.
 See [algorithm and stopping semantics](docs/moment_lloyd.md).

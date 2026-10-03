@@ -163,10 +163,13 @@ def run_risk_sweep(
     teacher_selection="grid",
     candidate_subset=None,
     evaluate_test=True,
+    initialization_steps=20,
+    require_initialization_convergence=False,
+    backtrack_steps=8,
 ):
     if teacher_selection not in ("grid", "validation_ce"):
         raise ValueError("Use grid or validation_ce teacher selection")
-    lloyd = method in ("moment_lloyd_hybrid", "moment_lloyd_full_only")
+    lloyd = method in ("moment_lloyd_hybrid", "moment_lloyd_full_only", "moment_lloyd_filtered_batch")
     if method not in ("variance_moment", "variance_kl", "variance_moment_low_rank") and not lloyd:
         raise ValueError("Unknown partition method")
     if (dataset, ratio) not in BUDGET:
@@ -214,7 +217,12 @@ def run_risk_sweep(
     sources, modules = _load_reference()
     solver, teacher = modules["risk_partition"]["risk_partition"], modules["teacher"]
     if lloyd:
-        solver = partial(moment_lloyd_partition, mode=method.removeprefix("moment_lloyd_"))
+        solver = partial(
+            moment_lloyd_partition, mode=method.removeprefix("moment_lloyd_"),
+            initialization_steps=initialization_steps,
+            require_initialization_convergence=require_initialization_convergence,
+            backtrack_steps=backtrack_steps,
+        )
     if method == "variance_kl":
         solver = partial(variance_kl_partition, seed_partition=modules["risk_partition"]["seed_partition"])
     if method == "variance_moment_low_rank":
@@ -287,7 +295,12 @@ def run_risk_sweep(
     )
     config["method"] = method
     if lloyd:
-        config["initialization"] = "full_feature_kmeans++_lloyd20"
+        config["initialization"] = "full_feature_kmeans++_lloyd"
+        config["lloyd_options"] = dict(
+            initialization_steps=initialization_steps,
+            require_initialization_convergence=require_initialization_convergence,
+            backtrack_steps=backtrack_steps,
+        )
     if candidate_subset is not None:
         config["candidate_subset"] = candidate_subset
     if "lambda" in space:
@@ -436,6 +449,8 @@ def run_risk_sweep(
                     sweeps=partition["sweeps"],
                     converged=partition["converged"],
                     status=partition.get("status", ""),
+                    initialization_steps=partition.get("initialization_steps", float("nan")),
+                    initialization_converged=partition.get("initialization_converged", None),
                     partition_seconds=partition["seconds"],
                     partition_path=str(artifact),
                 )

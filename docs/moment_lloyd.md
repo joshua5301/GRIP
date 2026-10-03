@@ -1,10 +1,13 @@
 # Moment-corrected Lloyd proposals
 
 The objective is `variance + lambda * ||global feature-label residual moment||_F`.
-Both `moment_lloyd_hybrid` and `moment_lloyd_full_only` use identical seeded
-k-means++ followed by at most 20 ordinary Lloyd iterations on the full centered,
+`moment_lloyd_hybrid`, `moment_lloyd_full_only` and `moment_lloyd_filtered_batch` use identical seeded
+k-means++ followed by ordinary Lloyd iterations on the full centered,
 RMS-normalized S²X features. There is no PCA, low-rank factor, annealing or GD.
 This initialization differs from the projected initialization of the low-rank method.
+`initialization_steps` defaults to 20; set 300 and `require_initialization_convergence=True`
+to require unchanged assignments before optimization. Hitting the initialization limit
+then raises an error. Artifacts store the initialization iterations and convergence flag.
 
 With feature and label means c,s, and G=M/||M||, assignment proposals minimize
 `||x-c||² + lambda*(x-c)^T G (q-s)`. This is a first-order cost, not an upper bound.
@@ -18,6 +21,12 @@ of moves ranked by predicted gain. If these fail, it scans exact single-node
 relocations and accepts the first verified improvement, then rebuilds proposals.
 The scan forbids deleting singleton cells. A complete scan with no accepted move
 is stationarity to numerical tolerance. An iteration limit is not convergence.
+
+Filtered-batch uses the same full proposal followed by top-gain prefixes (half,
+quarter, etc.) but never scans exact single moves. `backtrack_steps=8` limits the
+number of partial attempts for both filtered-batch and hybrid. Rejection or no
+proposal stops filtered-batch without declaring stationarity. Records include
+candidate count, accepted move fraction, and objective evaluation count.
 
 Artifacts retain the initial assignment digest, original objective history,
 termination status, and per-attempt kind, check count and accepted move count.

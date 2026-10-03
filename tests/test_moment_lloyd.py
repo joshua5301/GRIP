@@ -1,3 +1,4 @@
+import pytest
 import torch
 
 import src.moment_lloyd as module
@@ -43,9 +44,10 @@ def test_paired_initialization_and_monotonicity():
     x, q, _ = example()
     outputs = [
         module.moment_lloyd_partition(x, q, 3, moment_weight=2, mode=mode, max_sweeps=10)
-        for mode in ("hybrid", "full_only")
+        for mode in ("hybrid", "full_only", "filtered_batch")
     ]
     assert outputs[0]["initial_assignment_digest"] == outputs[1]["initial_assignment_digest"]
+    assert outputs[0]["initial_assignment_digest"] == outputs[2]["initial_assignment_digest"]
     for result in outputs:
         assert all(b < a for a, b in zip(result["history"], result["history"][1:]))
         assert (result["counts"] > 0).all()
@@ -65,3 +67,49 @@ def test_full_rejection_keeps_initial_state(monkeypatch):
     assert not result["converged"]
     assert len(result["history"]) == 1
     torch.testing.assert_close(initial["assignment"], result["assignment"])
+
+
+def test_initialization_stability_and_limit():
+    x, q, _ = example()
+    a, info = module.initialize(x, 3, 0, 8, iterations=100, return_info=True)
+    assert info["initialization_converged"]
+    centers = x.new_zeros(3, x.shape[1]).index_add_(0, a, x) / torch.bincount(a)[:, None]
+    assert torch.equal(torch.cdist(x, centers).argmin(1), a)
+    with pytest.raises(RuntimeError, match="Initial k-means"):
+        module.moment_lloyd_partition(
+            x, q, 3, initialization_steps=1, require_initialization_convergence=True
+        )
+
+
+def test_filtered_backtracks_without_exact_scan(monkeypatch):
+    x, q, _ = example()
+    x = x - x.mean(0)
+    x = x / x.square().sum(1).mean().sqrt()
+    initial = module.moment_lloyd_partition(x, q, 3, max_sweeps=0)["assignment"]
+    real_statistics = module.statistics
+
+    def forced_cost(xb, *args):
+        cost = xb.new_zeros(len(xb), 3)
+        target = (initial + 1) % 3
+        cost.scatter_(1, target[:, None], -torch.arange(1, len(xb) + 1, dtype=xb.dtype)[:, None])
+        return cost
+
+    def controlled_score(xb, qb, a, cells, energy, original):
+        state = real_statistics(xb, qb, initial, cells, energy, original)
+        changed = int((a != initial).sum())
+        value = 2.0 if changed == len(a) else (0.0 if changed else 1.0)
+        return (*state[:3], xb.new_tensor(value), torch.zeros_like(state[4]))
+
+    def forbidden(*args):
+        raise AssertionError("Filtered batches must not scan exact single moves")
+
+    monkeypatch.setattr(module, "assignment_cost", forced_cost)
+    monkeypatch.setattr(module, "statistics", controlled_score)
+    monkeypatch.setattr(module, "move_deltas", forbidden)
+    result = module.moment_lloyd_partition(x, q, 3, mode="filtered_batch", max_sweeps=1)
+    assert result["records"][0]["kind"] == "partial"
+    assert result["records"][0]["accepted_fraction"] == 0.5
+    assert result["records"][0]["checks"] == 2
+    stopped = module.moment_lloyd_partition(x, q, 3, mode="filtered_batch", max_sweeps=1, backtrack_steps=0)
+    assert stopped["status"] == "filtered_rejected"
+    assert not stopped["converged"]
