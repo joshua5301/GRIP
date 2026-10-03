@@ -32,6 +32,15 @@ def implementation_provenance():
 
 def dispatch(job, stop):
     options = dict(job["options"])
+    if job["kind"] == "citation_citeseer_certify_existing":
+        from src.citeseer_confirmation_source import certify_existing
+        return certify_existing(**options, stop=stop)
+    if job["kind"] == "citation_citeseer_prepare_initializer":
+        from src.citeseer_confirmation_source import prepare_initializer
+        return prepare_initializer(**options, stop=stop)
+    if job["kind"] == "citation_citeseer_prepare_node_reference":
+        from src.citeseer_confirmation_source import prepare_node_reference
+        return prepare_node_reference(**options, stop=stop)
     if job["kind"] == "citation_cora_csr_segment_ensemble":
         from src.cora_csr_segment_ensemble import prepare_isolation
         return prepare_isolation(**options, stop=stop)
