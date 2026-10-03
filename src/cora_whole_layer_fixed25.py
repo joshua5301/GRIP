@@ -29,10 +29,10 @@ from src.soft_ce_partition import head_gradient, optimize_ce_assignment, outer_v
 from src.sweep_utils import representative
 from src.whole_layer_gradient_alignment import POLICY, moment_partials
 
-SCIENCE = "Cora70_two_whole_layer_fixed25_matched_NODE_scientific_stageBR_v2.json"
-SCIENCE_SHA = "1cf9d80ded2415fb27e91e9605fdc03bfd6e7575cd87137e759cd0a7eea288ee"
-SCIENCE_REVIEW = "independent_scientific_review_stageBR_v2.json"
-SCIENCE_REVIEW_SHA = "2a9f5fb5d66b3fc42a80685e8e0d0251cca9ba8e1dfdc13587ab0febe53d0bca"
+SCIENCE = "Cora70_two_whole_layer_fixed25_matched_NODE_scientific_stageBS_v1.json"
+SCIENCE_SHA = "b894eab2fa03ac656a5c2b46fb738ff0277ab67c21d1713c63a7f2b964e08508"
+SCIENCE_REVIEW = "independent_scientific_review_stageBS_v1.json"
+SCIENCE_REVIEW_SHA = "89866467d8366f4edf4b6a6689e80c98b0053843fea94d22fe2effa0b6cab31e"
 _FIELDS = {"schema", "fixed", "case", "candidate", "candidate_id", "matched_NODE_candidate", "source", "numerical_source",
            "python_version", "files_sha256", "scientific_preregistration", "artifacts_sha256", "output_root",
            "certificate_outputs", "grouping_policy", "student_seeds"}
@@ -128,7 +128,7 @@ def _origin(buffers,saved,reference,evidence):
         moments = probe._moments(buffers,buffers["initial"]).detach()
     inherited._count(evidence,"origin_moment",True)
     _require(torch.equal(moments,probe._tensor(saved.get("moments"),(70,1441),torch.float64,"Malformed own original NODE0").to(moments)), "Own current M0 differs from original")
-    inputs = representative(moments,buffers["transform"],1433,"cuda")
+    inputs = representative(moments,probe._transform(buffers),1433,"cuda")
     weights = torch.full_like(inputs[2],1/70)
     inputs = (inputs[0],inputs[1],weights)
     _require(reference["actual_FP32_P0_X_Q_uniform_equal_reference"] is True and probe._digest(list(inputs)) == reference["student_inputs"], "Own actual P0 readout differs")
@@ -200,7 +200,7 @@ def _node_certificate(buffers, origin, expected, folder, evidence):
                  "Own linear head/value/history certificate differs")
         if step == 0:
             _require(torch.equal(moments, origin["moments"]), "Core native step0 differs from own manual P0")
-            x, q, mass = representative(moments, buffers["transform"], 1433, "cuda")
+            x, q, mass = representative(moments, probe._transform(buffers), 1433, "cuda")
             _require(all(torch.equal(a, b) for a, b in zip((x, q, torch.full_like(mass, 1 / 70)), origin["inputs"], strict=True)),
                      "Own core FP32 X/Q and supplied F64 uniform differ")
         else:
@@ -397,7 +397,7 @@ def _validate(spec,science,buffers,origin,states,context,arm,gate_sha,evidence,s
         endpoint = saved["moments"].to(origin["moments"])
     else:
         endpoint = states[25]["moments"].to(origin["moments"])
-    endpoint_inputs = representative(endpoint,buffers["transform"],1433,"cuda")
+    endpoint_inputs = representative(endpoint,probe._transform(buffers),1433,"cuda")
     endpoint_inputs = (endpoint_inputs[0],endpoint_inputs[1],torch.full_like(endpoint_inputs[2],1/70))
     base = Path(science["candidate_folder"]).parent
     rows = []

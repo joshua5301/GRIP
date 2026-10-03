@@ -160,6 +160,8 @@ def test_endpoint_numeric_AST_only_lr_and_receipt_instrumentation_changed():
         def visit_Call(self,n):
             self.generic_visit(n)
             if isinstance(n.func,ast.Attribute) and ast.unparse(n.func)=='inherited._count':n.func=ast.Name(id='_count',ctx=ast.Load())
+            if isinstance(n.func,ast.Name) and n.func.id=='representative' and len(n.args)==4 and ast.unparse(n.args[1])=='probe._transform(buffers)':
+                n.args[1]=ast.parse("buffers['transform']",mode='eval').body
             return n
         def visit_Compare(self,n):
             self.generic_visit(n)
@@ -199,3 +201,87 @@ def test_phase_API_before_native_access(tmp_path,mutation):
     elif mutation=='float_cells':cells=70.
     else:operation='resume'
     with pytest.raises(ValueError):extract('_request')['_request'](operation,cells,arm,gate,science['operation_outputs']['certify'],{},science)
+
+
+# StageBS adds only the four frozen-transform interface controls below.
+FROZEN_BR = REPO / "results/implementation_drafts/cora_whole_layer_fixed25_v1/proposed/src/cora_whole_layer_fixed25.py"
+FUNCTIONS = ("_origin", "_node_certificate", "_validate")
+
+
+def representative_calls(path):
+    calls = {}
+    for fn in ast.parse(path.read_text()).body:
+        if isinstance(fn, ast.FunctionDef):
+            selected = [n for n in ast.walk(fn) if isinstance(n, ast.Call)
+                        and isinstance(n.func, ast.Name) and n.func.id == "representative"]
+            if selected:
+                assert len(selected) == 1
+                calls[fn.name] = selected[0]
+    return calls
+
+
+def bridge():
+    # Execute only the unchanged constructor and bridge AST, with its local import
+    # replaced by the injected constructor. No production module is imported.
+    tree = ast.parse((REPO / "src/transforms.py").read_text())
+    cls = next(n for n in tree.body if isinstance(n, ast.ClassDef) and n.name == "FeatureTransform")
+    init = next(n for n in cls.body if isinstance(n, ast.FunctionDef) and n.name == "__init__")
+    cls.body = [init]
+    tree = ast.parse((REPO / "src/finite_student_probe.py").read_text())
+    fn = next(n for n in tree.body if isinstance(n, ast.FunctionDef) and n.name == "_transform")
+    assert isinstance(fn.body[0], ast.ImportFrom) and fn.body[0].module == "src.transforms"
+    fn.body = fn.body[1:]
+    env = {}
+    exec(compile(ast.Module(body=[cls, fn], type_ignores=[]), "unchanged_transform_constructor_AST", "exec"), env)
+    return env["_transform"]
+
+
+def test_exactly_three_readout_bridges_and_no_other_function_change():
+    calls = representative_calls(SOURCE)
+    assert tuple(calls) == FUNCTIONS
+    tree = ast.parse(SOURCE.read_text())
+    for call in calls.values():
+        assert len(call.args) == 4 and not call.keywords
+        assert ast.unparse(call.args[1]) == "probe._transform(buffers)"
+        assert ast.literal_eval(call.args[2]) == 1433 and ast.literal_eval(call.args[3]) == "cuda"
+    class Undo(ast.NodeTransformer):
+        def visit_Call(self, node):
+            self.generic_visit(node)
+            if isinstance(node.func, ast.Name) and node.func.id == "representative":
+                node.args[1] = ast.parse("buffers['transform']", mode="eval").body
+            return node
+    tree = Undo().visit(tree)
+    # Science/peer constants are the only other permitted new-BS changes.
+    constants = {"SCIENCE", "SCIENCE_SHA", "SCIENCE_REVIEW", "SCIENCE_REVIEW_SHA"}
+    def body_without_pins(tree):
+        return [n for n in tree.body if not (isinstance(n, ast.Assign)
+                and any(isinstance(t, ast.Name) and t.id in constants for t in n.targets))]
+    assert ast.dump(ast.Module(body=body_without_pins(tree), type_ignores=[])) == ast.dump(
+        ast.Module(body=body_without_pins(ast.parse(FROZEN_BR.read_text())), type_ignores=[]))
+
+
+@pytest.mark.parametrize("function", FUNCTIONS)
+def test_each_live_readout_call_wraps_same_frozen_mapping(function):
+    frozen = dict(center=object(), matrix=None, output_center=object(), scale=object(), kind="rms", eps=1e-12)
+    before = dict(frozen)
+    moments = object()
+    seen = []
+    def readout(value, transform, dimension, device):
+        # This is the actual representative object's attribute contract; no
+        # moment decoding, numerical arithmetic, tensor or device call occurs.
+        seen.append((value, transform, dimension, device))
+        assert transform.scale is frozen["scale"]
+        assert transform.output_center is frozen["output_center"]
+        assert transform.center is frozen["center"]
+        return ("FP32_X", "FP32_Q", "FP64_mass")
+    env = dict(buffers={"transform": frozen}, moments=moments, endpoint=moments,
+               probe=types.SimpleNamespace(_transform=bridge()), representative=readout)
+    call = representative_calls(SOURCE)[function]
+    result = eval(compile(ast.Expression(body=call), "actual_representative_call_AST", "eval"), env)
+    assert result == ("FP32_X", "FP32_Q", "FP64_mass")
+    assert len(seen) == 1 and seen[0][0] is moments and seen[0][2:] == (1433, "cuda")
+    assert seen[0][1].matrix is None and seen[0][1].kind == "rms" and seen[0][1].eps == 1e-12
+    assert frozen == before and all(frozen[key] is before[key] for key in frozen)
+    # Retain the observed failure shape for the historical direct-dict call.
+    with pytest.raises(AttributeError):
+        readout(moments, frozen, 1433, "cuda")

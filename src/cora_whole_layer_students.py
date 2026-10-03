@@ -20,8 +20,8 @@ from src.io import _fingerprint
 from src.research_loop import implementation_provenance
 from src.student_routes import replay_routes
 
-SCIENCE = "Cora70_two_whole_layer_fixed25_matched_NODE_scientific_stageBR_v2.json"
-SCIENCE_SHA = "1cf9d80ded2415fb27e91e9605fdc03bfd6e7575cd87137e759cd0a7eea288ee"
+SCIENCE = "Cora70_two_whole_layer_fixed25_matched_NODE_scientific_stageBS_v1.json"
+SCIENCE_SHA = "b894eab2fa03ac656a5c2b46fb738ff0277ab67c21d1713c63a7f2b964e08508"
 SEEDS = (4400, 4401, 4402)
 _require, _stop, _tensor = probe._require, probe._stop, probe._tensor
 _sha, _seal = probe._sha, probe._seal
