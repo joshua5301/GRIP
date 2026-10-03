@@ -2,6 +2,7 @@ import gc
 import hashlib
 import itertools
 import json
+import traceback
 from pathlib import Path
 
 import pandas as pd
@@ -71,18 +72,25 @@ def factorized_svd(left, right):
     return ql @ a, s, qr @ bt.T
 
 
+def evaluation_splits(graph, train, validation, testing):
+    splits = dict(train=(graph, train), val=validation, test=testing)
+    return splits if validation[0] is not graph else {name: split[1] for name, split in splits.items()}
+
+
 def run_distance_finetune(source, output_dir, ranks=(4, 8, 16), taus=(0.1, 0.3, 1.0),
                           penalties=(1e-5, 1e-4, 1e-3), steps=300,
                           checkpoints=(0, 25, 50, 100, 200, 300), lr=0.01,
                           inner_loss_weighting="mass", data_dir="/content/data/", device="cuda",
-                          methods=("fixed_D", "svd_UV")):
+                          methods=("fixed_D", "svd_UV"), continue_on_error=False):
     if not methods or len(set(methods)) != len(methods) or any(m not in ("fixed_D", "svd_UV") for m in methods):
         raise ValueError("Choose unique fixed_D and/or svd_UV methods")
     source = Path(source)
     config = json.loads((source / "config.json").read_text())
     selected = json.loads((source / "selected.json").read_text())
-    if config["dataset"] not in ("citeseer", "arxiv") or config["condensation_seeds"] != [0]:
-        raise ValueError("Use a Citeseer or Arxiv single deterministic partition source")
+    if config["dataset"] not in ("cora", "citeseer", "flickr", "reddit", "arxiv") or config["condensation_seeds"] != [0]:
+        raise ValueError("Use a supported single deterministic partition source")
+    if config.get("method") != "moment_lloyd_normalized_variance":
+        raise ValueError("Use a normalized-variance stage-one partition")
     if not all(0 <= step <= steps for step in checkpoints):
         raise ValueError("Checkpoints must fit the step budget")
     checkpoints = sorted(set(checkpoints) | {0, steps})
@@ -93,7 +101,7 @@ def run_distance_finetune(source, output_dir, ranks=(4, 8, 16), taus=(0.1, 0.3, 
     splits = dict(train=(graph, train), val=validation, test=testing)
     if _data_digest(splits) != config["data_digest"]:
         raise ValueError("Data differ from the stage-one run")
-    masks = {name: split[1] for name, split in splits.items()}
+    masks = evaluation_splits(graph, train, validation, testing)
     h = torch.load(source / "features.pt", map_location=device, weights_only=True).double()
     teacher = torch.load(source / "teachers" / f"{_fingerprint(dict(gamma=selected['gamma']))}.pt",
                          map_location=device, weights_only=True)
@@ -105,7 +113,7 @@ def run_distance_finetune(source, output_dir, ranks=(4, 8, 16), taus=(0.1, 0.3, 
     offset = h.mean(0)
     scale = (h - offset).square().sum(1).mean().sqrt().clamp_min(1e-30)
     z = (h - offset) / scale
-    factorized = config["dataset"] == "arxiv"
+    factorized = config["dataset"] in ("arxiv", "flickr", "reddit")
     if factorized:
         left, right, distance_scale = factorized_distance(h, q, assignment, selected["lambda"])
         decomposition = factorized_svd(left, right) if "svd_UV" in methods else None
@@ -118,7 +126,8 @@ def run_distance_finetune(source, output_dir, ranks=(4, 8, 16), taus=(0.1, 0.3, 
     settings = dict(source=str(source.resolve()), source_config=config, selected=selected, ranks=list(ranks),
                     taus=list(taus), penalties=list(penalties), steps=steps, checkpoints=checkpoints, lr=lr,
                     inner_loss_weighting=inner_loss_weighting, distance_scale=distance_scale, code=code,
-                    cg_max_iter=2048, cg_rtol=1e-6, inner_method="newton_first", methods=list(methods))
+                    cg_max_iter=2048, cg_rtol=1e-6, inner_method="newton_first", methods=list(methods),
+                    continue_on_error=continue_on_error)
     root = Path(output_dir) / _fingerprint(settings)
     root.mkdir(parents=True, exist_ok=True)
     save_json(settings, root / "config.json")
@@ -136,7 +145,10 @@ def run_distance_finetune(source, output_dir, ranks=(4, 8, 16), taus=(0.1, 0.3, 
             folder=folder, **config["student"],
         )) for seed in seeds]
 
-    rows, final_rows = [], []
+    rows, final_rows, failures = [], [], []
+    pd.DataFrame(columns=["candidate", "method", "rank", "tau", "penalty", "error"]).to_csv(
+        root / "failures.csv", index=False,
+    )
     baseline = evaluate(original["x"].to(device), original["y"].to(device), root / "hard" / "search", search_seeds)
     baseline_val = float(pd.DataFrame(baseline).val_acc.mean())
     init_cache = {}
@@ -172,14 +184,27 @@ def run_distance_finetune(source, output_dir, ranks=(4, 8, 16), taus=(0.1, 0.3, 
         else:
             resume = folder / "resume.pt"
             state = torch.load(resume, map_location="cpu", weights_only=False) if resume.exists() else None
-            optimized = optimize_ce_assignment(
-                z, q, assignment, penalty=penalty, steps=steps, lr=lr, assignment_rank=rank,
-                factor_seed=0, **base_options, correction_scale=1 / tau if method == "fixed_D" else 1.0,
-                initial_factors=factors if method == "svd_UV" else None,
-                checkpoint_steps=checkpoints, folder=folder, resume_state=state, save_resume=True,
-                save_assignment=False, inner_method="newton_first", implicit_warm_start=True,
-                inner_loss_weighting=inner_loss_weighting, cg_max_iter=2048, cg_rtol=1e-6,
-            )
+            try:
+                optimized = optimize_ce_assignment(
+                    z, q, assignment, penalty=penalty, steps=steps, lr=lr, assignment_rank=rank,
+                    factor_seed=0, **base_options, correction_scale=1 / tau if method == "fixed_D" else 1.0,
+                    initial_factors=factors if method == "svd_UV" else None,
+                    checkpoint_steps=checkpoints, folder=folder, resume_state=state, save_resume=True,
+                    save_assignment=False, inner_method="newton_first", implicit_warm_start=True,
+                    inner_loss_weighting=inner_loss_weighting, cg_max_iter=2048, cg_rtol=1e-6,
+                )
+            except (RuntimeError, FloatingPointError) as error:
+                if not continue_on_error:
+                    raise
+                failures.append(dict(candidate=candidate, method=method, rank=rank, tau=tau,
+                                     penalty=penalty, error=str(error)))
+                pd.DataFrame(failures).to_csv(root / "failures.csv", index=False)
+                (folder / "error.txt").write_text(traceback.format_exc(), encoding="utf-8")
+                print(f"Candidate {candidate} failed: {error}", flush=True)
+                gc.collect()
+                if torch.cuda.is_available():
+                    torch.cuda.empty_cache()
+                continue
             save_state(optimized, artifact)
         for step in checkpoints:
             moments = optimized["checkpoints"][step]["moments"]
@@ -198,6 +223,8 @@ def run_distance_finetune(source, output_dir, ranks=(4, 8, 16), taus=(0.1, 0.3, 
         del optimized
         gc.collect()
     search = pd.DataFrame(rows)
+    if search.empty:
+        raise RuntimeError(f"No candidates completed; inspect {root / 'failures.csv'}")
     hard_scores = pd.DataFrame(evaluate(original["x"].to(device), original["y"].to(device),
                                         root / "hard" / "final", final_seeds, final=True))
 
@@ -209,6 +236,8 @@ def run_distance_finetune(source, output_dir, ranks=(4, 8, 16), taus=(0.1, 0.3, 
 
     report("hard", "stage_one", hard_scores, dict(rank=None, tau=None, penalty=None, step=0), baseline_val)
     for method in methods:
+        if not bool((search.method == method).any()):
+            continue
         winner = search[search.method == method].sort_values(
             ["search_val", "step", "candidate"], ascending=[False, True, True]).iloc[0]
         candidate, step = int(winner.candidate), int(winner.step)

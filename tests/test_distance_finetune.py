@@ -1,11 +1,36 @@
 import pytest
 import torch
 
-from src.distance_finetune import distance_logits, factorized_distance, factorized_svd, svd_factors
+from src.distance_finetune import (
+    distance_logits,
+    evaluation_splits,
+    factorized_distance,
+    factorized_svd,
+    svd_factors,
+)
 from src.low_rank_assignment import FactorizedBaseMoments, logit_block
 from src.moment_seeding import normalized_variance_features
 from src.moments import make_material
 from src.soft_ce_partition import optimize_ce_assignment
+
+
+def test_inductive_evaluation_keeps_separate_graphs_and_full_split_masks():
+    train_graph, val_graph, test_graph = {}, {}, {}
+    train_mask = torch.tensor([True, False])
+    splits = evaluation_splits(train_graph, train_mask, (val_graph, None), (test_graph, None))
+    assert splits["train"][0] is train_graph
+    assert splits["train"][1] is train_mask
+    assert splits["val"][0] is val_graph and splits["val"][1] is None
+    assert splits["test"][0] is test_graph and splits["test"][1] is None
+
+
+def test_transductive_evaluation_uses_original_masks():
+    graph = {}
+    train, val, test = (torch.tensor([i == j for i in range(3)]) for j in range(3))
+    masks = evaluation_splits(graph, train, (graph, val), (graph, test))
+    assert masks["train"] is train
+    assert masks["val"] is val
+    assert masks["test"] is test
 
 
 def test_svd_initialization_matches_low_rank_logit_scaling():
