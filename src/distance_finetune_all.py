@@ -26,7 +26,7 @@ def source_matches(source, dataset, ratio):
         and config.get("method") == "moment_lloyd_normalized_variance"
         and config.get("condensation_seeds") == [0]
         and config.get("loss_weighting") == "uniform"
-        and config.get("lloyd_options", {}).get("seeding") == "var"
+        and config.get("lloyd_options", {}).get("seeding") == "bound_var"
     )
 
 
@@ -51,7 +51,7 @@ def run_all_distance_finetune(output_dir, sources=None, ranks=(8, 16, 32, 64),
             if source is None or not source_matches(source, dataset, ratio):
                 _, _, _, source = run_risk_sweep(
                     dataset=dataset, ratio=ratio, output_dir=root / "stage_one" / dataset,
-                    method="moment_lloyd_normalized_variance", seeding="var",
+                    method="moment_lloyd_normalized_variance", seeding="bound_var",
                     teacher_selection="accuracy_only",
                     space={
                         "gamma": [0.0001, 0.001, 0.003, 0.01, 0.03, 0.1] if dataset == "cora"
