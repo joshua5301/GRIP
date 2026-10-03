@@ -582,7 +582,8 @@ def optimize_ce_assignment(
                                    "node_factor_mode", "node_factor_artifact", "node_factor_sha256", "node_factor_context",
                                    "graph_assignment_kl_mode", "graph_assignment_kl_artifact",
                                    "graph_assignment_kl_sha256", "graph_assignment_kl_context",
-                                   "kernel_commutation_mode", "kernel_commutation_context", "kernel_commutation_inputs"}:
+                                   "kernel_commutation_mode", "kernel_commutation_context", "kernel_commutation_inputs",
+                                   "conditional_label_entropy_mode", "conditional_label_entropy_context"}:
         raise ValueError("Unknown MLP initial-mass control")
     mlp_initial_mass_schema = mlp_initial_options.get("mlp_initial_mass_schema")
     mlp_initial_mass_source = mlp_initial_options.get("mlp_initial_mass_source")
@@ -722,6 +723,30 @@ def optimize_ce_assignment(
                              kernel_commutation_context=commutation_context)
     elif commutation_context is not None or commutation_inputs is not None:
         raise ValueError("Disabled kernel commutation cannot carry source inputs or context")
+    entropy_mode = mlp_initial_options.get("conditional_label_entropy_mode")
+    entropy_context = mlp_initial_options.get("conditional_label_entropy_context")
+    entropy_active = entropy_mode is not None
+    if entropy_active:
+        if (entropy_mode != "normalized_conditional_label_entropy_v1"
+                or assignment_input != "node" or assignment_encoder != "linear"
+                or type(assignment_rank) is not int or assignment_rank < 1
+                or mass_mode != "free" or inner_loss_weighting != "uniform" or solver_mode != "exact"
+                or inner_method != "newton_first" or implicit_warm_start is not True
+                or node_weighting or temperature_logits is not None or outer_targets is not None
+                or outer_indices is not None or implicit_solver is not None or inner_solver is not None
+                or cache_assignment or centered_active or source_linear_active or prior_active or row_kl_active
+                or node_factor_active or graph_kl_active or commutation_active
+                or mlp_initial_mass_schema is not None or mlp_initial_mass_source is not None
+                or save_assignment or not save_resume or mixing != .05
+                or torch.get_default_dtype() != torch.float32 or not isinstance(entropy_context, dict)):
+            raise ValueError("Conditional entropy requires original native free/uniform exact CE")
+        from src.conditional_label_entropy import entropy_partials, validate_context as validate_entropy_context
+        from src.conditional_label_entropy import attach_snapshot as attach_entropy_snapshot
+        from src.conditional_label_entropy import attach_resume as attach_entropy_resume
+        resume_config.update(conditional_label_entropy_mode=entropy_mode,
+                             conditional_label_entropy_context=entropy_context)
+    elif entropy_context is not None:
+        raise ValueError("Disabled conditional entropy cannot carry context")
     if inner_loss_weighting == "mass":
         resume_config.pop("inner_loss_weighting")
     if outer_targets is not None:
@@ -857,7 +882,7 @@ def optimize_ce_assignment(
         raise ValueError("Checkpoint steps must be integers within the optimization budget")
     if checkpoints or mass_mode == "initial" or centered_active or source_linear_active or row_kl_active or node_factor_active:
         checkpoints.update((0, steps))
-    if graph_kl_active or commutation_active:
+    if graph_kl_active or commutation_active or entropy_active:
         checkpoints.update((0, steps))
     snapshots = {}
     _check_assignment_stop(stop)
@@ -1038,6 +1063,12 @@ def optimize_ce_assignment(
             commutation_inputs, resume_config, steps, resume_state=resume_state, folder=folder)
         commutation_CE0 = None if resume_state is None else resume_state["kernel_commutation_CE0"]
         commutation_G0 = None if resume_state is None else resume_state["kernel_commutation_G0"]
+    if entropy_active:
+        entropy_initial = validate_entropy_context(
+            z, q, assignment, parameters, mixing, chunk_size, entropy_context,
+            resume_config, steps, resume_state=resume_state, folder=folder)
+        entropy_CE0 = None if resume_state is None else resume_state["conditional_label_entropy_CE0"]
+        entropy_E0 = None if resume_state is None else resume_state["conditional_label_entropy_E0"]
     if node_weighting:
         node_logits = z.new_zeros(len(z), dtype=torch.float32).requires_grad_()
         groups = [
@@ -1314,13 +1345,30 @@ def optimize_ce_assignment(
                        kernel_commutation_CE0=commutation_CE0, kernel_commutation_G0=commutation_G0,
                        objective=objective, normalized_objective=objective,
                        objective_name="teacher_CE_over_CE0_plus_kernel_gap_over_G0")
+        if entropy_active:
+            entropy = entropy_partials(moments.detach(), z.shape[1], q.shape[1])
+            entropy_value = float(entropy["value"])
+            if step == 0:
+                if not np.isfinite(value) or value <= 0 or not np.isfinite(entropy_value) or entropy_value <= 0:
+                    raise FloatingPointError("Conditional entropy needs strict positive frozen CE0/E0")
+                if entropy_CE0 is None and entropy_E0 is None:
+                    entropy_CE0, entropy_E0 = value, entropy_value
+                elif entropy_CE0 != value or entropy_E0 != entropy_value:
+                    raise ValueError("Resumed P0 CE/E differs from its frozen positive scales")
+            objective = value / entropy_CE0 + entropy_value / entropy_E0
+            if not np.isfinite(objective):
+                raise FloatingPointError("Nonfinite normalized CE/conditional entropy objective")
+            row.update(teacher_ce=value, conditional_label_entropy_E=entropy_value,
+                       conditional_label_entropy_CE0=entropy_CE0, conditional_label_entropy_E0=entropy_E0,
+                       objective=objective, normalized_objective=objective,
+                       objective_name="teacher_CE_over_CE0_plus_conditional_entropy_over_E0")
         failure = None
         if refresh and (not fitted["inner_converged"]) or not np.isfinite(value):
             failure = "Inner CE did not converge; increase inner_max_iter or inspect inner_tol"
         else:
             if step == 0:
                 initial_moments = moments.detach().cpu()
-                scale = value if commutation_active else max(value, 1e-12)
+                scale = value if commutation_active or entropy_active else max(value, 1e-12)
             if row_kl_active:
                 row.update(assignment_kl_scale=scale, normalized_objective=objective / scale)
             if graph_kl_active:
@@ -1463,6 +1511,9 @@ def optimize_ce_assignment(
             if commutation_active:
                 attach_commutation_snapshot(snapshot, commutation_context, resume_config, parameters,
                     physical_moments, phi_moments, commutation_CE0, commutation_G0, gap_value, objective)
+            if entropy_active:
+                attach_entropy_snapshot(snapshot, entropy_context, resume_config, parameters,
+                                        entropy_CE0, entropy_E0, entropy_value, objective)
             snapshots[step] = snapshot
             if folder is not None:
                 checkpoint_dir = folder / "checkpoints"
@@ -1511,6 +1562,8 @@ def optimize_ce_assignment(
             if commutation_active:
                 attach_commutation_resume(state, commutation_context, commutation_initial,
                                           commutation_CE0, commutation_G0)
+            if entropy_active:
+                attach_entropy_resume(state, entropy_context, entropy_initial, entropy_CE0, entropy_E0)
             if folder is not None:
                 torch.save(state, folder / "resume.tmp.pt")
                 (folder / "resume.tmp.pt").replace(folder / "resume.pt")
@@ -1541,6 +1594,11 @@ def optimize_ce_assignment(
                     (direction / commutation_CE0 + gap["moment_gradient"] / commutation_G0,
                      gap["physical_gradient"] / commutation_G0,
                      gap["phi_gradient"] / commutation_G0))
+            elif entropy_active:
+                joint_direction = direction / entropy_CE0 + entropy["moment_gradient"] / entropy_E0
+                if not bool(torch.isfinite(joint_direction).all()):
+                    raise FloatingPointError("Nonfinite combined CE/entropy moment cotangent")
+                moments.backward(joint_direction)
             elif graph_kl_active:
                 torch.autograd.backward((moments, graph_row_kl), (direction / scale, graph_row_kl.new_tensor(1 / scale)))
             else:
@@ -1551,6 +1609,8 @@ def optimize_ce_assignment(
                 pd.DataFrame(history).to_csv(folder / "optimization.csv", index=False)
                 (folder / "failure.json").write_text(json.dumps(dict(step=step, reason=str(error)), indent=2))
             raise
+        if entropy_active and any(p.grad is None or not bool(torch.isfinite(p.grad).all()) for p in parameters):
+            raise FloatingPointError("Missing or nonfinite CE/entropy native factor gradient")
         if temperature_logits is not None:
             if log_temperature.grad is None or not bool(torch.isfinite(log_temperature.grad)):
                 raise FloatingPointError("Missing or nonfinite temperature gradient")
@@ -1609,6 +1669,10 @@ def optimize_ce_assignment(
         result.update(kernel_commutation_context=commutation_context,
                       kernel_commutation_CE0=commutation_CE0, kernel_commutation_G0=commutation_G0,
                       objective_name="teacher_CE_over_CE0_plus_kernel_gap_over_G0")
+    if entropy_active:
+        result.update(conditional_label_entropy_context=entropy_context,
+                      conditional_label_entropy_CE0=entropy_CE0, conditional_label_entropy_E0=entropy_E0,
+                      objective_name="teacher_CE_over_CE0_plus_conditional_entropy_over_E0")
     if folder is not None and save_assignment:
         if assignment_rank is None:
             torch.save(best_parameters[0].cpu(), folder / "best_assignment_logits.pt")
