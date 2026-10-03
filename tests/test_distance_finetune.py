@@ -1,8 +1,8 @@
 import pytest
 import torch
 
-from src.distance_finetune import distance_logits, svd_factors
-from src.low_rank_assignment import logit_block
+from src.distance_finetune import distance_logits, factorized_distance, factorized_svd, svd_factors
+from src.low_rank_assignment import FactorizedBaseMoments, logit_block
 from src.moment_seeding import normalized_variance_features
 from src.moments import make_material
 from src.soft_ce_partition import optimize_ce_assignment
@@ -41,16 +41,48 @@ def test_distance_initialization_matches_normalized_variance_metric():
         svd_factors(logits, 4)
 
 
-def test_optimizer_uses_supplied_factors_at_step_zero(tmp_path):
+@pytest.mark.parametrize("factorized", [False, True])
+def test_optimizer_uses_supplied_factors_at_step_zero(tmp_path, factorized):
     z = torch.tensor([[-1.0], [-0.5], [0.5], [1.0]], dtype=torch.float64)
     q = torch.tensor([[0.8, 0.2], [0.7, 0.3], [0.3, 0.7], [0.2, 0.8]], dtype=z.dtype)
     assignment = torch.tensor([0, 0, 1, 1])
     logits = torch.tensor([[1., -1.], [.5, -.5], [-.5, .5], [-1., 1.]], dtype=z.dtype)
     u, v = svd_factors(logits, 2)
+    base = dict(base_factors=(z.new_zeros(4, 1), z.new_zeros(2, 1))) if factorized else dict(base_logits=torch.zeros_like(logits))
     result = optimize_ce_assignment(
         z, q, assignment, assignment_rank=2, initial_factors=(u, v),
-        base_logits=torch.zeros_like(logits), steps=0, penalty=0.1,
+        **base, steps=0, penalty=0.1,
         checkpoint_steps=[0], folder=tmp_path, save_assignment=False,
     )
     expected = logits.softmax(1).T @ make_material(z, q) / len(z)
     torch.testing.assert_close(result["checkpoints"][0]["moments"], expected, atol=1e-7, rtol=1e-7)
+
+
+def test_factorized_distance_and_svd_equal_dense_construction():
+    generator = torch.Generator().manual_seed(8)
+    h = torch.randn(18, 4, generator=generator, dtype=torch.float64)
+    q = torch.randn(18, 3, generator=generator, dtype=torch.float64).softmax(1)
+    assignment = torch.arange(18) % 3
+    expected, expected_scale = distance_logits(h, q, assignment, 0.2)
+    left, right, scale = factorized_distance(h, q, assignment, 0.2, chunk_size=5)
+    assert scale == pytest.approx(expected_scale)
+    torch.testing.assert_close(left @ right.T, expected)
+    a, s, b = factorized_svd(left, right)
+    torch.testing.assert_close((a * s) @ b.T, expected)
+
+
+def test_factorized_base_moments_gradient_matches_dense_autograd():
+    generator = torch.Generator().manual_seed(9)
+    left = torch.randn(7, 3, generator=generator, dtype=torch.float64)
+    right = torch.randn(4, 3, generator=generator, dtype=torch.float64)
+    material = torch.randn(7, 5, generator=generator, dtype=torch.float64, requires_grad=True)
+    u = torch.randn(7, 2, generator=generator, dtype=torch.float64, requires_grad=True)
+    v = torch.randn(4, 2, generator=generator, dtype=torch.float64, requires_grad=True)
+    gradient = torch.randn(4, 5, generator=generator, dtype=torch.float64)
+    actual = FactorizedBaseMoments.apply(u, v, left, right, material, 3)
+    expected = (left @ right.T + u @ v.T / 2**0.5).softmax(1).T @ material / len(u)
+    torch.testing.assert_close(actual, expected)
+    actual_grads = torch.autograd.grad((actual * gradient).sum(), (u, v, material))
+    expected_grads = torch.autograd.grad((expected * gradient).sum(), (u, v, material))
+    for a, b in zip(actual_grads, expected_grads):
+        torch.testing.assert_close(a, b)

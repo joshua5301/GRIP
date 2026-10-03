@@ -11,6 +11,7 @@ from tqdm.auto import tqdm
 from src.data import _prepare_dataset
 from src.evaluation import fit_gcn_diagnostic
 from src.io import _fingerprint, save_json, save_state
+from src.low_rank_assignment import FactorizedBaseMoments
 from src.moment_seeding import normalized_variance_features
 from src.moments import AssignmentMoments, decode_moments, make_material
 from src.soft_ce_partition import optimize_ce_assignment
@@ -40,6 +41,36 @@ def distance_logits(h, q, assignment, alpha):
     return -(d - d.mean(1, keepdim=True)) / scale, float(scale)
 
 
+@torch.no_grad()
+def factorized_distance(h, q, assignment, alpha, chunk_size=2048):
+    x = h.double() - h.double().mean(0)
+    x /= x.square().sum(1).mean().sqrt().clamp_min(1e-30)
+    z, _ = normalized_variance_features(x, q.double(), alpha)
+    cells = int(assignment.max()) + 1
+    counts = torch.bincount(assignment, minlength=cells)
+    centers = z.new_zeros(cells, z.shape[1]).index_add_(0, assignment, z) / counts[:, None]
+    energy = centers.square().sum(1)
+    left = torch.cat((2 * z, z.new_ones(len(z), 1)), 1)
+    right = torch.cat((centers - centers.mean(0), -(energy - energy.mean())[:, None]), 1)
+    gaps = []
+    for block in left.split(chunk_size):
+        values = (block @ right.T).topk(2).values
+        gaps.append(values[:, 0] - values[:, 1])
+    gaps = torch.cat(gaps)
+    positive = gaps[gaps > 0]
+    scale = positive.median() if len(positive) else left.new_tensor(1.0)
+    left /= scale
+    return left, right, float(scale)
+
+
+@torch.no_grad()
+def factorized_svd(left, right):
+    ql, rl = torch.linalg.qr(left, mode="reduced")
+    qr, rr = torch.linalg.qr(right, mode="reduced")
+    a, s, bt = torch.linalg.svd(rl @ rr.T, full_matrices=False)
+    return ql @ a, s, qr @ bt.T
+
+
 def run_distance_finetune(source, output_dir, ranks=(4, 8, 16), taus=(0.1, 0.3, 1.0),
                           penalties=(1e-5, 1e-4, 1e-3), steps=300,
                           checkpoints=(0, 25, 50, 100, 200, 300), lr=0.01,
@@ -50,14 +81,14 @@ def run_distance_finetune(source, output_dir, ranks=(4, 8, 16), taus=(0.1, 0.3, 
     source = Path(source)
     config = json.loads((source / "config.json").read_text())
     selected = json.loads((source / "selected.json").read_text())
-    if config["dataset"] != "citeseer" or config["condensation_seeds"] != [0]:
-        raise ValueError("Use a Citeseer single deterministic partition source")
+    if config["dataset"] not in ("citeseer", "arxiv") or config["condensation_seeds"] != [0]:
+        raise ValueError("Use a Citeseer or Arxiv single deterministic partition source")
     if not all(0 <= step <= steps for step in checkpoints):
         raise ValueError("Checkpoints must fit the step budget")
     checkpoints = sorted(set(checkpoints) | {0, steps})
     torch.backends.cuda.matmul.allow_tf32 = False
     torch.backends.cudnn.allow_tf32 = False
-    graph, train, validation, testing, computed = _prepare_dataset("citeseer", data_dir, device)
+    graph, train, validation, testing, computed = _prepare_dataset(config["dataset"], data_dir, device)
     del computed
     splits = dict(train=(graph, train), val=validation, test=testing)
     if _data_digest(splits) != config["data_digest"]:
@@ -74,7 +105,13 @@ def run_distance_finetune(source, output_dir, ranks=(4, 8, 16), taus=(0.1, 0.3, 
     offset = h.mean(0)
     scale = (h - offset).square().sum(1).mean().sqrt().clamp_min(1e-30)
     z = (h - offset) / scale
-    distance, distance_scale = distance_logits(h, q, assignment, selected["lambda"])
+    factorized = config["dataset"] == "arxiv"
+    if factorized:
+        left, right, distance_scale = factorized_distance(h, q, assignment, selected["lambda"])
+        decomposition = factorized_svd(left, right) if "svd_UV" in methods else None
+        zero_base = (z.new_zeros(len(z), 1), z.new_zeros(config["nodes"], 1))
+    else:
+        distance, distance_scale = distance_logits(h, q, assignment, selected["lambda"])
     files = ("distance_finetune.py", "soft_ce_partition.py", "low_rank_assignment.py", "moments.py",
              "head.py", "evaluation.py", "models.py", "data.py", "moment_seeding.py")
     code = hashlib.sha256(b"".join((Path(__file__).parent / name).read_bytes() for name in files)).hexdigest()
@@ -107,12 +144,26 @@ def run_distance_finetune(source, output_dir, ranks=(4, 8, 16), taus=(0.1, 0.3, 
     for candidate, (method, rank, tau, penalty) in enumerate(tqdm(grid, desc="Distance-initialized bilevel sweep")):
         key = (rank, tau)
         if method == "svd_UV" and key not in init_cache:
-            target = distance / tau
-            factors = svd_factors(target, rank)
-            reconstructed = factors[0].double() @ factors[1].double().T / rank**0.5
-            init_cache[key] = (factors, float((reconstructed - target).norm() / target.norm().clamp_min(1e-30)))
+            if factorized:
+                a, s, b = decomposition
+                if rank > len(s):
+                    raise ValueError("Rank exceeds the factorized distance dimension")
+                factor_scale = (s[:rank] / tau).sqrt() * rank**0.25
+                factors = ((a[:, :rank] * factor_scale).float(), (b[:, :rank] * factor_scale).float())
+                error = float(s[rank:].norm() / s.norm().clamp_min(1e-30))
+            else:
+                target = distance / tau
+                factors = svd_factors(target, rank)
+                reconstructed = factors[0].double() @ factors[1].double().T / rank**0.5
+                error = float((reconstructed - target).norm() / target.norm().clamp_min(1e-30))
+            init_cache[key] = (factors, error)
         factors, error = init_cache[key] if method == "svd_UV" else (None, 0.0)
-        base = distance / tau if method == "fixed_D" else torch.zeros_like(distance)
+        if factorized:
+            bases = (left / tau, right) if method == "fixed_D" else zero_base
+            base_options = dict(base_factors=bases)
+        else:
+            base = distance / tau if method == "fixed_D" else torch.zeros_like(distance)
+            base_options = dict(base_logits=base)
         folder = root / f"candidate_{candidate:04d}"
         folder.mkdir(exist_ok=True)
         artifact = folder / "optimized.pt"
@@ -123,7 +174,7 @@ def run_distance_finetune(source, output_dir, ranks=(4, 8, 16), taus=(0.1, 0.3, 
             state = torch.load(resume, map_location="cpu", weights_only=False) if resume.exists() else None
             optimized = optimize_ce_assignment(
                 z, q, assignment, penalty=penalty, steps=steps, lr=lr, assignment_rank=rank,
-                factor_seed=0, base_logits=base, correction_scale=1 / tau if method == "fixed_D" else 1.0,
+                factor_seed=0, **base_options, correction_scale=1 / tau if method == "fixed_D" else 1.0,
                 initial_factors=factors if method == "svd_UV" else None,
                 checkpoint_steps=checkpoints, folder=folder, resume_state=state, save_resume=True,
                 save_assignment=False, inner_method="newton_first", implicit_warm_start=True,
@@ -171,8 +222,14 @@ def run_distance_finetune(source, output_dir, ranks=(4, 8, 16), taus=(0.1, 0.3, 
             report(method, phase, scores, params, val)
             scores.assign(method=method, phase=phase).to_csv(root / f"{method}_{phase}_students.csv", index=False)
         if method == "svd_UV":
-            logits = distance / float(winner.tau)
-            moments = AssignmentMoments.apply(logits, make_material(z, q), 4096)
+            if factorized:
+                moments = FactorizedBaseMoments.apply(
+                    z.new_zeros(len(z), 1), z.new_zeros(config["nodes"], 1),
+                    left / float(winner.tau), right, make_material(z, q), 2048,
+                )
+            else:
+                logits = distance / float(winner.tau)
+                moments = AssignmentMoments.apply(logits, make_material(z, q), 4096)
             x, y, _ = representative(moments)
             scores = pd.DataFrame(evaluate(x, y, root / f"soft_reference_tau_{winner.tau}" / "final", final_seeds, final=True))
             report(method, "full_distance_soft_reference", scores,

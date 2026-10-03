@@ -14,6 +14,7 @@ from src.head import fit_head, head_objective
 from src.io import array_digest, cpu_state
 from src.low_rank_assignment import (
     CachedLowRankMoments,
+    FactorizedBaseMoments,
     LowRankLogits,
     LowRankMoments,
     WeightedLowRankMoments,
@@ -527,6 +528,7 @@ def optimize_ce_assignment(
     probability_floor=0.0,
     initial_dense_logits=None,
     initial_factors=None,
+    base_factors=None,
 ):
     if feature_control != "joint" or initial_representatives is not None:
         raise ValueError("Only clustering-derived features and labels are supported")
@@ -563,6 +565,7 @@ def optimize_ce_assignment(
             "base_logits",
             "initial_dense_logits",
             "initial_factors",
+            "base_factors",
         )
     }
     if base_logits is not None:
@@ -576,6 +579,18 @@ def optimize_ce_assignment(
             raise ValueError("Invalid base logits")
         base_logits = base_logits.detach().to(z)
         resume_config["base_logits_digest"] = array_digest(base_logits.cpu().numpy())
+    if base_factors is not None:
+        if (assignment_rank is None or assignment_input != "node" or mass_mode != "free"
+                or base_logits is not None or cache_assignment or node_weighting
+                or temperature_logits is not None or sparse_k is not None or save_assignment):
+            raise ValueError("Factorized bases require uncached free-mass node factors and save_assignment=False")
+        if (len(base_factors) != 2 or any(p.ndim != 2 or not bool(torch.isfinite(p).all()) for p in base_factors)
+                or base_factors[0].shape[0] != len(z)
+                or base_factors[1].shape[0] != int(assignment.max()) + 1
+                or base_factors[0].shape[1] != base_factors[1].shape[1]):
+            raise ValueError("Invalid factorized base")
+        base_factors = tuple(p.detach().to(z) for p in base_factors)
+        resume_config["base_factors_digest"] = array_digest(*[p.cpu().numpy() for p in base_factors])
     if initial_factors is not None:
         if assignment_rank is None or assignment_input != "node" or mass_mode != "free" or len(initial_factors) != 2:
             raise ValueError("Initial factors require free-mass node low-rank assignment")
@@ -592,7 +607,7 @@ def optimize_ce_assignment(
         resume_config["initial_dense_logits_digest"] = array_digest(initial_dense_logits.cpu().numpy())
     if correction_scale == 1.0:
         resume_config.pop("correction_scale")
-    elif base_logits is None or not np.isfinite(correction_scale) or correction_scale == 0:
+    elif (base_logits is None and base_factors is None) or not np.isfinite(correction_scale) or correction_scale == 0:
         raise ValueError("A finite nonzero correction scale requires fixed base logits")
     if factor_initial_std == 0.0:
         resume_config.pop("factor_initial_std")
@@ -870,6 +885,11 @@ def optimize_ce_assignment(
                 balance_iterations=int(diagnostic[0]),
                 row_residual=float(diagnostic[1]),
                 column_residual=float(diagnostic[2]),
+            )
+        elif assignment_rank is not None and base_factors is not None:
+            moments = FactorizedBaseMoments.apply(
+                u, v if correction_scale == 1.0 else v * correction_scale,
+                *base_factors, material, chunk_size,
             )
         elif assignment_rank is not None:
             operation = CachedLowRankMoments if cache_assignment else LowRankMoments

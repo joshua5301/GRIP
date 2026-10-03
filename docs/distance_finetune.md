@@ -28,3 +28,11 @@ The `methods` argument can restrict the sweep to fixed_D only. Initial GCN
 search evaluations are shared across ranks and penalties at fixed tau for
 fixed_D, and across penalties at fixed rank/tau for svd_UV. No SVD is computed
 in fixed_D-only runs.
+
+Arxiv is supported using an exact factorized representation of row-centered
+negative squared distances: [2z_i,1] dot [c_j-mean(c), -(||c_j||²-mean||c||²)].
+The median positive nearest-center gap is measured in node blocks. QR of both
+factors followed by SVD of the small product yields the distance-logit SVD
+without forming N-by-m distances. The learned assignment moments and their
+backward pass recompute logits in blocks; no dense probability cache is used.
+This saves memory at the cost of recomputing the fixed distance blocks.

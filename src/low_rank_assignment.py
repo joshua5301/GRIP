@@ -158,6 +158,38 @@ class LowRankMoments(torch.autograd.Function):
         return result + (None,) if ctx.has_floor else result
 
 
+class FactorizedBaseMoments(torch.autograd.Function):
+    @staticmethod
+    def forward(ctx, u, v, left, right, material, chunk_size):
+        ctx.save_for_backward(u, v, left, right, material)
+        ctx.chunk_size = chunk_size
+        result = material.new_zeros(len(v), material.shape[1])
+        for start in range(0, len(u), chunk_size):
+            end = start + chunk_size
+            logits = left[start:end] @ right.T + (u[start:end] @ v.T).to(left) / math.sqrt(u.shape[1])
+            probability = logits.to(material).softmax(1)
+            result += probability.T @ material[start:end] / len(u)
+        return result
+
+    @staticmethod
+    def backward(ctx, gradient):
+        u, v, left, right, material = ctx.saved_tensors
+        du, dv = torch.empty_like(u), torch.zeros_like(v)
+        dm = torch.empty_like(material) if ctx.needs_input_grad[4] else None
+        for start in range(0, len(u), ctx.chunk_size):
+            end = start + ctx.chunk_size
+            logits = left[start:end] @ right.T + (u[start:end] @ v.T).to(left) / math.sqrt(u.shape[1])
+            probability = logits.to(material).softmax(1)
+            direction = material[start:end] @ gradient.T / len(u)
+            block = (probability * (direction - (probability * direction).sum(1, keepdim=True))).to(u)
+            block /= math.sqrt(u.shape[1])
+            du[start:end] = block @ v
+            dv += block.T @ u[start:end]
+            if dm is not None:
+                dm[start:end] = probability @ gradient / len(u)
+        return du, dv, None, None, dm, None
+
+
 class CachedLowRankMoments(torch.autograd.Function):
     @staticmethod
     def forward(ctx, u, v, assignment, material, mixing, chunk_size):
