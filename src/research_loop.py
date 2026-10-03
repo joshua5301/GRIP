@@ -32,6 +32,9 @@ def implementation_provenance():
 
 def dispatch(job, stop):
     options = dict(job["options"])
+    if job["kind"] == "citation_soft_cell_mass_kl":
+        from src.citation_soft_cell_mass_kl import run
+        return run(**options, stop=stop)
     if job["kind"] == "citation_conditional_label_entropy":
         from src.citation_conditional_label_entropy import run
         return run(**options, stop=stop)

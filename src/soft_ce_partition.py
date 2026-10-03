@@ -583,7 +583,8 @@ def optimize_ce_assignment(
                                    "graph_assignment_kl_mode", "graph_assignment_kl_artifact",
                                    "graph_assignment_kl_sha256", "graph_assignment_kl_context",
                                    "kernel_commutation_mode", "kernel_commutation_context", "kernel_commutation_inputs",
-                                   "conditional_label_entropy_mode", "conditional_label_entropy_context"}:
+                                   "conditional_label_entropy_mode", "conditional_label_entropy_context",
+                                   "soft_cell_mass_KL_mode", "soft_cell_mass_KL_context"}:
         raise ValueError("Unknown MLP initial-mass control")
     mlp_initial_mass_schema = mlp_initial_options.get("mlp_initial_mass_schema")
     mlp_initial_mass_source = mlp_initial_options.get("mlp_initial_mass_source")
@@ -747,6 +748,30 @@ def optimize_ce_assignment(
                              conditional_label_entropy_context=entropy_context)
     elif entropy_context is not None:
         raise ValueError("Disabled conditional entropy cannot carry context")
+    soft_mass_mode = mlp_initial_options.get("soft_cell_mass_KL_mode")
+    soft_mass_context = mlp_initial_options.get("soft_cell_mass_KL_context")
+    soft_mass_active = soft_mass_mode is not None
+    if soft_mass_active:
+        if (soft_mass_mode != "normalized_soft_cell_mass_KL_v1"
+                or assignment_input != "node" or assignment_encoder != "linear"
+                or type(assignment_rank) is not int or assignment_rank < 1
+                or mass_mode != "free" or inner_loss_weighting != "uniform" or solver_mode != "exact"
+                or inner_method != "newton_first" or implicit_warm_start is not True
+                or node_weighting or temperature_logits is not None or outer_targets is not None
+                or outer_indices is not None or implicit_solver is not None or inner_solver is not None
+                or cache_assignment or centered_active or source_linear_active or prior_active or row_kl_active
+                or node_factor_active or graph_kl_active or commutation_active or entropy_active
+                or mlp_initial_mass_schema is not None or mlp_initial_mass_source is not None
+                or save_assignment or not save_resume or mixing != .05
+                or torch.get_default_dtype() != torch.float32 or not isinstance(soft_mass_context, dict)):
+            raise ValueError("Soft cell mass KL requires original native free/uniform exact CE")
+        from src.soft_cell_mass_kl import mass_kl_partials, validate_context as validate_soft_mass_context
+        from src.soft_cell_mass_kl import attach_snapshot as attach_soft_mass_snapshot
+        from src.soft_cell_mass_kl import attach_resume as attach_soft_mass_resume
+        resume_config.update(soft_cell_mass_KL_mode=soft_mass_mode,
+                             soft_cell_mass_KL_context=soft_mass_context)
+    elif soft_mass_context is not None:
+        raise ValueError("Disabled soft cell mass KL cannot carry context")
     if inner_loss_weighting == "mass":
         resume_config.pop("inner_loss_weighting")
     if outer_targets is not None:
@@ -882,7 +907,7 @@ def optimize_ce_assignment(
         raise ValueError("Checkpoint steps must be integers within the optimization budget")
     if checkpoints or mass_mode == "initial" or centered_active or source_linear_active or row_kl_active or node_factor_active:
         checkpoints.update((0, steps))
-    if graph_kl_active or commutation_active or entropy_active:
+    if graph_kl_active or commutation_active or entropy_active or soft_mass_active:
         checkpoints.update((0, steps))
     snapshots = {}
     _check_assignment_stop(stop)
@@ -1069,6 +1094,12 @@ def optimize_ce_assignment(
             resume_config, steps, resume_state=resume_state, folder=folder)
         entropy_CE0 = None if resume_state is None else resume_state["conditional_label_entropy_CE0"]
         entropy_E0 = None if resume_state is None else resume_state["conditional_label_entropy_E0"]
+    if soft_mass_active:
+        soft_mass_initial = validate_soft_mass_context(
+            z, q, assignment, parameters, mixing, chunk_size, soft_mass_context,
+            resume_config, steps, resume_state=resume_state, folder=folder)
+        soft_mass_CE0 = None if resume_state is None else resume_state["soft_cell_mass_KL_CE0"]
+        soft_mass_Omega0 = None if resume_state is None else resume_state["soft_cell_mass_KL_Omega0"]
     if node_weighting:
         node_logits = z.new_zeros(len(z), dtype=torch.float32).requires_grad_()
         groups = [
@@ -1362,13 +1393,30 @@ def optimize_ce_assignment(
                        conditional_label_entropy_CE0=entropy_CE0, conditional_label_entropy_E0=entropy_E0,
                        objective=objective, normalized_objective=objective,
                        objective_name="teacher_CE_over_CE0_plus_conditional_entropy_over_E0")
+        if soft_mass_active:
+            soft_mass = mass_kl_partials(moments.detach(), z.shape[1], q.shape[1])
+            soft_mass_value = float(soft_mass["value"])
+            if step == 0:
+                if not np.isfinite(value) or value <= 0 or not np.isfinite(soft_mass_value) or soft_mass_value <= 0:
+                    raise FloatingPointError("Soft cell mass KL needs strict positive frozen CE0/Omega0")
+                if soft_mass_CE0 is None and soft_mass_Omega0 is None:
+                    soft_mass_CE0, soft_mass_Omega0 = value, soft_mass_value
+                elif soft_mass_CE0 != value or soft_mass_Omega0 != soft_mass_value:
+                    raise ValueError("Resumed P0 CE/Omega differs from its frozen positive scales")
+            objective = value / soft_mass_CE0 + soft_mass_value / soft_mass_Omega0
+            if not np.isfinite(objective):
+                raise FloatingPointError("Nonfinite normalized CE/soft cell mass KL objective")
+            row.update(teacher_ce=value, soft_cell_mass_KL_Omega=soft_mass_value,
+                       soft_cell_mass_KL_CE0=soft_mass_CE0, soft_cell_mass_KL_Omega0=soft_mass_Omega0,
+                       objective=objective, normalized_objective=objective,
+                       objective_name="teacher_CE_over_CE0_plus_soft_cell_mass_KL_over_Omega0")
         failure = None
         if refresh and (not fitted["inner_converged"]) or not np.isfinite(value):
             failure = "Inner CE did not converge; increase inner_max_iter or inspect inner_tol"
         else:
             if step == 0:
                 initial_moments = moments.detach().cpu()
-                scale = value if commutation_active or entropy_active else max(value, 1e-12)
+                scale = value if commutation_active or entropy_active or soft_mass_active else max(value, 1e-12)
             if row_kl_active:
                 row.update(assignment_kl_scale=scale, normalized_objective=objective / scale)
             if graph_kl_active:
@@ -1514,6 +1562,9 @@ def optimize_ce_assignment(
             if entropy_active:
                 attach_entropy_snapshot(snapshot, entropy_context, resume_config, parameters,
                                         entropy_CE0, entropy_E0, entropy_value, objective)
+            if soft_mass_active:
+                attach_soft_mass_snapshot(snapshot, soft_mass_context, resume_config, parameters,
+                                        soft_mass_CE0, soft_mass_Omega0, soft_mass_value, objective)
             snapshots[step] = snapshot
             if folder is not None:
                 checkpoint_dir = folder / "checkpoints"
@@ -1564,6 +1615,8 @@ def optimize_ce_assignment(
                                           commutation_CE0, commutation_G0)
             if entropy_active:
                 attach_entropy_resume(state, entropy_context, entropy_initial, entropy_CE0, entropy_E0)
+            if soft_mass_active:
+                attach_soft_mass_resume(state, soft_mass_context, soft_mass_initial, soft_mass_CE0, soft_mass_Omega0)
             if folder is not None:
                 torch.save(state, folder / "resume.tmp.pt")
                 (folder / "resume.tmp.pt").replace(folder / "resume.pt")
@@ -1599,6 +1652,11 @@ def optimize_ce_assignment(
                 if not bool(torch.isfinite(joint_direction).all()):
                     raise FloatingPointError("Nonfinite combined CE/entropy moment cotangent")
                 moments.backward(joint_direction)
+            elif soft_mass_active:
+                joint_direction = direction / soft_mass_CE0 + soft_mass["moment_gradient"] / soft_mass_Omega0
+                if not bool(torch.isfinite(joint_direction).all()):
+                    raise FloatingPointError("Nonfinite combined CE/soft cell mass KL moment cotangent")
+                moments.backward(joint_direction)
             elif graph_kl_active:
                 torch.autograd.backward((moments, graph_row_kl), (direction / scale, graph_row_kl.new_tensor(1 / scale)))
             else:
@@ -1611,6 +1669,8 @@ def optimize_ce_assignment(
             raise
         if entropy_active and any(p.grad is None or not bool(torch.isfinite(p.grad).all()) for p in parameters):
             raise FloatingPointError("Missing or nonfinite CE/entropy native factor gradient")
+        if soft_mass_active and any(p.grad is None or not bool(torch.isfinite(p.grad).all()) for p in parameters):
+            raise FloatingPointError("Missing or nonfinite CE/soft cell mass KL native factor gradient")
         if temperature_logits is not None:
             if log_temperature.grad is None or not bool(torch.isfinite(log_temperature.grad)):
                 raise FloatingPointError("Missing or nonfinite temperature gradient")
@@ -1673,6 +1733,10 @@ def optimize_ce_assignment(
         result.update(conditional_label_entropy_context=entropy_context,
                       conditional_label_entropy_CE0=entropy_CE0, conditional_label_entropy_E0=entropy_E0,
                       objective_name="teacher_CE_over_CE0_plus_conditional_entropy_over_E0")
+    if soft_mass_active:
+        result.update(soft_cell_mass_KL_context=soft_mass_context,
+                      soft_cell_mass_KL_CE0=soft_mass_CE0, soft_cell_mass_KL_Omega0=soft_mass_Omega0,
+                      objective_name="teacher_CE_over_CE0_plus_soft_cell_mass_KL_over_Omega0")
     if folder is not None and save_assignment:
         if assignment_rank is None:
             torch.save(best_parameters[0].cpu(), folder / "best_assignment_logits.pt")
