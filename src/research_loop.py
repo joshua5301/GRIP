@@ -32,6 +32,9 @@ def implementation_provenance():
 
 def dispatch(job, stop):
     options = dict(job["options"])
+    if job["kind"] == "citation_kernel_commutation_probe":
+        from src.kernel_commutation_probe import run
+        return run(**options, stop=stop)
     if job["kind"] == "citation_graph_prior":
         from src.citation_graph_prior import run
         return run(**options, stop=stop)
