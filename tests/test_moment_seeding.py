@@ -80,3 +80,33 @@ def test_var_part_uses_largest_variance_axis():
     assignment, info = pca_partition(x, 2, method="var")
     assert torch.equal(assignment, torch.tensor([0, 0, 1, 1]))
     assert info["pca_splits"][0]["power_steps"] == 0
+
+
+@pytest.mark.parametrize("weight", [0.0, 3.0, 100.0])
+def test_variance_lloyd_matches_bound_and_initialization(weight):
+    x, q = example()
+    options = dict(moment_weight=weight, seeding="bound_var", max_sweeps=100)
+    result = moment_lloyd_partition(x, q, 4, mode="variance", **options)
+    moment = moment_lloyd_partition(x, q, 4, mode="filtered_batch", **options)
+    assert result["initial_assignment_digest"] == moment["initial_assignment_digest"]
+    assert all(b <= a + 1e-10 for a, b in zip(result["history"], result["history"][1:]))
+    normalized = x - x.mean(0)
+    normalized /= normalized.square().sum(1).mean().sqrt()
+    z, _ = bound_features(normalized, q, weight)
+    assignment = result["assignment"]
+    centers = torch.stack([z[assignment == j].mean(0) for j in range(4)])
+    expected = (z - centers[assignment]).square().sum(1).mean()
+    assert result["J"] == pytest.approx(float(expected), abs=1e-10)
+    assert result["moment_objective"] <= result["variance_objective"] + 1e-10
+    assert result["converged"]
+    distances = (z[:, None] - centers).square().sum(2)
+    torch.testing.assert_close(distances.gather(1, assignment[:, None]).squeeze(1), distances.min(1).values)
+
+
+def test_variance_lloyd_handles_identical_points():
+    x = torch.zeros(8, 2, dtype=torch.float64)
+    q = torch.full((8, 3), 1 / 3, dtype=torch.float64)
+    result = moment_lloyd_partition(x, q, 4, mode="variance", seeding="bound_var")
+    assert result["converged"]
+    assert (result["counts"] > 0).all()
+    assert result["J"] == pytest.approx(0.0, abs=1e-12)

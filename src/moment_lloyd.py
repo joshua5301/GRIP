@@ -124,7 +124,7 @@ def moment_lloyd_partition(
     seeding="feature",
     greedy_trials=4,
 ):
-    if mode not in ("hybrid", "full_only", "filtered_batch") or not 1 <= m <= len(H):
+    if mode not in ("hybrid", "full_only", "filtered_batch", "variance") or not 1 <= m <= len(H):
         raise ValueError("Invalid mode or cell count")
     if not math.isfinite(moment_weight) or moment_weight < 0 or max_sweeps < 0 or block_size < 1:
         raise ValueError("Invalid weight or budget")
@@ -143,6 +143,10 @@ def moment_lloyd_partition(
     if seeding not in ("feature", "bound", "bound_greedy", *hierarchical) or greedy_trials < 1:
         raise ValueError("Invalid seeding method or greedy trial count")
     material, scaling = (x, {}) if seeding == "feature" else bound_features(x, q, moment_weight)
+    if mode == "variance" and seeding == "feature":
+        raise ValueError("Variance comparison requires bound-space initialization")
+    a, b = scaling.get("feature_weight", 1.0), scaling.get("label_weight", 0.0)
+    label_energy = q.square().sum(1).mean()
     if seeding in hierarchical:
         assignment, initialization_info = pca_partition(material, m, method=hierarchical[seeding])
         if require_initialization_convergence:
@@ -162,6 +166,8 @@ def moment_lloyd_partition(
         return statistics(x, q, a, m, energy, original)
 
     def score(s):
+        if mode == "variance":
+            return float(a * s[3] + b * (label_energy - (s[0] * s[2].square().sum(1)).sum() / len(x)))
         return float(s[3] + moment_weight * s[4].norm())
 
     state = aggregate(assignment)
@@ -172,11 +178,37 @@ def moment_lloyd_partition(
         proposed, gains = assignment.clone(), x.new_zeros(len(x))
         for start in range(0, len(x), block_size):
             end = min(start + block_size, len(x))
-            cost = assignment_cost(x[start:end], q[start:end], state[1], state[2], state[4], moment_weight)
+            if mode == "variance":
+                cost = a * (state[1].square().sum(1) - 2 * x[start:end] @ state[1].T)
+                cost += b * (state[2].square().sum(1) - 2 * q[start:end] @ state[2].T)
+            else:
+                cost = assignment_cost(x[start:end], q[start:end], state[1], state[2], state[4], moment_weight)
             best, target = cost.min(1)
             old = cost.gather(1, assignment[start:end, None]).squeeze(1)
             proposed[start:end] = torch.where(old <= best, assignment[start:end], target)
             gains[start:end] = old - best
+        if mode == "variance":
+            counts = torch.bincount(proposed, minlength=m)
+            residual = a * (x - state[1][proposed]).square().sum(1)
+            residual += b * (q - state[2][proposed]).square().sum(1)
+            for empty in torch.where(counts == 0)[0].tolist():
+                donor = int(residual.masked_fill(counts[proposed] <= 1, -torch.inf).argmax())
+                counts[proposed[donor]] -= 1
+                proposed[donor] = empty
+                counts[empty] += 1
+                residual[donor] = -torch.inf
+            moved = int((proposed != assignment).sum())
+            if not moved:
+                status, converged = "assignment_stable", True
+                break
+            updated = aggregate(proposed)
+            value = score(updated)
+            if value > history[-1] + tolerance:
+                raise RuntimeError("Lloyd variance objective increased")
+            assignment, state = proposed, updated
+            history.append(value)
+            records.append(dict(sweep=sweep + 1, kind="lloyd", moves=moved, J=value))
+            continue
         ids = torch.where(proposed != assignment)[0]
         checks, accepted, kind = 0, None, "full"
 
@@ -257,6 +289,10 @@ def moment_lloyd_partition(
         J=history[-1],
         V=float(variance),
         moment_error=float(moment.norm()),
+        label_variance=float(label_energy - (counts * labels.square().sum(1)).sum() / len(x)),
+        moment_objective=float(variance + moment_weight * moment.norm()),
+        variance_objective=float(a * variance + b * (label_energy - (counts * labels.square().sum(1)).sum() / len(x))),
+        beta=b / a if a > 0 else None,
         history=history,
         records=records,
         sweeps=len(records),

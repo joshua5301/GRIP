@@ -173,7 +173,7 @@ def run_risk_sweep(
 ):
     if teacher_selection not in ("grid", "validation_ce", "accuracy_then_ce", "calibrated_ce"):
         raise ValueError("Use grid or validation_ce teacher selection")
-    lloyd = method in ("moment_lloyd_hybrid", "moment_lloyd_full_only", "moment_lloyd_filtered_batch")
+    lloyd = method in ("moment_lloyd_hybrid", "moment_lloyd_full_only", "moment_lloyd_filtered_batch", "moment_lloyd_variance")
     if method not in ("variance_moment", "variance_kl", "variance_moment_low_rank") and not lloyd:
         raise ValueError("Unknown partition method")
     if (dataset, ratio) not in BUDGET:
@@ -320,6 +320,8 @@ def run_risk_sweep(
         config["candidate_subset"] = candidate_subset
     if "lambda" in space:
         config["objective"] = "variance + lambda * global_moment_norm"
+    if method == "moment_lloyd_variance":
+        config["objective"] = "a * feature_variance + b * label_variance; bound-derived a,b"
     if method == "variance_moment_low_rank":
         config["assignment"] = dict(
             rank=space.get("rank", assignment_rank),
@@ -483,6 +485,10 @@ def run_risk_sweep(
                     J_final=partition["J"],
                     variance=partition["V"],
                     moment_error=partition["moment_error"],
+                    label_variance=partition.get("label_variance", float("nan")),
+                    moment_objective=partition.get("moment_objective", float("nan")),
+                    variance_objective=partition.get("variance_objective", float("nan")),
+                    beta=partition.get("beta"),
                     label_kl=partition.get("label_kl", float("nan")),
                     best_step=partition.get("best_step", float("nan")),
                     sweeps=partition["sweeps"],
