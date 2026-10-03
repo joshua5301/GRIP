@@ -40,6 +40,23 @@ every gamma, then selects the lowest calibrated validation CE (gamma breaks ties
 `calibrated_teacher_grid.csv` and `all_temperature_curves.csv` preserve all fits.
 Temperature bounds still apply; boundary solutions must be reported.
 
+Seeding options: `feature` (original), `bound` (weighted feature/label k-means++),
+`bound_greedy` (four candidate draws per center by default), and `bound_pca`.
+The augmented space uses eta=sqrt(global label variance/global feature variance),
+feature weight 1+lambda*eta/2 and label weight lambda/(2*eta). Zero-variance cases
+fall back to the nonconstant block. Lambda zero uses features only.
+Greedy candidates minimize the augmented-space nearest-center squared-distance sum.
+No Lloyd refinement is used when initialization_steps=1.
+
+PCA-Part splits the cell with largest total squared scatter at its mean projection.
+For scalability its principal direction is approximated with at most 100 deterministic
+power iterations (tolerance 1e-8), starting from the largest-variance coordinate.
+It is not an exact eigensolver; split diagnostics report direction convergence.
+Empty-side splits use a stable median fallback. Cell/tie ordering is fixed, no RNG
+is used. Numerical differences across devices are still possible. The resulting
+divisive partition is used directly, without a nearest-center reassignment.
+PCA-Part is evaluated once per setting, not presented as independent seed repeats.
+
 Initialization-only controls use `max_sweeps=0` (no moment updates) and may use
 `lambda=[0.0]`. Use one initialization iteration for selected-center assignment,
 or require converged k-means for a standard k-means baseline. Shared runs reuse

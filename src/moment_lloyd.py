@@ -4,6 +4,7 @@ from time import perf_counter
 import torch
 
 from src.io import array_digest
+from src.moment_seeding import bound_features, pca_partition
 
 
 def statistics(x, q, assignment, cells, energy, original):
@@ -49,7 +50,7 @@ def move_deltas(x, q, source, state, n, weight):
     return delta
 
 
-def initialize(x, cells, seed, block_size, iterations=20, return_info=False):
+def initialize(x, cells, seed, block_size, iterations=20, return_info=False, local_trials=1):
     if iterations < 1:
         raise ValueError("Initialization iterations must be positive")
     generator = torch.Generator(device=x.device).manual_seed(seed)
@@ -63,11 +64,18 @@ def initialize(x, cells, seed, block_size, iterations=20, return_info=False):
         nearest = torch.minimum(nearest, (x - x[index]).square().sum(1))
         nearest[selected] = 0
         if len(indices) < cells:
-            index = (
-                int(torch.multinomial(nearest, 1, generator=generator))
-                if float(nearest.sum()) > 0
-                else int(torch.where(~selected)[0][0])
-            )
+            if float(nearest.sum()) > 0:
+                if local_trials == 1:
+                    index = int(torch.multinomial(nearest, 1, generator=generator))
+                else:
+                    candidates = torch.multinomial(nearest, local_trials, replacement=True, generator=generator)
+                    costs = torch.stack([
+                        torch.minimum(nearest, (x - x[candidate]).square().sum(1)).sum()
+                        for candidate in candidates
+                    ])
+                    index = int(candidates[costs.argmin()])
+            else:
+                index = int(torch.where(~selected)[0][0])
     centers = x[indices].clone()
     assignment = torch.full((len(x),), -1, device=x.device, dtype=torch.long)
     converged = False
@@ -113,6 +121,8 @@ def moment_lloyd_partition(
     initialization_steps=20,
     require_initialization_convergence=False,
     backtrack_steps=8,
+    seeding="feature",
+    greedy_trials=4,
 ):
     if mode not in ("hybrid", "full_only", "filtered_batch") or not 1 <= m <= len(H):
         raise ValueError("Invalid mode or cell count")
@@ -129,9 +139,20 @@ def moment_lloyd_partition(
     scale = x.square().sum(1).mean().sqrt().clamp_min(1e-30)
     x = x / scale
     energy, original = x.square().sum(1).mean(), x.T @ q / len(x)
-    assignment, initialization_info = initialize(
-        x, m, seed, block_size, initialization_steps, return_info=True
-    )
+    if seeding not in ("feature", "bound", "bound_greedy", "bound_pca") or greedy_trials < 1:
+        raise ValueError("Invalid seeding method or greedy trial count")
+    material, scaling = (x, {}) if seeding == "feature" else bound_features(x, q, moment_weight)
+    if seeding == "bound_pca":
+        assignment, initialization_info = pca_partition(material, m)
+        if require_initialization_convergence:
+            raise ValueError("PCA-Part is a divisive partition, not converged Lloyd initialization")
+    else:
+        assignment, initialization_info = initialize(
+            material, m, seed, block_size, initialization_steps, return_info=True,
+            local_trials=greedy_trials if seeding == "bound_greedy" else 1,
+        )
+    initialization_info.update(seeding=seeding, **scaling)
+    del material
     if require_initialization_convergence and not initialization_info["initialization_converged"]:
         raise RuntimeError("Initial k-means reached its iteration limit; increase initialization_steps")
     digest = array_digest(assignment.cpu().numpy())

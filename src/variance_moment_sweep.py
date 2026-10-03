@@ -168,6 +168,8 @@ def run_risk_sweep(
     require_initialization_convergence=False,
     backtrack_steps=8,
     temperature_bounds=(0.05, 20.0),
+    seeding="feature",
+    greedy_trials=4,
 ):
     if teacher_selection not in ("grid", "validation_ce", "accuracy_then_ce", "calibrated_ce"):
         raise ValueError("Use grid or validation_ce teacher selection")
@@ -229,6 +231,7 @@ def run_risk_sweep(
             initialization_steps=initialization_steps,
             require_initialization_convergence=require_initialization_convergence,
             backtrack_steps=backtrack_steps,
+            seeding=seeding, greedy_trials=greedy_trials,
         )
     if method == "variance_kl":
         solver = partial(variance_kl_partition, seed_partition=modules["risk_partition"]["seed_partition"])
@@ -265,6 +268,7 @@ def run_risk_sweep(
             "variance_kl.py",
             "variance_moment_low_rank.py",
             "moment_lloyd.py",
+            "moment_seeding.py",
             "teacher_calibration.py",
             "distance_initialization.py",
             "evaluation.py",
@@ -305,8 +309,9 @@ def run_risk_sweep(
     if teacher_selection in ("accuracy_then_ce", "calibrated_ce"):
         config["temperature_bounds"] = list(temperature_bounds)
     if lloyd:
-        config["initialization"] = "full_feature_kmeans++_lloyd"
+        config["initialization"] = f"moment_seeding_{seeding}"
         config["lloyd_options"] = dict(
+            seeding=seeding, greedy_trials=greedy_trials,
             initialization_steps=initialization_steps,
             require_initialization_convergence=require_initialization_convergence,
             backtrack_steps=backtrack_steps,
@@ -343,7 +348,6 @@ def run_risk_sweep(
             "torch",
             "student",
             "loss_weighting",
-            "condensation_seeds",
             "search_seeds",
             "final_seeds",
             "block_size",
