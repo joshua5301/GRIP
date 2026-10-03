@@ -576,7 +576,8 @@ def optimize_ce_assignment(
     }
     if set(mlp_initial_options) - {"mlp_initial_mass_schema", "mlp_initial_mass_source",
                                    "mlp_output_centering", "mlp_source_centering_schema", "mlp_source_centering_source",
-                                   "source_linear_coordinates", "source_linear_schema", "source_linear_source", "source_linear_inputs"}:
+                                   "source_linear_coordinates", "source_linear_schema", "source_linear_source", "source_linear_inputs",
+                                   "uniform_cell_q_prior_weight", "uniform_cell_q_prior_schema", "uniform_cell_q_prior_source"}:
         raise ValueError("Unknown MLP initial-mass control")
     mlp_initial_mass_schema = mlp_initial_options.get("mlp_initial_mass_schema")
     mlp_initial_mass_source = mlp_initial_options.get("mlp_initial_mass_source")
@@ -589,6 +590,27 @@ def optimize_ce_assignment(
     source_linear_source = mlp_initial_options.get("source_linear_source")
     source_linear_inputs = mlp_initial_options.get("source_linear_inputs")
     source_linear_active = source_linear_mode is not None
+    # Parse after locals-derived resume_config: default0 preserves the exact old
+    # signature, config keys, tensor arithmetic and source-helper introspection.
+    prior_weight = mlp_initial_options.get("uniform_cell_q_prior_weight", 0.0)
+    prior_schema = mlp_initial_options.get("uniform_cell_q_prior_schema")
+    prior_source = mlp_initial_options.get("uniform_cell_q_prior_source")
+    if isinstance(prior_weight, (bool, np.bool_)) or not isinstance(prior_weight, (int, float, np.integer, np.floating)) or prior_weight not in (0, 1):
+        raise ValueError("Uniform-cell Q prior supports only coefficient0 or fixed1")
+    prior_active = prior_weight == 1
+    if prior_active:
+        if (assignment_input != "node" or assignment_encoder != "linear" or assignment_rank is None
+                or mass_mode != "free" or inner_loss_weighting != "uniform" or solver_mode != "exact"
+                or node_weighting or temperature_logits is not None or outer_targets is not None
+                or outer_indices is not None or implicit_solver is not None or inner_solver is not None
+                or cache_assignment or centered_active or source_linear_active or mixing != .05):
+            raise ValueError("Prior objective requires original free NODE/uniform exact CE")
+        from src.uniform_cell_q_prior import config_context, prior_partials
+        prior_pi, prior_context = config_context(q, prior_schema, prior_source)
+        resume_config.update(uniform_cell_q_prior_weight=1.0, uniform_cell_q_prior_schema=prior_schema,
+                             uniform_cell_q_prior_source=prior_source, uniform_cell_q_prior_context=prior_context)
+    elif prior_schema is not None or prior_source is not None:
+        raise ValueError("Disabled prior cannot carry activated provenance")
     if inner_loss_weighting == "mass":
         resume_config.pop("inner_loss_weighting")
     if outer_targets is not None:
@@ -1006,6 +1028,16 @@ def optimize_ce_assignment(
             row["inner_benchmark_seconds"] = row["inner_seconds"]
             row["inner_seconds"] = fitted["benchmark_lbfgs_seconds"]
         objective = value
+        if prior_active:
+            # Direct moment term is independent of theta, so CE head/RHS stays
+            # unchanged. Evaluate terminal value too; no terminal P backward.
+            prior = prior_partials(moments.detach(), z.shape[1], prior_pi)
+            objective += float(prior["value"])
+            if not np.isfinite(objective):
+                raise FloatingPointError("Nonfinite combined CE/prior objective")
+            row.update(uniform_cell_q_prior_KL=float(prior["value"]),
+                       uniform_cell_q_prior_cell_mean=prior["cell_prior"].cpu().tolist(),
+                       objective=objective, teacher_CE_normalization_scale="max_teacher_CE_P0_1e-12")
         if node_weighting:
             objective += node_weight_penalty * float(weight_kl.detach())
             row.update(
@@ -1139,6 +1171,10 @@ def optimize_ce_assignment(
             if source_linear_active:
                 from src.source_linear_assignment import attach as attach_linear
                 attach_linear(snapshot, source_context, parameters, u)
+            if prior_active:
+                snapshot.update(uniform_cell_q_prior_context=prior_context,
+                                uniform_cell_q_prior_config=resume_config,
+                                uniform_cell_q_prior_KL=float(prior["value"]), objective=objective)
             snapshots[step] = snapshot
             if folder is not None:
                 checkpoint_dir = folder / "checkpoints"
@@ -1188,6 +1224,8 @@ def optimize_ce_assignment(
         direction = implicit_moment_gradient(
             moments, z.shape[1], theta, vector, penalty, inner_loss_weighting
         )
+        if prior_active:
+            direction = direction+prior["moment_gradient"]
         if not bool(torch.isfinite(direction).all()):
             raise FloatingPointError("Nonfinite implicit gradient")
         try:
@@ -1247,6 +1285,9 @@ def optimize_ce_assignment(
         node_weight_penalty=node_weight_penalty,
         assignment_parameters=sum((parameter.numel() for parameter in parameters)),
     )
+    if prior_active:
+        result.update(uniform_cell_q_prior_context=prior_context,
+                      objective_name="teacher_CE_plus_uniform_cell_Q_prior_KL")
     if folder is not None and save_assignment:
         if assignment_rank is None:
             torch.save(best_parameters[0].cpu(), folder / "best_assignment_logits.pt")
