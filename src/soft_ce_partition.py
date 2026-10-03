@@ -581,7 +581,8 @@ def optimize_ce_assignment(
                                    "assignment_kl_weight", "assignment_kl_schema", "assignment_kl_source", "assignment_kl_teacher_T",
                                    "node_factor_mode", "node_factor_artifact", "node_factor_sha256", "node_factor_context",
                                    "graph_assignment_kl_mode", "graph_assignment_kl_artifact",
-                                   "graph_assignment_kl_sha256", "graph_assignment_kl_context"}:
+                                   "graph_assignment_kl_sha256", "graph_assignment_kl_context",
+                                   "kernel_commutation_mode", "kernel_commutation_context", "kernel_commutation_inputs"}:
         raise ValueError("Unknown MLP initial-mass control")
     mlp_initial_mass_schema = mlp_initial_options.get("mlp_initial_mass_schema")
     mlp_initial_mass_source = mlp_initial_options.get("mlp_initial_mass_source")
@@ -694,6 +695,33 @@ def optimize_ce_assignment(
                              graph_assignment_kl_context=graph_kl_context)
     elif any(value is not None for value in (graph_kl_artifact, graph_kl_sha256, graph_kl_context)):
         raise ValueError("Disabled graph KL cannot carry an artifact or context")
+    # Coupled geometry uses the same CE head and original base moments. The
+    # physical-H and kernel numerators are separate to preserve its BLAS path.
+    commutation_mode = mlp_initial_options.get("kernel_commutation_mode")
+    commutation_context = mlp_initial_options.get("kernel_commutation_context")
+    commutation_inputs = mlp_initial_options.get("kernel_commutation_inputs")
+    commutation_active = commutation_mode is not None
+    if commutation_active:
+        if (commutation_mode != "normalized_kernel_commutation_v1"
+                or assignment_input != "node" or assignment_encoder != "linear"
+                or type(assignment_rank) is not int or assignment_rank < 1
+                or mass_mode != "free" or inner_loss_weighting != "uniform" or solver_mode != "exact"
+                or inner_method != "newton_first" or implicit_warm_start is not True
+                or node_weighting or temperature_logits is not None or outer_targets is not None
+                or outer_indices is not None or implicit_solver is not None or inner_solver is not None
+                or cache_assignment or centered_active or source_linear_active or prior_active or row_kl_active
+                or node_factor_active or graph_kl_active or mlp_initial_mass_schema is not None
+                or mlp_initial_mass_source is not None or save_assignment or not save_resume
+                or mixing != .05 or torch.get_default_dtype() != torch.float32
+                or not isinstance(commutation_context, dict) or not isinstance(commutation_inputs, dict)):
+            raise ValueError("Kernel commutation requires the original native free/uniform exact CE")
+        from src.kernel_commutation_moments import JointKernelMoments, gap_partials, validate_context
+        from src.kernel_commutation_moments import attach_snapshot as attach_commutation_snapshot
+        from src.kernel_commutation_moments import attach_resume as attach_commutation_resume
+        resume_config.update(kernel_commutation_mode=commutation_mode,
+                             kernel_commutation_context=commutation_context)
+    elif commutation_context is not None or commutation_inputs is not None:
+        raise ValueError("Disabled kernel commutation cannot carry source inputs or context")
     if inner_loss_weighting == "mass":
         resume_config.pop("inner_loss_weighting")
     if outer_targets is not None:
@@ -829,7 +857,7 @@ def optimize_ce_assignment(
         raise ValueError("Checkpoint steps must be integers within the optimization budget")
     if checkpoints or mass_mode == "initial" or centered_active or source_linear_active or row_kl_active or node_factor_active:
         checkpoints.update((0, steps))
-    if graph_kl_active:
+    if graph_kl_active or commutation_active:
         checkpoints.update((0, steps))
     snapshots = {}
     _check_assignment_stop(stop)
@@ -1004,6 +1032,12 @@ def optimize_ce_assignment(
                     raise ValueError("Graph KL resume history changed its CE/KL/normalization binding")
         elif folder is not None and any((Path(folder) / "checkpoints").glob("step_*.pt")):
             raise ValueError("Graph KL cached checkpoints require a verifiable resume")
+    if commutation_active:
+        commutation_initial = validate_context(
+            z, q, assignment, parameters, mixing, chunk_size, commutation_context,
+            commutation_inputs, resume_config, steps, resume_state=resume_state, folder=folder)
+        commutation_CE0 = None if resume_state is None else resume_state["kernel_commutation_CE0"]
+        commutation_G0 = None if resume_state is None else resume_state["kernel_commutation_G0"]
     if node_weighting:
         node_logits = z.new_zeros(len(z), dtype=torch.float32).requires_grad_()
         groups = [
@@ -1118,6 +1152,10 @@ def optimize_ce_assignment(
                 row_residual=float(diagnostic[1]),
                 column_residual=float(diagnostic[2]),
             )
+        elif commutation_active:
+            moments, physical_moments, phi_moments = JointKernelMoments.apply(
+                u, v, assignment, material, mixing, chunk_size,
+                commutation_inputs["physical_H"], commutation_inputs["source_phi"])
         elif graph_kl_active:
             moments, graph_row_kl = InitialAssignmentKLMoments.apply(
                 u, v, assignment, material, mixing, chunk_size, graph_log_reference)
@@ -1258,13 +1296,31 @@ def optimize_ce_assignment(
             row.update(graph_assignment_kl_KL=float(graph_row_kl.detach()), teacher_ce=value,
                        objective=objective, objective_name="teacher_CE_plus_KL_current_to_frozen_graph_diffused_P0",
                        teacher_CE_normalization_scale="max_teacher_CE_P0_1e-12")
+        if commutation_active:
+            gap = gap_partials(moments.detach(), physical_moments.detach(), phi_moments.detach(),
+                               commutation_inputs)
+            gap_value = float(gap["value"])
+            if step == 0:
+                if not np.isfinite(value) or value <= 0 or not np.isfinite(gap_value) or gap_value <= 0:
+                    raise FloatingPointError("Kernel commutation needs strictly positive frozen CE0/G0")
+                if commutation_CE0 is None and commutation_G0 is None:
+                    commutation_CE0, commutation_G0 = value, gap_value
+                elif commutation_CE0 != value or commutation_G0 != gap_value:
+                    raise ValueError("Resumed P0 CE/G differs from its frozen positive scales")
+            objective = value / commutation_CE0 + gap_value / commutation_G0
+            if not np.isfinite(objective):
+                raise FloatingPointError("Nonfinite normalized CE/kernel commutation objective")
+            row.update(teacher_ce=value, kernel_commutation_G=gap_value,
+                       kernel_commutation_CE0=commutation_CE0, kernel_commutation_G0=commutation_G0,
+                       objective=objective, normalized_objective=objective,
+                       objective_name="teacher_CE_over_CE0_plus_kernel_gap_over_G0")
         failure = None
         if refresh and (not fitted["inner_converged"]) or not np.isfinite(value):
             failure = "Inner CE did not converge; increase inner_max_iter or inspect inner_tol"
         else:
             if step == 0:
                 initial_moments = moments.detach().cpu()
-                scale = max(value, 1e-12)
+                scale = value if commutation_active else max(value, 1e-12)
             if row_kl_active:
                 row.update(assignment_kl_scale=scale, normalized_objective=objective / scale)
             if graph_kl_active:
@@ -1404,6 +1460,9 @@ def optimize_ce_assignment(
                                 graph_assignment_kl_KL=float(graph_row_kl.detach()), objective=objective,
                                 graph_assignment_kl_scale=scale,
                                 objective_name="teacher_CE_plus_KL_current_to_frozen_graph_diffused_P0")
+            if commutation_active:
+                attach_commutation_snapshot(snapshot, commutation_context, resume_config, parameters,
+                    physical_moments, phi_moments, commutation_CE0, commutation_G0, gap_value, objective)
             snapshots[step] = snapshot
             if folder is not None:
                 checkpoint_dir = folder / "checkpoints"
@@ -1449,6 +1508,9 @@ def optimize_ce_assignment(
             if graph_kl_active:
                 state.update(graph_assignment_kl_context=graph_kl_context,
                              graph_assignment_kl_initial_parameters=graph_initial_parameters)
+            if commutation_active:
+                attach_commutation_resume(state, commutation_context, commutation_initial,
+                                          commutation_CE0, commutation_G0)
             if folder is not None:
                 torch.save(state, folder / "resume.tmp.pt")
                 (folder / "resume.tmp.pt").replace(folder / "resume.pt")
@@ -1472,6 +1534,13 @@ def optimize_ce_assignment(
                 )
             elif row_kl_active:
                 torch.autograd.backward((moments, row_kl), (direction / scale, row_kl.new_tensor(1 / scale)))
+            elif commutation_active:
+                # All three FP64 cotangents enter one softmax/factor VJP. G
+                # differentiates both the physical centroid and source-phi mean.
+                torch.autograd.backward((moments, physical_moments, phi_moments),
+                    (direction / commutation_CE0 + gap["moment_gradient"] / commutation_G0,
+                     gap["physical_gradient"] / commutation_G0,
+                     gap["phi_gradient"] / commutation_G0))
             elif graph_kl_active:
                 torch.autograd.backward((moments, graph_row_kl), (direction / scale, graph_row_kl.new_tensor(1 / scale)))
             else:
@@ -1536,6 +1605,10 @@ def optimize_ce_assignment(
     if graph_kl_active:
         result.update(graph_assignment_kl_context=graph_kl_context,
                       objective_name="teacher_CE_plus_KL_current_to_frozen_graph_diffused_P0")
+    if commutation_active:
+        result.update(kernel_commutation_context=commutation_context,
+                      kernel_commutation_CE0=commutation_CE0, kernel_commutation_G0=commutation_G0,
+                      objective_name="teacher_CE_over_CE0_plus_kernel_gap_over_G0")
     if folder is not None and save_assignment:
         if assignment_rank is None:
             torch.save(best_parameters[0].cpu(), folder / "best_assignment_logits.pt")
