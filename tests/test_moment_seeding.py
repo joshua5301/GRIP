@@ -127,3 +127,22 @@ def test_feature_var_initialization_ignores_labels_weight_and_seed():
     assert first["initial_assignment_digest"] == second["initial_assignment_digest"]
     assert first["moment_objective"] == pytest.approx(first["V"] + first["moment_error"])
     assert second["moment_objective"] == pytest.approx(second["V"] + 100 * second["moment_error"])
+
+
+@pytest.mark.parametrize("weight", [0.0, 1.0, 10.0])
+@pytest.mark.parametrize("hard", [False, True])
+def test_kl_lloyd_matches_direct_objective(weight, hard):
+    x, q = example()
+    if hard:
+        q = torch.nn.functional.one_hot(q.argmax(1), 3).double()
+    options = dict(moment_weight=weight, seeding="bound_var", max_sweeps=100)
+    result = moment_lloyd_partition(x, q, 4, mode="kl", **options)
+    initial = moment_lloyd_partition(x, q, 4, mode="filtered_batch", **options)
+    assert result["initial_assignment_digest"] == initial["initial_assignment_digest"]
+    assert all(b <= a + 1e-10 for a, b in zip(result["history"], result["history"][1:]))
+    assignment = result["assignment"]
+    labels = torch.stack([q[assignment == j].mean(0) for j in range(4)])
+    kl = (torch.special.xlogy(q, q) - torch.special.xlogy(q, labels[assignment])).sum(1).mean()
+    assert result["J"] == pytest.approx(result["V"] + weight * float(kl), abs=1e-10)
+    assert (result["counts"] > 0).all()
+    assert result["converged"]

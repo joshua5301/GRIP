@@ -52,3 +52,14 @@ mean teacher probabilities. Subsequent filtered updates optimize the unchanged
 `Vx + lambda ||M||` objective. Compare against `bound_var` with the same candidate
 grid, teacher features, and student seeds. The `variance` solver mode deliberately
 rejects feature-only seeding to avoid silently changing its bound-derived weights.
+
+## Variance plus forward KL
+
+`method="moment_lloyd_kl"` minimizes `Vx + lambda * mean KL(q_i || s_assignment)`
+using batch assignments and arithmetic feature/label means. It accepts the same
+Var-Part seeding choices as the moment solver. With `bound_var`, matching lambda,
+gamma and T give the same initial partition, but lambda has different meanings
+in the two objectives and should be tuned separately. Bound-space seeding in this
+KL comparison is a shared initialization convention, not a newly derived KL bound.
+The historical `variance_kl` implementation is unchanged; its equivalent KL weight
+after rescaling the objective is `16/B**2`. Zero weight skips KL assignment costs.

@@ -124,7 +124,7 @@ def moment_lloyd_partition(
     seeding="feature",
     greedy_trials=4,
 ):
-    if mode not in ("hybrid", "full_only", "filtered_batch", "variance") or not 1 <= m <= len(H):
+    if mode not in ("hybrid", "full_only", "filtered_batch", "variance", "kl") or not 1 <= m <= len(H):
         raise ValueError("Invalid mode or cell count")
     if not math.isfinite(moment_weight) or moment_weight < 0 or max_sweeps < 0 or block_size < 1:
         raise ValueError("Invalid weight or budget")
@@ -148,6 +148,8 @@ def moment_lloyd_partition(
         raise ValueError("Variance comparison requires bound-space initialization")
     a, b = scaling.get("feature_weight", 1.0), scaling.get("label_weight", 0.0)
     label_energy = q.square().sum(1).mean()
+    entropy = torch.special.xlogy(q, q).sum(1)
+    tiny = torch.finfo(q.dtype).tiny
     if seeding in hierarchical:
         assignment, initialization_info = pca_partition(material, m, method=hierarchical[seeding])
         if require_initialization_convergence:
@@ -166,20 +168,30 @@ def moment_lloyd_partition(
     def aggregate(a):
         return statistics(x, q, a, m, energy, original)
 
-    def score(s):
+    def label_kl(s, assignment):
+        return (entropy - (q * s[2][assignment].clamp_min(tiny).log()).sum(1)).mean().clamp_min(0)
+
+    def score(s, assignment=None):
+        if mode == "kl":
+            return float(s[3] + moment_weight * label_kl(s, assignment))
         if mode == "variance":
             return float(a * s[3] + b * (label_energy - (s[0] * s[2].square().sum(1)).sum() / len(x)))
         return float(s[3] + moment_weight * s[4].norm())
 
     state = aggregate(assignment)
-    history, records = [score(state)], []
+    history, records = [score(state, assignment)], []
     status, converged = "initialization_only" if max_sweeps == 0 else "iteration_limit", False
     for sweep in range(max_sweeps):
         tolerance = atol + rtol * max(1.0, abs(history[-1]))
         proposed, gains = assignment.clone(), x.new_zeros(len(x))
         for start in range(0, len(x), block_size):
             end = min(start + block_size, len(x))
-            if mode == "variance":
+            if mode == "kl":
+                cost = state[1].square().sum(1) - 2 * x[start:end] @ state[1].T
+                if moment_weight > 0:
+                    cost -= moment_weight * q[start:end] @ state[2].clamp_min(tiny).log().T
+                    cost.masked_fill_((q[start:end] > 0).to(x) @ (state[2] == 0).to(x).T > 0, torch.inf)
+            elif mode == "variance":
                 cost = a * (state[1].square().sum(1) - 2 * x[start:end] @ state[1].T)
                 cost += b * (state[2].square().sum(1) - 2 * q[start:end] @ state[2].T)
             else:
@@ -188,10 +200,16 @@ def moment_lloyd_partition(
             old = cost.gather(1, assignment[start:end, None]).squeeze(1)
             proposed[start:end] = torch.where(old <= best, assignment[start:end], target)
             gains[start:end] = old - best
-        if mode == "variance":
+        if mode in ("variance", "kl"):
             counts = torch.bincount(proposed, minlength=m)
             residual = a * (x - state[1][proposed]).square().sum(1)
             residual += b * (q - state[2][proposed]).square().sum(1)
+            if mode == "kl":
+                residual = (x - state[1][proposed]).square().sum(1)
+                if moment_weight > 0:
+                    residual += moment_weight * (
+                        entropy - (q * state[2][proposed].clamp_min(tiny).log()).sum(1)
+                    ).clamp_min(0)
             for empty in torch.where(counts == 0)[0].tolist():
                 donor = int(residual.masked_fill(counts[proposed] <= 1, -torch.inf).argmax())
                 counts[proposed[donor]] -= 1
@@ -203,9 +221,9 @@ def moment_lloyd_partition(
                 status, converged = "assignment_stable", True
                 break
             updated = aggregate(proposed)
-            value = score(updated)
-            if value > history[-1] + tolerance:
-                raise RuntimeError("Lloyd variance objective increased")
+            value = score(updated, proposed)
+            if not math.isfinite(value) or value > history[-1] + tolerance:
+                raise RuntimeError("Lloyd objective increased or became nonfinite")
             assignment, state = proposed, updated
             history.append(value)
             records.append(dict(sweep=sweep + 1, kind="lloyd", moves=moved, J=value))
@@ -290,6 +308,7 @@ def moment_lloyd_partition(
         J=history[-1],
         V=float(variance),
         moment_error=float(moment.norm()),
+        label_kl=float(label_kl(state, assignment)),
         label_variance=float(label_energy - (counts * labels.square().sum(1)).sum() / len(x)),
         moment_objective=float(variance + moment_weight * moment.norm()),
         variance_objective=float(a * variance + b * (label_energy - (counts * labels.square().sum(1)).sum() / len(x))),
