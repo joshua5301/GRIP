@@ -35,6 +35,13 @@ Endpoints and T=1 (when feasible) are checked. The selected temperature replaces
 the placeholder before condensation; it is not a student hyperparameter sweep.
 Teacher grid, calibration curve, selected temperature and boundary flag are saved.
 
+Initialization-only controls use `max_sweeps=0` (no moment updates) and may use
+`lambda=[0.0]`. Use one initialization iteration for selected-center assignment,
+or require converged k-means for a standard k-means baseline. Shared runs reuse
+only features and gamma-keyed teacher caches, so their coefficient grids and
+optimization budgets may differ. Compare variance and moment error separately
+when coefficients differ; raw objective values are then not comparable.
+
 Filtered-batch uses the same full proposal followed by top-gain prefixes (half,
 quarter, etc.) but never scans exact single moves. `backtrack_steps=8` limits the
 number of partial attempts for both filtered-batch and hybrid. Rejection or no

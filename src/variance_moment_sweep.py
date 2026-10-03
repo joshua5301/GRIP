@@ -205,8 +205,11 @@ def run_risk_sweep(
             raise ValueError("Candidate subset must not contain duplicates")
     if "rank" in space and any(isinstance(r, bool) or not isinstance(r, int) or r < 1 for r in space["rank"]):
         raise ValueError("Ranks must be positive integers")
-    if any(not math.isfinite(value) or value <= 0 for row in candidates for value in row.values()):
-        raise ValueError("Grid values must be finite and positive")
+    if any(
+        not math.isfinite(value) or (value < 0 if lloyd and key == "lambda" else value <= 0)
+        for row in candidates for key, value in row.items()
+    ):
+        raise ValueError("Grid values must be finite and positive (Lloyd lambda may be zero)")
     if any(
         not seeds or len(seeds) != len(set(seeds))
         for seeds in (condensation_seeds, search_seeds, final_seeds)
@@ -214,7 +217,7 @@ def run_risk_sweep(
         raise ValueError("Seed lists must be nonempty and unique")
     if set(search_seeds) & set(final_seeds):
         raise ValueError("Search and final student seeds must be disjoint")
-    if min(max_sweeps, block_size, basis, epochs, eval_every, hidden) < 1:
+    if max_sweeps < (0 if lloyd else 1) or min(block_size, basis, epochs, eval_every, hidden) < 1:
         raise ValueError("Solver and student budgets must be positive")
     torch.backends.cuda.matmul.allow_tf32 = False
     torch.backends.cudnn.allow_tf32 = False
@@ -338,13 +341,11 @@ def run_risk_sweep(
             "teacher_kernel",
             "protocol",
             "torch",
-            "space",
             "student",
             "loss_weighting",
             "condensation_seeds",
             "search_seeds",
             "final_seeds",
-            "max_sweeps",
             "block_size",
         )
         changed = [key for key in keys if previous.get(key) != config[key]]

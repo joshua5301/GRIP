@@ -96,6 +96,19 @@ def test_one_assignment_uses_same_kmeans_plus_plus_centers():
         torch.testing.assert_close(once["y"][j], q[mask].mean(0).float())
 
 
+def test_zero_moment_initialization_only_control():
+    x, q, _ = example()
+    result = module.moment_lloyd_partition(
+        x, q, 3, moment_weight=0, max_sweeps=0,
+        initialization_steps=100, require_initialization_convergence=True,
+    )
+    assert result["status"] == "initialization_only"
+    assert result["initialization_converged"]
+    assert result["J"] == result["V"]
+    assert result["records"] == []
+    assert result["sweeps"] == 0
+
+
 def test_filtered_backtracks_without_exact_scan(monkeypatch):
     x, q, _ = example()
     x = x - x.mean(0)

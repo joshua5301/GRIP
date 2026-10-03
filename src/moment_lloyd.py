@@ -144,7 +144,7 @@ def moment_lloyd_partition(
 
     state = aggregate(assignment)
     history, records = [score(state)], []
-    status, converged = "iteration_limit", False
+    status, converged = "initialization_only" if max_sweeps == 0 else "iteration_limit", False
     for sweep in range(max_sweeps):
         tolerance = atol + rtol * max(1.0, abs(history[-1]))
         proposed, gains = assignment.clone(), x.new_zeros(len(x))
