@@ -32,6 +32,9 @@ def implementation_provenance():
 
 def dispatch(job, stop):
     options = dict(job["options"])
+    if job["kind"] == "cora_hybrid_fixed25":
+        from src.cora_hybrid_fixed25 import run
+        return run(**options, stop=stop)
     if job["kind"] == "cora_hybrid_probe":
         from src.cora_hybrid_probe import prepare
         return prepare(**options, stop=stop)
