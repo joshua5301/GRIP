@@ -32,6 +32,9 @@ def implementation_provenance():
 
 def dispatch(job, stop):
     options = dict(job["options"])
+    if job["kind"] == "large_scipy_full_ce_reference":
+        from src.scipy_full_ce_reference import prepare_independent_reference
+        return prepare_independent_reference(**options, stop=stop)
     if job["kind"] == "large_feature_tile_source_gradient":
         from src.large_feature_tile_source_gradient import prepare_source_gradient
         return prepare_source_gradient(**options, stop=stop)
