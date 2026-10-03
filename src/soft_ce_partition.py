@@ -526,6 +526,7 @@ def optimize_ce_assignment(
     factor_initial_std=0.0,
     probability_floor=0.0,
     initial_dense_logits=None,
+    initial_factors=None,
 ):
     if feature_control != "joint" or initial_representatives is not None:
         raise ValueError("Only clustering-derived features and labels are supported")
@@ -561,6 +562,7 @@ def optimize_ce_assignment(
             "outer_targets",
             "base_logits",
             "initial_dense_logits",
+            "initial_factors",
         )
     }
     if base_logits is not None:
@@ -574,6 +576,13 @@ def optimize_ce_assignment(
             raise ValueError("Invalid base logits")
         base_logits = base_logits.detach().to(z)
         resume_config["base_logits_digest"] = array_digest(base_logits.cpu().numpy())
+    if initial_factors is not None:
+        if assignment_rank is None or assignment_input != "node" or mass_mode != "free" or len(initial_factors) != 2:
+            raise ValueError("Initial factors require free-mass node low-rank assignment")
+        expected = ((len(z), assignment_rank), (int(assignment.max()) + 1, assignment_rank))
+        if any(p.shape != shape or not bool(torch.isfinite(p).all()) for p, shape in zip(initial_factors, expected)):
+            raise ValueError("Invalid initial low-rank factors")
+        resume_config["initial_factors_digest"] = array_digest(*[p.detach().cpu().numpy() for p in initial_factors])
     if initial_dense_logits is not None:
         if (assignment_rank is not None or assignment_input != "node" or mass_mode != "free"
                 or node_weighting or sparse_k is not None or base_logits is not None
@@ -754,6 +763,8 @@ def optimize_ce_assignment(
             parameters = [*encoder_parameters, v]
     else:
         u, v = initialize_factors(assignment, clusters, assignment_rank, factor_seed, factor_initial_std)
+        if initial_factors is not None:
+            u, v = [p.detach().to(device=z.device, dtype=torch.float32).clone().requires_grad_() for p in initial_factors]
         parameters = [u, v]
     if node_weighting:
         node_logits = z.new_zeros(len(z), dtype=torch.float32).requires_grad_()
