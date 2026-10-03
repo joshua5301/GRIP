@@ -578,7 +578,8 @@ def optimize_ce_assignment(
                                    "mlp_output_centering", "mlp_source_centering_schema", "mlp_source_centering_source",
                                    "source_linear_coordinates", "source_linear_schema", "source_linear_source", "source_linear_inputs",
                                    "uniform_cell_q_prior_weight", "uniform_cell_q_prior_schema", "uniform_cell_q_prior_source",
-                                   "assignment_kl_weight", "assignment_kl_schema", "assignment_kl_source", "assignment_kl_teacher_T"}:
+                                   "assignment_kl_weight", "assignment_kl_schema", "assignment_kl_source", "assignment_kl_teacher_T",
+                                   "node_factor_mode", "node_factor_artifact", "node_factor_sha256", "node_factor_context"}:
         raise ValueError("Unknown MLP initial-mass control")
     mlp_initial_mass_schema = mlp_initial_options.get("mlp_initial_mass_schema")
     mlp_initial_mass_source = mlp_initial_options.get("mlp_initial_mass_source")
@@ -638,6 +639,30 @@ def optimize_ce_assignment(
                              assignment_kl_source=row_kl_source, assignment_kl_teacher_T=1.0)
     elif any(value is not None for value in (row_kl_schema, row_kl_source, row_kl_teacher_T)):
         raise ValueError("Disabled assignment KL cannot carry activated provenance")
+    # This changes only V0. U0 and the prior assignment remain the native ones.
+    # Parse after the legacy config capture to keep inactive resumes unchanged.
+    node_factor_mode = mlp_initial_options.get("node_factor_mode")
+    node_factor_active = node_factor_mode is not None
+    node_factor_artifact = mlp_initial_options.get("node_factor_artifact")
+    node_factor_sha256 = mlp_initial_options.get("node_factor_sha256")
+    node_factor_context = mlp_initial_options.get("node_factor_context")
+    if node_factor_active:
+        if (node_factor_mode not in ("prototype_gram_v1", "centered_gaussian_v1")
+                or assignment_input != "node" or assignment_encoder != "linear"
+                or type(assignment_rank) is not int or assignment_rank < 1
+                or mass_mode != "free" or inner_loss_weighting != "uniform" or solver_mode != "exact"
+                or inner_method != "newton_first" or implicit_warm_start is not True
+                or node_weighting or temperature_logits is not None or outer_targets is not None
+                or outer_indices is not None or implicit_solver is not None or inner_solver is not None
+                or cache_assignment or centered_active or source_linear_active or prior_active or row_kl_active
+                or save_assignment or not save_resume or mixing != .05 or torch.get_default_dtype() != torch.float32
+                or not isinstance(node_factor_artifact, str) or not isinstance(node_factor_sha256, str)
+                or not isinstance(node_factor_context, dict)):
+            raise ValueError("Frozen NODE factor initialization requires original free/uniform exact CE")
+        resume_config.update(node_factor_mode=node_factor_mode, node_factor_artifact=node_factor_artifact,
+                             node_factor_sha256=node_factor_sha256, node_factor_context=node_factor_context)
+    elif any(value is not None for value in (node_factor_artifact, node_factor_sha256, node_factor_context)):
+        raise ValueError("Disabled NODE factor mode cannot carry an artifact or context")
     if inner_loss_weighting == "mass":
         resume_config.pop("inner_loss_weighting")
     if outer_targets is not None:
@@ -771,7 +796,7 @@ def optimize_ce_assignment(
     checkpoints = set(checkpoint_steps)
     if any((not isinstance(step, (int, np.integer)) or not 0 <= step <= steps for step in checkpoints)):
         raise ValueError("Checkpoint steps must be integers within the optimization budget")
-    if checkpoints or mass_mode == "initial" or centered_active or source_linear_active or row_kl_active:
+    if checkpoints or mass_mode == "initial" or centered_active or source_linear_active or row_kl_active or node_factor_active:
         checkpoints.update((0, steps))
     snapshots = {}
     _check_assignment_stop(stop)
@@ -811,7 +836,27 @@ def optimize_ce_assignment(
             encoder_parameters = [weight]
         parameters = [*encoder_parameters, v]
     else:
-        u, v = initialize_factors(assignment, clusters, assignment_rank, factor_seed)
+        if node_factor_active:
+            from src.prototype_factor_initialization import load_frozen_factor
+            u = torch.zeros(len(assignment), assignment_rank, device=assignment.device).requires_grad_()
+            refs = node_factor_context.get("source_refs", {})
+            if (node_factor_context.get("rank") != assignment_rank
+                    or refs.get("data_digest") != resume_config["data_digest"]
+                    or refs.get("factor_seed") != factor_seed or refs.get("mixing") != mixing):
+                raise ValueError("Frozen NODE factor source differs from native inputs")
+            frozen_v = load_frozen_factor(node_factor_artifact, node_factor_sha256, node_factor_mode,
+                dict(cells=clusters, feature_dimension=z.shape[1]), z.device, expected_context=node_factor_context)
+            v = frozen_v.requires_grad_()
+            if resume_state is not None:
+                if resume_state.get("node_factor_context") != node_factor_context:
+                    raise ValueError("NODE factor resume lost its immutable initializer context")
+                for snapshot in resume_state.get("snapshots", {}).values():
+                    if snapshot.get("node_factor_context") != node_factor_context:
+                        raise ValueError("NODE factor resume checkpoint context differs")
+            elif folder is not None and any((Path(folder) / "checkpoints").glob("step_*.pt")):
+                raise ValueError("NODE factor cached checkpoints require a verifiable resume")
+        else:
+            u, v = initialize_factors(assignment, clusters, assignment_rank, factor_seed)
         parameters = [u, v]
     if mass_mode == "initial":
         from src.mlp_initial_mass import original_context, validate_resume
@@ -1235,6 +1280,9 @@ def optimize_ce_assignment(
                                 objective_name="teacher_CE_plus_source_row_KL_current_to_initial",
                                 assignment_kl_scale=scale)
                 attach_row_kl(snapshot, row_kl_reference, row_kl_context, resume_config)
+            if node_factor_active:
+                snapshot.update(node_factor_context=node_factor_context, node_factor_config=resume_config,
+                                node_factor_parameters=[p.detach().cpu().clone() for p in parameters])
             snapshots[step] = snapshot
             if folder is not None:
                 checkpoint_dir = folder / "checkpoints"
@@ -1275,6 +1323,8 @@ def optimize_ce_assignment(
                 attach_linear(state, source_context)
             if row_kl_active:
                 attach_row_kl(state, row_kl_reference, row_kl_context, resume_config)
+            if node_factor_active:
+                state["node_factor_context"] = node_factor_context
             if folder is not None:
                 torch.save(state, folder / "resume.tmp.pt")
                 (folder / "resume.tmp.pt").replace(folder / "resume.pt")
@@ -1355,6 +1405,8 @@ def optimize_ce_assignment(
     if row_kl_active:
         result.update(assignment_kl_context=row_kl_context,
                       objective_name="teacher_CE_plus_source_row_KL_current_to_initial")
+    if node_factor_active:
+        result.update(node_factor_mode=node_factor_mode, node_factor_context=node_factor_context)
     if folder is not None and save_assignment:
         if assignment_rank is None:
             torch.save(best_parameters[0].cpu(), folder / "best_assignment_logits.pt")
