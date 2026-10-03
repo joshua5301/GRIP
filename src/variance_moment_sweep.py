@@ -17,6 +17,7 @@ from tqdm.auto import tqdm
 from src.data import BUDGET, _prepare_dataset
 from src.evaluation import fit_gcn_diagnostic
 from src.io import _fingerprint, array_digest, save_json, save_state, write_table
+from src.moment_lloyd import moment_lloyd_partition
 from src.sweep_utils import grid_rows
 from src.variance_kl import variance_kl_partition
 from src.variance_moment_low_rank import low_rank_partition
@@ -165,7 +166,8 @@ def run_risk_sweep(
 ):
     if teacher_selection not in ("grid", "validation_ce"):
         raise ValueError("Use grid or validation_ce teacher selection")
-    if method not in ("variance_moment", "variance_kl", "variance_moment_low_rank"):
+    lloyd = method in ("moment_lloyd_hybrid", "moment_lloyd_full_only")
+    if method not in ("variance_moment", "variance_kl", "variance_moment_low_rank") and not lloyd:
         raise ValueError("Unknown partition method")
     if (dataset, ratio) not in BUDGET:
         raise ValueError("Use a configured dataset and ratio")
@@ -182,7 +184,9 @@ def run_risk_sweep(
     optional = {"rank", "assignment_lr"} if method == "variance_moment_low_rank" else set()
     if not required <= keys or not keys <= required | optional:
         raise ValueError("Use gamma, T and B or lambda; low-rank also supports rank and assignment_lr")
-    if "lambda" in keys and (
+    if lloyd and "lambda" not in keys:
+        raise ValueError("Moment Lloyd requires a lambda grid")
+    if "lambda" in keys and not lloyd and (
         method != "variance_moment_low_rank" or assignment_initialization not in ("random", "distance")
     ):
         raise ValueError("Lambda grid requires random or distance low-rank optimization")
@@ -209,6 +213,8 @@ def run_risk_sweep(
     torch.backends.cudnn.allow_tf32 = False
     sources, modules = _load_reference()
     solver, teacher = modules["risk_partition"]["risk_partition"], modules["teacher"]
+    if lloyd:
+        solver = partial(moment_lloyd_partition, mode=method.removeprefix("moment_lloyd_"))
     if method == "variance_kl":
         solver = partial(variance_kl_partition, seed_partition=modules["risk_partition"]["seed_partition"])
     if method == "variance_moment_low_rank":
@@ -243,6 +249,7 @@ def run_risk_sweep(
             "variance_moment_sweep.py",
             "variance_kl.py",
             "variance_moment_low_rank.py",
+            "moment_lloyd.py",
             "distance_initialization.py",
             "evaluation.py",
             "models.py",
@@ -279,6 +286,8 @@ def run_risk_sweep(
         torch=str(torch.__version__),
     )
     config["method"] = method
+    if lloyd:
+        config["initialization"] = "full_feature_kmeans++_lloyd20"
     if candidate_subset is not None:
         config["candidate_subset"] = candidate_subset
     if "lambda" in space:
@@ -426,6 +435,7 @@ def run_risk_sweep(
                     best_step=partition.get("best_step", float("nan")),
                     sweeps=partition["sweeps"],
                     converged=partition["converged"],
+                    status=partition.get("status", ""),
                     partition_seconds=partition["seconds"],
                     partition_path=str(artifact),
                 )
