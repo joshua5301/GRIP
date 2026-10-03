@@ -47,7 +47,7 @@ def test_greedy_one_trial_matches_standard():
     )
 
 
-@pytest.mark.parametrize("seeding", ["feature", "bound", "bound_greedy", "bound_pca", "bound_var", "bound_pca_sse"])
+@pytest.mark.parametrize("seeding", ["feature", "bound", "bound_greedy", "bound_pca", "bound_var", "bound_pca_sse", "feature_var"])
 def test_seeding_preserves_objective_and_cell_means(seeding):
     x, q = example()
     result = moment_lloyd_partition(
@@ -110,3 +110,20 @@ def test_variance_lloyd_handles_identical_points():
     assert result["converged"]
     assert (result["counts"] > 0).all()
     assert result["J"] == pytest.approx(0.0, abs=1e-12)
+
+
+def test_feature_var_initialization_ignores_labels_weight_and_seed():
+    x, q = example()
+    first = moment_lloyd_partition(
+        x, q, 4, seeding="feature_var", moment_weight=1, max_sweeps=0,
+    )
+    second = moment_lloyd_partition(
+        x, q.flip(0), 4, seeding="feature_var", moment_weight=100, seed=9, max_sweeps=0,
+    )
+    normalized = x - x.mean(0)
+    normalized /= normalized.square().sum(1).mean().sqrt()
+    expected, _ = pca_partition(normalized, 4, method="var")
+    assert torch.equal(first["assignment"], expected)
+    assert first["initial_assignment_digest"] == second["initial_assignment_digest"]
+    assert first["moment_objective"] == pytest.approx(first["V"] + first["moment_error"])
+    assert second["moment_objective"] == pytest.approx(second["V"] + 100 * second["moment_error"])

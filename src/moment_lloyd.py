@@ -139,11 +139,12 @@ def moment_lloyd_partition(
     scale = x.square().sum(1).mean().sqrt().clamp_min(1e-30)
     x = x / scale
     energy, original = x.square().sum(1).mean(), x.T @ q / len(x)
-    hierarchical = {"bound_pca": "pca", "bound_var": "var", "bound_pca_sse": "pca_sse"}
+    hierarchical = {"bound_pca": "pca", "bound_var": "var", "bound_pca_sse": "pca_sse", "feature_var": "var"}
     if seeding not in ("feature", "bound", "bound_greedy", *hierarchical) or greedy_trials < 1:
         raise ValueError("Invalid seeding method or greedy trial count")
-    material, scaling = (x, {}) if seeding == "feature" else bound_features(x, q, moment_weight)
-    if mode == "variance" and seeding == "feature":
+    feature_only = seeding in ("feature", "feature_var")
+    material, scaling = (x, {}) if feature_only else bound_features(x, q, moment_weight)
+    if mode == "variance" and feature_only:
         raise ValueError("Variance comparison requires bound-space initialization")
     a, b = scaling.get("feature_weight", 1.0), scaling.get("label_weight", 0.0)
     label_energy = q.square().sum(1).mean()

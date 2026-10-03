@@ -42,3 +42,13 @@ Artifacts expose both objective values, label variance, and beta. Raw J values
 across objectives must not be interpreted as comparable losses. The final GCN
 evaluation still uses uniform CE, so the comparison is empirical rather than a
 mass-weighted risk guarantee for that downstream student.
+
+## Feature-only Var-Part ablation
+
+`seeding="feature_var"` partitions normalized propagated features only, using the
+same Var-Part split rules as `bound_var`. It does not use teacher labels, lambda,
+or random seeds to construct the initial assignments. Cell labels are still the
+mean teacher probabilities. Subsequent filtered updates optimize the unchanged
+`Vx + lambda ||M||` objective. Compare against `bound_var` with the same candidate
+grid, teacher features, and student seeds. The `variance` solver mode deliberately
+rejects feature-only seeding to avoid silently changing its bound-derived weights.
