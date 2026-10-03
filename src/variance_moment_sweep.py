@@ -169,7 +169,7 @@ def run_risk_sweep(
     backtrack_steps=8,
     temperature_bounds=(0.05, 20.0),
 ):
-    if teacher_selection not in ("grid", "validation_ce", "accuracy_then_ce"):
+    if teacher_selection not in ("grid", "validation_ce", "accuracy_then_ce", "calibrated_ce"):
         raise ValueError("Use grid or validation_ce teacher selection")
     lloyd = method in ("moment_lloyd_hybrid", "moment_lloyd_full_only", "moment_lloyd_filtered_batch")
     if method not in ("variance_moment", "variance_kl", "variance_moment_low_rank") and not lloyd:
@@ -183,7 +183,7 @@ def run_risk_sweep(
         bounds = {"cora": DEFAULT_SPACE["B"], "citeseer": [0.03, 0.1, 0.3, 1.0, 3.0]}
         space = dict(DEFAULT_SPACE, B=bounds.get(dataset, [0.1, 0.3, 1.0, 3.0, 10.0]))
     keys = set(space)
-    if teacher_selection == "accuracy_then_ce" and (space.get("T") != [1.0] or candidate_subset is not None):
+    if teacher_selection in ("accuracy_then_ce", "calibrated_ce") and (space.get("T") != [1.0] or candidate_subset is not None):
         raise ValueError("Calibrated teachers require placeholder T=[1.0] and no candidate subset")
     if teacher_selection == "validation_ce" and space.get("T") != [1.0]:
         raise ValueError("Teacher CE preselection requires T=[1.0]")
@@ -302,7 +302,7 @@ def run_risk_sweep(
         torch=str(torch.__version__),
     )
     config["method"] = method
-    if teacher_selection == "accuracy_then_ce":
+    if teacher_selection in ("accuracy_then_ce", "calibrated_ce"):
         config["temperature_bounds"] = list(temperature_bounds)
     if lloyd:
         config["initialization"] = "full_feature_kmeans++_lloyd"
@@ -398,6 +398,23 @@ def run_risk_sweep(
         )
     del phi, val_phi, weights
     write_table(pd.DataFrame(teacher_rows), root / "teacher_grid.csv")
+    if teacher_selection == "calibrated_ce":
+        calibrated, curves = [], []
+        for row in teacher_rows:
+            gamma = row["gamma"]
+            saved = torch.load(teacher_dir / f"{_fingerprint(dict(gamma=gamma))}.pt", map_location="cpu", weights_only=True)
+            calibration, curve = calibrate_temperature(saved["validation_logits"], val_labels, temperature_bounds)
+            calibrated.append(dict(row, **calibration))
+            curves.extend(dict(point, gamma=gamma) for point in curve)
+        table = pd.DataFrame(calibrated).sort_values(["calibrated_val_ce", "gamma"])
+        selected_teacher = table.iloc[0].to_dict()
+        gamma = selected_teacher["gamma"]
+        save_json(selected_teacher, root / "selected_teacher.json")
+        write_table(table, root / "calibrated_teacher_grid.csv")
+        write_table(pd.DataFrame(curves), root / "all_temperature_curves.csv")
+        write_table(pd.DataFrame(curves).query("gamma == @gamma").drop(columns="gamma"), root / "temperature_grid.csv")
+        candidates = [dict(candidate, T=selected_teacher["T"]) for candidate in candidates if candidate["gamma"] == gamma]
+        logits = {gamma: logits[gamma]}
     if teacher_selection == "accuracy_then_ce":
         selected_teacher = select_accuracy(teacher_rows)
         gamma = selected_teacher["gamma"]

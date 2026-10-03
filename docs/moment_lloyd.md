@@ -35,6 +35,11 @@ Endpoints and T=1 (when feasible) are checked. The selected temperature replaces
 the placeholder before condensation; it is not a student hyperparameter sweep.
 Teacher grid, calibration curve, selected temperature and boundary flag are saved.
 
+`teacher_selection="calibrated_ce"` instead optimizes continuous T separately for
+every gamma, then selects the lowest calibrated validation CE (gamma breaks ties).
+`calibrated_teacher_grid.csv` and `all_temperature_curves.csv` preserve all fits.
+Temperature bounds still apply; boundary solutions must be reported.
+
 Initialization-only controls use `max_sweeps=0` (no moment updates) and may use
 `lambda=[0.0]`. Use one initialization iteration for selected-center assignment,
 or require converged k-means for a standard k-means baseline. Shared runs reuse
