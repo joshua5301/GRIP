@@ -171,9 +171,9 @@ def run_risk_sweep(
     seeding="feature",
     greedy_trials=4,
 ):
-    if teacher_selection not in ("grid", "validation_ce", "accuracy_then_ce", "calibrated_ce"):
+    if teacher_selection not in ("grid", "validation_ce", "accuracy_only", "accuracy_then_ce", "calibrated_ce"):
         raise ValueError("Use grid or validation_ce teacher selection")
-    lloyd = method in ("moment_lloyd_hybrid", "moment_lloyd_full_only", "moment_lloyd_filtered_batch", "moment_lloyd_variance", "moment_lloyd_kl")
+    lloyd = method in ("moment_lloyd_hybrid", "moment_lloyd_full_only", "moment_lloyd_filtered_batch", "moment_lloyd_variance", "moment_lloyd_normalized_variance", "moment_lloyd_kl")
     if method not in ("variance_moment", "variance_kl", "variance_moment_low_rank") and not lloyd:
         raise ValueError("Unknown partition method")
     if (dataset, ratio) not in BUDGET:
@@ -324,6 +324,9 @@ def run_risk_sweep(
         config["objective"] = "a * feature_variance + b * label_variance; bound-derived a,b"
     if method == "moment_lloyd_kl":
         config["objective"] = "feature_variance + lambda * mean KL(q_i || cell_mean)"
+    if method == "moment_lloyd_normalized_variance":
+        config["objective"] = "feature_variance / global_feature_variance + alpha * label_variance / global_label_variance"
+        config["coefficient"] = "lambda grid stores alpha; global variances fixed before clustering; zero-variance terms omitted"
     if method == "variance_moment_low_rank":
         config["assignment"] = dict(
             rank=space.get("rank", assignment_rank),
@@ -423,6 +426,12 @@ def run_risk_sweep(
         write_table(pd.DataFrame(curves).query("gamma == @gamma").drop(columns="gamma"), root / "temperature_grid.csv")
         candidates = [dict(candidate, T=selected_teacher["T"]) for candidate in candidates if candidate["gamma"] == gamma]
         logits = {gamma: logits[gamma]}
+    if teacher_selection == "accuracy_only":
+        selected_teacher = select_accuracy(teacher_rows)
+        gamma = selected_teacher["gamma"]
+        save_json(selected_teacher, root / "selected_teacher.json")
+        candidates = [candidate for candidate in candidates if candidate["gamma"] == gamma]
+        logits = {gamma: logits[gamma]}
     if teacher_selection == "accuracy_then_ce":
         selected_teacher = select_accuracy(teacher_rows)
         gamma = selected_teacher["gamma"]
@@ -491,6 +500,9 @@ def run_risk_sweep(
                     moment_objective=partition.get("moment_objective", float("nan")),
                     variance_objective=partition.get("variance_objective", float("nan")),
                     beta=partition.get("beta"),
+                    alpha=partition.get("alpha", float("nan")),
+                    global_feature_variance=partition.get("global_feature_variance", float("nan")),
+                    global_label_variance=partition.get("global_label_variance", float("nan")),
                     label_kl=partition.get("label_kl", float("nan")),
                     best_step=partition.get("best_step", float("nan")),
                     sweeps=partition["sweeps"],

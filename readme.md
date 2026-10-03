@@ -251,6 +251,9 @@ objective through soft low-rank assignment logits, without bilevel optimization.
 See [the initialization and sweep protocol](docs/variance_moment_low_rank.md).
 # Moment-corrected Lloyd
 
+Normalized variance sum and teacher-accuracy gamma preselection are available;
+see [the normalized objective and protocol](docs/normalized_variance.md).
+
 `run_risk_sweep` supports `moment_lloyd_hybrid`, `moment_lloyd_full_only`
 and `moment_lloyd_filtered_batch`
 with a `lambda` grid. Both use the same full-feature k-means++ initialization,

@@ -11,6 +11,39 @@ def example():
     return x, q, torch.arange(18) % 3
 
 
+def test_normalized_variance_objective_and_scale_invariance():
+    x, q, _ = example()
+    options = dict(mode="normalized_variance", seeding="bound_var", moment_weight=2.0, max_sweeps=300)
+    result = module.moment_lloyd_partition(x, q, 3, **options)
+    assignment = result["assignment"]
+    cx = torch.stack([x[assignment == j].mean(0) for j in range(3)])
+    cq = torch.stack([q[assignment == j].mean(0) for j in range(3)])
+    gx = (x - x.mean(0)).square().sum(1).mean()
+    gq = (q - q.mean(0)).square().sum(1).mean()
+    expected = (x - cx[assignment]).square().sum(1).mean() / gx
+    expected += 2 * (q - cq[assignment]).square().sum(1).mean() / gq
+    assert result["J"] == pytest.approx(float(expected), abs=1e-10)
+    assert result["converged"]
+    assert all(b <= a + 1e-10 for a, b in zip(result["history"], result["history"][1:]))
+    changed = module.moment_lloyd_partition(7 * x + 3, 0.2 * q + 0.8 / q.shape[1], 3, **options)
+    assert torch.equal(assignment, changed["assignment"])
+    assert changed["J"] == pytest.approx(result["J"], abs=1e-10)
+
+
+@pytest.mark.parametrize("constant_features", [False, True])
+def test_normalized_variance_constant_labels(constant_features):
+    x, q, _ = example()
+    if constant_features:
+        x = torch.ones_like(x)
+    q = torch.full_like(q, 1 / q.shape[1])
+    result = module.moment_lloyd_partition(
+        x, q, 3, mode="normalized_variance", seeding="bound_var", max_sweeps=300,
+    )
+    assert result["label_weight"] == 0
+    assert result["J"] >= -1e-10
+    assert bool((result["counts"] > 0).all())
+
+
 def test_exact_move_matches_reaggregation():
     x, q, assignment = example()
     energy, original = x.square().sum(1).mean(), x.T @ q / len(x)

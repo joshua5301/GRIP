@@ -1,6 +1,21 @@
 import torch
 
 
+def normalized_variance_features(x, q, alpha):
+    xc, qc = x - x.mean(0), q - q.mean(0)
+    if torch.equal(x, x[:1].expand_as(x)):
+        xc = torch.zeros_like(x)
+    if torch.equal(q, q[:1].expand_as(q)):
+        qc = torch.zeros_like(q)
+    gx, gq = xc.square().sum(1).mean(), qc.square().sum(1).mean()
+    a = 1 / float(gx) if float(gx) > 0 else 0.0
+    b = alpha / float(gq) if float(gq) > 0 else 0.0
+    return torch.cat((a**0.5 * xc, b**0.5 * qc), 1), dict(
+        feature_weight=a, label_weight=b, global_feature_variance=float(gx),
+        global_label_variance=float(gq), alpha=alpha,
+    )
+
+
 def bound_features(x, q, weight):
     xc, qc = x - x.mean(0), q - q.mean(0)
     vx, vq = xc.square().sum(1).mean(), qc.square().sum(1).mean()
