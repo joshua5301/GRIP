@@ -12,7 +12,7 @@ from pathlib import Path
 import torch
 import torch.nn.functional as F
 
-from src.io import array_digest, save_json
+from src.io import array_digest, save_json, save_state
 
 
 def hard_training_outer(q, labels, train):
@@ -31,6 +31,21 @@ def hard_training_outer(q, labels, train):
     target = q.detach().clone()
     target[mask] = F.one_hot(selected, num_classes=q.shape[1]).to(q)
     return mask, target
+
+
+def balanced_source_training_outer(q, labels, train):
+    """Exactly coalesce teacher CE plus fixed repeated train hard-label CE.
+
+    R=ceil(N/T). Expanding all N source rows plus R copies of each train row
+    and blending only train targets yields (sum_source_CE + R*sum_train_CE)
+    /(N+R*T). Inner targets and original source features remain unchanged.
+    """
+    mask, hard = hard_training_outer(q, labels, train)
+    repeats = math.ceil(len(q) / int(mask.sum()))
+    target = q.detach().clone()
+    target[mask] = (q.detach()[mask] + repeats * hard[mask]) / (repeats + 1)
+    indices = torch.cat((torch.arange(len(q), device=q.device), mask.nonzero().flatten().repeat(repeats)))
+    return indices, target, repeats
 
 
 def core_options(candidate, seed, train, target):
@@ -108,13 +123,24 @@ def _run(protocol_path, budget, steps, student_seeds, stop):
     assignment = torch.load(B['hard_assignment'], map_location=device, weights_only=False)
     logits = torch.load(family / 'teacher.pt', map_location=device, weights_only=False)['logits'].to(device)
     q = training_refined_targets(logits, B['candidate']['T'], graph['y'], train, 0.0)
-    mask, target = hard_training_outer(q, graph['y'], train)
+    policy = B.get('outer_policy', 'train_hard_v1')
+    if policy == 'balanced_source_train_v1':
+        mask, target, repeats = balanced_source_training_outer(q, graph['y'], train)
+        objective = 'mean_coalesced_source_teacher_CE_plus_fixed_repeated_train_hard_CE'
+    elif policy == 'train_hard_v1':
+        mask, target = hard_training_outer(q, graph['y'], train)
+        repeats = None
+        objective = 'mean_hard_CE_on_original_training_nodes_only'
+    else:
+        raise ValueError("Unknown training outer policy")
     options = core_options(B['candidate'], condensation_seed, mask, target)
-    context = dict(schema=1, objective='mean_hard_CE_on_original_training_nodes_only',
+    context = dict(schema=1, objective=objective,
         inner_targets='original_all_node_teacher_Q; labels_and_features_derived_from_P',
-        source=packet['source'], candidate=B['candidate'], condensation_seed=condensation_seed, train_nodes=int(mask.sum()),
+        source=packet['source'], candidate=B['candidate'], condensation_seed=condensation_seed, train_nodes=int(train.sum()),
         inputs=dict(data_digest=array_digest(z.cpu().numpy(), q.cpu().numpy(), assignment.cpu().numpy()),
                     outer_digest=array_digest(mask.cpu().numpy()), outer_targets_digest=array_digest(target.cpu().numpy())))
+    if repeats is not None:
+        context.update(outer_policy=policy, repeats=repeats, outer_rows=len(mask))
     context_path, manifest_path = folder / 'context.json', folder / 'checkpoint_manifest.json'
     if context_path.exists():
         if json.loads(context_path.read_text()) != context or not manifest_path.exists():
@@ -127,6 +153,17 @@ def _run(protocol_path, budget, steps, student_seeds, stop):
     else:
         folder.mkdir(parents=True)
         save_json(context, context_path)
+        if repeats is not None:
+            # Persist native teacher Q bits for the independent mixed-CE audit.
+            # Ground-truth storage contains training labels only.
+            save_state(dict(q=q, indices=mask, targets=target, train=train,
+                train_labels=graph['y'][train], repeats=repeats), folder / 'outer_inputs.pt')
+    if repeats is not None:
+        saved_outer = torch.load(folder / 'outer_inputs.pt', map_location=device, weights_only=False)
+        if (not torch.equal(saved_outer['q'], q) or not torch.equal(saved_outer['indices'], mask)
+                or not torch.equal(saved_outer['targets'], target) or not torch.equal(saved_outer['train'], train)
+                or not torch.equal(saved_outer['train_labels'], graph['y'][train]) or saved_outer['repeats'] != repeats):
+            raise ValueError("Balanced training outer persisted inputs changed")
     resume_path = folder / 'resume.pt'
     state = torch.load(resume_path, map_location='cpu', weights_only=False) if resume_path.exists() else None
     initial_step = 0 if state is None else state['step']
@@ -138,6 +175,8 @@ def _run(protocol_path, budget, steps, student_seeds, stop):
         state = torch.load(resume_path, map_location='cpu', weights_only=False)
         validate_resume(state, z, q, assignment, mask, target, steps)
         paths = [resume_path, folder / 'optimization.csv', *sorted((folder / 'checkpoints').glob('step_*.pt'))]
+        if repeats is not None:
+            paths.append(folder / 'outer_inputs.pt')
         save_json({str(path): _sha(path) for path in paths}, manifest_path)
     if state['step'] != steps:
         raise ValueError("Training outer did not reach its frozen endpoint")
@@ -157,7 +196,7 @@ def _run(protocol_path, budget, steps, student_seeds, stop):
                 raise ValueError("Training outer validation routes differ from the selected student")
             records.append(dict(step=step, **result, SGC_MLP_sameweights_val=routes['mlp_val_acc']))
     report = dict(schema=1, budget=budget, folder=str(folder), steps=steps,
-        train_nodes=int(mask.sum()), records=records, validation_only=True,
+        train_nodes=int(train.sum()), records=records, validation_only=True,
         actual_new_P_updates=steps - initial_step,
         objective=context['objective'], synthetic_targets_remain_teacher_Q=True, test_evaluations=0)
     report['trajectory_P_updates'] = steps
