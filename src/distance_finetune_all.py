@@ -1,4 +1,5 @@
 import gc
+import itertools
 import json
 import traceback
 from pathlib import Path
@@ -30,10 +31,21 @@ def source_matches(source, dataset, ratio):
     )
 
 
+def select_inner_weighting(summary):
+    selected = summary.loc[summary.phase == "selected"]
+    return selected.sort_values(
+        ["search_val", "step", "inner_loss_weighting"], ascending=[False, True, True],
+    ).drop_duplicates(["dataset", "method"]).reset_index(drop=True)
+
+
 def run_all_distance_finetune(output_dir, sources=None, ranks=(8, 16, 32, 64),
                               taus=(0.1, 0.3, 1.0, 3.0), penalties=(1e-6, 1e-5, 1e-4),
                               steps=300, checkpoints=(0, 10, 25, 50, 100, 200, 300),
-                              lr=0.01, data_dir="/content/data/", device="cuda"):
+                              lr=0.01, data_dir="/content/data/", device="cuda",
+                              inner_loss_weightings=("mass",)):
+    if (not inner_loss_weightings or len(set(inner_loss_weightings)) != len(inner_loss_weightings)
+            or any(value not in ("mass", "uniform") for value in inner_loss_weightings)):
+        raise ValueError("Choose unique mass and/or uniform inner CE weightings")
     root = Path(output_dir)
     root.mkdir(parents=True, exist_ok=True)
     sources = {} if sources is None else sources
@@ -76,29 +88,39 @@ def run_all_distance_finetune(output_dir, sources=None, ranks=(8, 16, 32, 64),
                 torch.cuda.empty_cache()
             continue
 
-        for method in ("fixed_D", "svd_UV"):
+        for method, inner_weighting in itertools.product(("fixed_D", "svd_UV"), inner_loss_weightings):
+            key = method if len(inner_loss_weightings) == 1 else f"{method}_{inner_weighting}"
+            output = root / dataset / method
+            if len(inner_loss_weightings) > 1:
+                output = output / f"inner_{inner_weighting}"
             started = perf_counter()
             try:
                 summary, _, run = run_distance_finetune(
-                    source=source, output_dir=root / dataset / method,
+                    source=source, output_dir=output,
                     methods=[method], ranks=grid_ranks, taus=taus, penalties=penalties,
                     steps=steps, checkpoints=checkpoints, lr=lr,
-                    inner_loss_weighting="mass", data_dir=data_dir, device=device,
+                    inner_loss_weighting=inner_weighting, data_dir=data_dir, device=device,
                     continue_on_error=True,
                 )
-                table = summary.assign(dataset=dataset, ratio=ratio, nodes=cells, run_dir=str(run))
+                table = summary.assign(dataset=dataset, ratio=ratio, nodes=cells, run_dir=str(run),
+                                       inner_loss_weighting=inner_weighting)
                 tables.append(table)
-                write_table(pd.concat(tables, ignore_index=True), root / "summary.csv")
-                status[dataset][method] = dict(
+                combined = pd.concat(tables, ignore_index=True)
+                write_table(combined, root / "summary.csv")
+                if "step" in combined:
+                    write_table(select_inner_weighting(combined), root / "selected_by_validation.csv")
+                status[dataset][key] = dict(
                     state="complete", output_dir=str(run), seconds=perf_counter() - started,
+                    method=method, inner_loss_weighting=inner_weighting,
                     failed_candidates=len(pd.read_csv(run / "failures.csv")) if (run / "failures.csv").exists() else 0,
                 )
                 print(table.to_string(index=False), flush=True)
             except Exception:
-                status[dataset][method] = dict(
+                status[dataset][key] = dict(
                     state="failed", error=traceback.format_exc(), seconds=perf_counter() - started,
+                    method=method, inner_loss_weighting=inner_weighting,
                 )
-                print(status[dataset][method]["error"], flush=True)
+                print(status[dataset][key]["error"], flush=True)
             finally:
                 save_json(status, status_path)
                 gc.collect()

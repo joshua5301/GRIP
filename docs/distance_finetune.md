@@ -65,3 +65,12 @@ with nonzero failures is a partial grid, not a complete successful grid. An
 identical rerun reuses cached evaluations and optimization checkpoints, so it
 does not require the notebook's in-memory state. Solver or source changes can
 create a new run fingerprint. Completed method paths remain in status.json.
+
+Set `inner_loss_weightings=["mass", "uniform"]` to sweep both inner objectives
+with the same stage-one partition, seed lists and hyperparameter grid. GCN
+search and final evaluation remain uniform CE. Separate `inner_mass` and
+`inner_uniform` folders prevent cache mixing. Each weighting reports its own
+validation-selected configuration and checkpoint. selected_by_validation.csv
+then chooses the inner weighting per dataset/method by search validation,
+never by test. This doubles the stage-two candidate count, not the stage-one
+teacher/partition sweep.

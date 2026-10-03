@@ -82,3 +82,32 @@ def test_new_stage_one_routes_valid_var_part_option_to_real_solver(tmp_path, mon
     assert calls == ["bound_var"]
     assert len(summary) == 2
     assert status["cora"]["fixed_D"]["state"] == "complete"
+
+
+def test_inner_weighting_grid_has_isolated_runs_and_selects_validation_not_test(tmp_path, monkeypatch):
+    monkeypatch.setattr(sweep, "FIRST_RATIOS", {"cora": 0.013})
+    monkeypatch.setattr(sweep, "source_matches", lambda *args: True)
+    calls = []
+
+    def run(**options):
+        weighting = options["inner_loss_weighting"]
+        method = options["methods"][0]
+        root = options["output_dir"]
+        root.mkdir(parents=True)
+        calls.append((method, weighting, root))
+        result = dict(method=method, phase="selected", step=25,
+                      search_val=81 if weighting == "uniform" else 80,
+                      test_mean=60 if weighting == "uniform" else 90)
+        return pd.DataFrame([result]), pd.DataFrame(), root
+
+    monkeypatch.setattr(sweep, "run_distance_finetune", run)
+    summary, status = sweep.run_all_distance_finetune(
+        tmp_path, sources={"cora": tmp_path / "source"}, device="cpu",
+        inner_loss_weightings=["mass", "uniform"],
+    )
+    assert [(method, weighting) for method, weighting, _ in calls] == [
+        ("fixed_D", "mass"), ("fixed_D", "uniform"), ("svd_UV", "mass"), ("svd_UV", "uniform"),
+    ]
+    assert len({root for _, _, root in calls}) == 4
+    assert set(sweep.select_inner_weighting(summary).inner_loss_weighting) == {"uniform"}
+    assert status["cora"]["svd_UV_uniform"]["state"] == "complete"

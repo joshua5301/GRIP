@@ -215,6 +215,7 @@ def run_distance_finetune(source, output_dir, ranks=(4, 8, 16), taus=(0.1, 0.3, 
                 evaluation_folder = root / "initial_search" / initial_key
             scores = pd.DataFrame(evaluate(x, y, evaluation_folder, search_seeds))
             rows.append(dict(candidate=candidate, method=method, rank=rank, tau=tau, penalty=penalty,
+                             inner_loss_weighting=inner_loss_weighting,
                              step=step, search_val=float(scores.val_acc.mean()),
                              search_val_std=float(scores.val_acc.std()),
                              outer_ce=optimized["checkpoints"][step]["teacher_ce"],
@@ -229,7 +230,8 @@ def run_distance_finetune(source, output_dir, ranks=(4, 8, 16), taus=(0.1, 0.3, 
                                         root / "hard" / "final", final_seeds, final=True))
 
     def report(method, phase, scores, params, search_val):
-        final_rows.append(dict(method=method, phase=phase, **params, search_val=search_val,
+        final_rows.append(dict(method=method, phase=phase, inner_loss_weighting=inner_loss_weighting,
+                               **params, search_val=search_val,
                                final_val=float(scores.val_acc.mean()), final_val_std=float(scores.val_acc.std()),
                                test_mean=float(scores.test_acc.mean()), test_std=float(scores.test_acc.std())))
         pd.DataFrame(final_rows).to_csv(root / "summary.csv", index=False)
