@@ -44,6 +44,28 @@ def test_normalized_variance_constant_labels(constant_features):
     assert bool((result["counts"] > 0).all())
 
 
+def test_feature_only_initialization_preserves_normalized_objective():
+    x, q, _ = example()
+    options = dict(mode="normalized_variance", seeding="feature_var", max_sweeps=0)
+    a = module.moment_lloyd_partition(x, q, 3, moment_weight=0.0, **options)
+    b = module.moment_lloyd_partition(x, q, 3, moment_weight=2.0, **options)
+    assert torch.equal(a["assignment"], b["assignment"])
+    assert b["label_weight"] > 0
+    expected = b["V"] * b["feature_weight"] + b["label_variance"] * b["label_weight"]
+    assert b["J"] == pytest.approx(expected)
+
+
+def test_variance_sum_without_label_normalization():
+    x, q, _ = example()
+    result = module.moment_lloyd_partition(
+        x, q, 3, mode="variance_sum", seeding="bound_var", moment_weight=0.5, max_sweeps=300,
+    )
+    assert result["label_weight"] == 0.5
+    assert result["feature_weight"] == 1.0
+    assert result["J"] == pytest.approx(result["V"] + 0.5 * result["label_variance"])
+    assert result["converged"]
+
+
 def test_exact_move_matches_reaggregation():
     x, q, assignment = example()
     energy, original = x.square().sum(1).mean(), x.T @ q / len(x)

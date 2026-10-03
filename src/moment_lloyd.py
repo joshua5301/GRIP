@@ -124,7 +124,7 @@ def moment_lloyd_partition(
     seeding="feature",
     greedy_trials=4,
 ):
-    if mode not in ("hybrid", "full_only", "filtered_batch", "variance", "normalized_variance", "kl") or not 1 <= m <= len(H):
+    if mode not in ("hybrid", "full_only", "filtered_batch", "variance", "normalized_variance", "variance_sum", "kl") or not 1 <= m <= len(H):
         raise ValueError("Invalid mode or cell count")
     if not math.isfinite(moment_weight) or moment_weight < 0 or max_sweeps < 0 or block_size < 1:
         raise ValueError("Invalid weight or budget")
@@ -146,7 +146,12 @@ def moment_lloyd_partition(
     material, scaling = (x, {}) if feature_only else bound_features(x, q, moment_weight)
     if mode == "normalized_variance":
         material, scaling = normalized_variance_features(x, q, moment_weight)
-    if mode in ("variance", "normalized_variance") and feature_only:
+    if mode == "variance_sum":
+        material = torch.cat((x, moment_weight**0.5 * (q - q.mean(0))), 1)
+        scaling = dict(feature_weight=1.0, label_weight=moment_weight)
+    if mode in ("normalized_variance", "variance_sum") and feature_only:
+        material = x
+    if mode == "variance" and feature_only:
         raise ValueError("Variance comparison requires bound-space initialization")
     a, b = scaling.get("feature_weight", 1.0), scaling.get("label_weight", 0.0)
     label_energy = q.square().sum(1).mean()
@@ -176,7 +181,7 @@ def moment_lloyd_partition(
     def score(s, assignment=None):
         if mode == "kl":
             return float(s[3] + moment_weight * label_kl(s, assignment))
-        if mode in ("variance", "normalized_variance"):
+        if mode in ("variance", "normalized_variance", "variance_sum"):
             return float(a * s[3] + b * (label_energy - (s[0] * s[2].square().sum(1)).sum() / len(x)))
         return float(s[3] + moment_weight * s[4].norm())
 
@@ -193,7 +198,7 @@ def moment_lloyd_partition(
                 if moment_weight > 0:
                     cost -= moment_weight * q[start:end] @ state[2].clamp_min(tiny).log().T
                     cost.masked_fill_((q[start:end] > 0).to(x) @ (state[2] == 0).to(x).T > 0, torch.inf)
-            elif mode in ("variance", "normalized_variance"):
+            elif mode in ("variance", "normalized_variance", "variance_sum"):
                 cost = a * (state[1].square().sum(1) - 2 * x[start:end] @ state[1].T)
                 cost += b * (state[2].square().sum(1) - 2 * q[start:end] @ state[2].T)
             else:
@@ -202,7 +207,7 @@ def moment_lloyd_partition(
             old = cost.gather(1, assignment[start:end, None]).squeeze(1)
             proposed[start:end] = torch.where(old <= best, assignment[start:end], target)
             gains[start:end] = old - best
-        if mode in ("variance", "normalized_variance", "kl"):
+        if mode in ("variance", "normalized_variance", "variance_sum", "kl"):
             counts = torch.bincount(proposed, minlength=m)
             residual = a * (x - state[1][proposed]).square().sum(1)
             residual += b * (q - state[2][proposed]).square().sum(1)
