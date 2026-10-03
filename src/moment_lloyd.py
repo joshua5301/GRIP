@@ -139,13 +139,14 @@ def moment_lloyd_partition(
     scale = x.square().sum(1).mean().sqrt().clamp_min(1e-30)
     x = x / scale
     energy, original = x.square().sum(1).mean(), x.T @ q / len(x)
-    if seeding not in ("feature", "bound", "bound_greedy", "bound_pca") or greedy_trials < 1:
+    hierarchical = {"bound_pca": "pca", "bound_var": "var", "bound_pca_sse": "pca_sse"}
+    if seeding not in ("feature", "bound", "bound_greedy", *hierarchical) or greedy_trials < 1:
         raise ValueError("Invalid seeding method or greedy trial count")
     material, scaling = (x, {}) if seeding == "feature" else bound_features(x, q, moment_weight)
-    if seeding == "bound_pca":
-        assignment, initialization_info = pca_partition(material, m)
+    if seeding in hierarchical:
+        assignment, initialization_info = pca_partition(material, m, method=hierarchical[seeding])
         if require_initialization_convergence:
-            raise ValueError("PCA-Part is a divisive partition, not converged Lloyd initialization")
+            raise ValueError("Hierarchical seeding is a divisive partition, not converged Lloyd initialization")
     else:
         assignment, initialization_info = initialize(
             material, m, seed, block_size, initialization_steps, return_info=True,

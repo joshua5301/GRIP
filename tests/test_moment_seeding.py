@@ -2,7 +2,7 @@ import pytest
 import torch
 
 from src.moment_lloyd import initialize, moment_lloyd_partition
-from src.moment_seeding import bound_features, pca_partition
+from src.moment_seeding import bound_features, minimum_scatter_split, pca_partition
 
 
 def example():
@@ -29,12 +29,13 @@ def test_bound_matches_augmented_variance():
 
 
 @pytest.mark.parametrize("constant", [False, True])
-def test_pca_repeatability_and_nonempty_cells(constant):
+@pytest.mark.parametrize("method", ["pca", "var", "pca_sse"])
+def test_pca_repeatability_and_nonempty_cells(constant, method):
     x, _ = example()
     if constant:
         x.zero_()
-    a, _ = pca_partition(x, 7)
-    b, _ = pca_partition(x, 7)
+    a, _ = pca_partition(x, 7, method=method)
+    b, _ = pca_partition(x, 7, method=method)
     assert torch.equal(a, b)
     assert (torch.bincount(a, minlength=7) > 0).all()
 
@@ -46,7 +47,7 @@ def test_greedy_one_trial_matches_standard():
     )
 
 
-@pytest.mark.parametrize("seeding", ["feature", "bound", "bound_greedy", "bound_pca"])
+@pytest.mark.parametrize("seeding", ["feature", "bound", "bound_greedy", "bound_pca", "bound_var", "bound_pca_sse"])
 def test_seeding_preserves_objective_and_cell_means(seeding):
     x, q = example()
     result = moment_lloyd_partition(
@@ -58,3 +59,24 @@ def test_seeding_preserves_objective_and_cell_means(seeding):
         assert mask.any()
         torch.testing.assert_close(result["x"][j], x[mask].mean(0).float())
         torch.testing.assert_close(result["y"][j], q[mask].mean(0).float())
+
+
+def test_minimum_scatter_split_matches_brute_force():
+    x, _ = example()
+    x -= x.mean(0)
+    projection = x[:, 0].round(decimals=1)
+    left = minimum_scatter_split(x, projection)
+
+    def cost(mask):
+        return sum((part - part.mean(0)).square().sum() for part in (x[mask], x[~mask]))
+
+    candidates = [projection <= value for value in projection.unique().sort().values[:-1]]
+    expected = torch.stack([cost(mask) for mask in candidates]).min()
+    torch.testing.assert_close(cost(left), expected)
+
+
+def test_var_part_uses_largest_variance_axis():
+    x = torch.tensor([[-10., 0.], [-2., 1.], [3., -1.], [5., 0.]], dtype=torch.float64)
+    assignment, info = pca_partition(x, 2, method="var")
+    assert torch.equal(assignment, torch.tensor([0, 0, 1, 1]))
+    assert info["pca_splits"][0]["power_steps"] == 0

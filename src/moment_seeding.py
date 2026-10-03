@@ -15,7 +15,26 @@ def bound_features(x, q, weight):
     )
 
 
-def pca_partition(z, cells, power_steps=100, tolerance=1e-8):
+def minimum_scatter_split(centered, projection):
+    order = torch.argsort(projection, stable=True)
+    values = projection[order]
+    valid = values[:-1] < values[1:]
+    if not bool(valid.any()):
+        cut = len(order) // 2
+    else:
+        prefix = centered[order].cumsum(0)
+        count = torch.arange(1, len(order), device=centered.device, dtype=centered.dtype)
+        gain = prefix[:-1].square().sum(1) / count
+        gain += (prefix[-1] - prefix[:-1]).square().sum(1) / (len(order) - count)
+        cut = int(gain.masked_fill(~valid, -torch.inf).argmax()) + 1
+    left = torch.zeros(len(order), device=centered.device, dtype=torch.bool)
+    left[order[:cut]] = True
+    return left
+
+
+def pca_partition(z, cells, power_steps=100, tolerance=1e-8, method="pca"):
+    if method not in ("pca", "var", "pca_sse"):
+        raise ValueError("Unknown hierarchical split method")
     if not 1 <= cells <= len(z):
         raise ValueError("Invalid cell count")
     groups = [torch.arange(len(z), device=z.device)]
@@ -37,7 +56,7 @@ def pca_partition(z, cells, power_steps=100, tolerance=1e-8):
         direction = torch.zeros_like(variance)
         direction[axis] = 1
         converged, used = False, 0
-        for step in range(power_steps):
+        for step in range(0 if method == "var" else power_steps):
             updated = centered.T @ (centered @ direction)
             norm = updated.norm()
             used = step + 1
@@ -52,7 +71,7 @@ def pca_partition(z, cells, power_steps=100, tolerance=1e-8):
         if direction[direction.abs().argmax()] < 0:
             direction = -direction
         projection = centered @ direction
-        left = projection <= 0
+        left = minimum_scatter_split(centered, projection) if method == "pca_sse" else projection <= 0
         if bool(left.all()) or not bool(left.any()):
             order = torch.argsort(projection, stable=True)
             left = torch.zeros_like(left)
@@ -62,7 +81,7 @@ def pca_partition(z, cells, power_steps=100, tolerance=1e-8):
         groups.append(second)
         energies[index] = scatter(first)
         energies.append(scatter(second))
-        diagnostics.append(dict(power_steps=used, power_converged=converged))
+        diagnostics.append(dict(power_steps=used, power_converged=converged, method=method))
     assignment = torch.empty(len(z), device=z.device, dtype=torch.long)
     for j, ids in enumerate(groups):
         assignment[ids] = j
