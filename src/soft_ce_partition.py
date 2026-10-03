@@ -577,7 +577,8 @@ def optimize_ce_assignment(
     if set(mlp_initial_options) - {"mlp_initial_mass_schema", "mlp_initial_mass_source",
                                    "mlp_output_centering", "mlp_source_centering_schema", "mlp_source_centering_source",
                                    "source_linear_coordinates", "source_linear_schema", "source_linear_source", "source_linear_inputs",
-                                   "uniform_cell_q_prior_weight", "uniform_cell_q_prior_schema", "uniform_cell_q_prior_source"}:
+                                   "uniform_cell_q_prior_weight", "uniform_cell_q_prior_schema", "uniform_cell_q_prior_source",
+                                   "assignment_kl_weight", "assignment_kl_schema", "assignment_kl_source", "assignment_kl_teacher_T"}:
         raise ValueError("Unknown MLP initial-mass control")
     mlp_initial_mass_schema = mlp_initial_options.get("mlp_initial_mass_schema")
     mlp_initial_mass_source = mlp_initial_options.get("mlp_initial_mass_source")
@@ -611,6 +612,32 @@ def optimize_ce_assignment(
                              uniform_cell_q_prior_source=prior_source, uniform_cell_q_prior_context=prior_context)
     elif prior_schema is not None or prior_source is not None:
         raise ValueError("Disabled prior cannot carry activated provenance")
+    # Activated-only options are parsed after the original locals() config.
+    row_kl_weight = mlp_initial_options.get("assignment_kl_weight", 0.0)
+    row_kl_schema = mlp_initial_options.get("assignment_kl_schema")
+    row_kl_source = mlp_initial_options.get("assignment_kl_source")
+    row_kl_teacher_T = mlp_initial_options.get("assignment_kl_teacher_T")
+    if isinstance(row_kl_weight, (bool, np.bool_)) or not isinstance(row_kl_weight, (int, float, np.integer, np.floating)) or row_kl_weight not in (0, 1):
+        raise ValueError("Initial-assignment KL supports only disabled0 or fixed1")
+    row_kl_active = row_kl_weight == 1
+    if row_kl_active:
+        if (assignment_input != "node" or assignment_encoder != "linear" or assignment_rank is None
+                or mass_mode != "free" or inner_loss_weighting != "uniform" or solver_mode != "exact"
+                or inner_method != "newton_first" or implicit_warm_start is not True
+                or node_weighting or temperature_logits is not None or outer_targets is not None
+                or outer_indices is not None or implicit_solver is not None or inner_solver is not None
+                or cache_assignment or centered_active or source_linear_active or prior_active
+                or save_assignment or not save_resume or mixing != .05 or torch.get_default_dtype() != torch.float32
+                or type(row_kl_schema) is not int or row_kl_schema != 1
+                or isinstance(row_kl_teacher_T, (bool, np.bool_)) or row_kl_teacher_T != 1.0):
+            raise ValueError("Assignment KL requires original native fixedT1/free NODE/uniform exact CE")
+        from src.initial_assignment_row_kl import InitialAssignmentKLMoments, original_reference
+        from src.initial_assignment_row_kl import attach as attach_row_kl
+        from src.initial_assignment_row_kl import validate_core_resume as validate_row_kl_resume
+        resume_config.update(assignment_kl_weight=1.0, assignment_kl_schema=1,
+                             assignment_kl_source=row_kl_source, assignment_kl_teacher_T=1.0)
+    elif any(value is not None for value in (row_kl_schema, row_kl_source, row_kl_teacher_T)):
+        raise ValueError("Disabled assignment KL cannot carry activated provenance")
     if inner_loss_weighting == "mass":
         resume_config.pop("inner_loss_weighting")
     if outer_targets is not None:
@@ -744,7 +771,7 @@ def optimize_ce_assignment(
     checkpoints = set(checkpoint_steps)
     if any((not isinstance(step, (int, np.integer)) or not 0 <= step <= steps for step in checkpoints)):
         raise ValueError("Checkpoint steps must be integers within the optimization budget")
-    if checkpoints or mass_mode == "initial" or centered_active or source_linear_active:
+    if checkpoints or mass_mode == "initial" or centered_active or source_linear_active or row_kl_active:
         checkpoints.update((0, steps))
     snapshots = {}
     _check_assignment_stop(stop)
@@ -814,6 +841,22 @@ def optimize_ce_assignment(
                                      centering_initial, steps, folder)
         elif folder is not None and any((Path(folder) / "checkpoints").glob("step_*.pt")):
             raise ValueError("Centered cached checkpoints require a verifiable resume")
+    if row_kl_active:
+        row_kl_reference, row_kl_context = original_reference(
+            z, q, assignment, assignment_rank, factor_seed, mixing, chunk_size,
+            resume_config, row_kl_source, parameters=parameters)
+        resume_config["assignment_kl_context"] = row_kl_context
+        if resume_state is not None:
+            validate_row_kl_resume(resume_state, row_kl_reference, row_kl_context, resume_config, steps)
+            # Reconstruct only to verify origin; resumed arithmetic consumes the
+            # verified persisted immutable anchor with device-only copies.
+            saved_reference = resume_state["assignment_kl_reference"]
+            row_kl_reference = dict(
+                schema=saved_reference["schema"],
+                initial_parameters=[p.detach().to(device=z.device).clone() for p in saved_reference["initial_parameters"]],
+                log_probability=saved_reference["log_probability"].detach().to(device=z.device).clone())
+        elif folder is not None and any((Path(folder) / "checkpoints").glob("step_*.pt")):
+            raise ValueError("Assignment KL cached checkpoints require a verifiable resume")
     if node_weighting:
         node_logits = z.new_zeros(len(z), dtype=torch.float32).requires_grad_()
         groups = [
@@ -928,6 +971,9 @@ def optimize_ce_assignment(
                 row_residual=float(diagnostic[1]),
                 column_residual=float(diagnostic[2]),
             )
+        elif row_kl_active:
+            moments, row_kl = InitialAssignmentKLMoments.apply(
+                u, v, assignment, material, mixing, chunk_size, row_kl_reference["log_probability"])
         elif assignment_rank is not None:
             operation = CachedLowRankMoments if cache_assignment else LowRankMoments
             moments = operation.apply(u, v, assignment, material, mixing, chunk_size)
@@ -1038,6 +1084,13 @@ def optimize_ce_assignment(
             row.update(uniform_cell_q_prior_KL=float(prior["value"]),
                        uniform_cell_q_prior_cell_mean=prior["cell_prior"].cpu().tolist(),
                        objective=objective, teacher_CE_normalization_scale="max_teacher_CE_P0_1e-12")
+        if row_kl_active:
+            objective += float(row_kl.detach())
+            if not np.isfinite(objective):
+                raise FloatingPointError("Nonfinite combined teacher CE/initial-assignment KL objective")
+            row.update(assignment_kl_KL=float(row_kl.detach()), teacher_ce=value,
+                       objective=objective, objective_name="teacher_CE_plus_source_row_KL_current_to_initial",
+                       teacher_CE_normalization_scale="max_teacher_CE_P0_1e-12")
         if node_weighting:
             objective += node_weight_penalty * float(weight_kl.detach())
             row.update(
@@ -1055,6 +1108,8 @@ def optimize_ce_assignment(
             if step == 0:
                 initial_moments = moments.detach().cpu()
                 scale = max(value, 1e-12)
+            if row_kl_active:
+                row.update(assignment_kl_scale=scale, normalized_objective=objective / scale)
             if fitted["inner_converged"] and objective < best:
                 best, best_step = (objective, step)
                 best_moments, best_theta = (moments.detach().cpu(), theta.cpu())
@@ -1175,6 +1230,11 @@ def optimize_ce_assignment(
                 snapshot.update(uniform_cell_q_prior_context=prior_context,
                                 uniform_cell_q_prior_config=resume_config,
                                 uniform_cell_q_prior_KL=float(prior["value"]), objective=objective)
+            if row_kl_active:
+                snapshot.update(assignment_kl_KL=float(row_kl.detach()), objective=objective,
+                                objective_name="teacher_CE_plus_source_row_KL_current_to_initial",
+                                assignment_kl_scale=scale)
+                attach_row_kl(snapshot, row_kl_reference, row_kl_context, resume_config)
             snapshots[step] = snapshot
             if folder is not None:
                 checkpoint_dir = folder / "checkpoints"
@@ -1213,6 +1273,8 @@ def optimize_ce_assignment(
             if source_linear_active:
                 from src.source_linear_assignment import attach as attach_linear
                 attach_linear(state, source_context)
+            if row_kl_active:
+                attach_row_kl(state, row_kl_reference, row_kl_context, resume_config)
             if folder is not None:
                 torch.save(state, folder / "resume.tmp.pt")
                 (folder / "resume.tmp.pt").replace(folder / "resume.pt")
@@ -1234,6 +1296,8 @@ def optimize_ce_assignment(
                     (moments, weight_kl),
                     (direction / scale, weight_kl.new_tensor(node_weight_penalty / scale)),
                 )
+            elif row_kl_active:
+                torch.autograd.backward((moments, row_kl), (direction / scale, row_kl.new_tensor(1 / scale)))
             else:
                 moments.backward(direction / scale)
         except RuntimeError as error:
@@ -1288,6 +1352,9 @@ def optimize_ce_assignment(
     if prior_active:
         result.update(uniform_cell_q_prior_context=prior_context,
                       objective_name="teacher_CE_plus_uniform_cell_Q_prior_KL")
+    if row_kl_active:
+        result.update(assignment_kl_context=row_kl_context,
+                      objective_name="teacher_CE_plus_source_row_KL_current_to_initial")
     if folder is not None and save_assignment:
         if assignment_rank is None:
             torch.save(best_parameters[0].cpu(), folder / "best_assignment_logits.pt")

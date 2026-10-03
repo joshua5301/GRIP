@@ -68,6 +68,21 @@ def _nystrom_inner_weighting(identity):
 def _candidate_nystrom_mass(candidate):
     """Preload validation; only balanced candidates gain effective controls."""
     candidate = dict(candidate)
+    if any(key.startswith("assignment_kl_") for key in candidate):
+        row_keys = ("assignment_kl_weight", "assignment_kl_schema", "assignment_kl_source_digest")
+        if any(key.startswith("assignment_kl_") and key not in row_keys for key in candidate):
+            raise ValueError("Unknown initial-assignment KL control")
+        weight = candidate.get("assignment_kl_weight", 0)
+        if isinstance(weight, bool) or not isinstance(weight, Real) or not math.isfinite(weight) or weight not in (0, 1):
+            raise ValueError("Initial-assignment KL supports only disabled0 or fixed1")
+        if weight == 0:
+            if any(candidate.get(key) is not None for key in row_keys[1:]):
+                raise ValueError("Disabled assignment KL cannot carry activated provenance")
+            for key in row_keys:
+                candidate.pop(key, None)
+        else:
+            from src.initial_assignment_row_kl import candidate_controls
+            candidate = candidate_controls(candidate)
     if any(key.startswith("uniform_cell_q_prior_") for key in candidate):
         from src.uniform_cell_q_prior import candidate_controls
         candidate = candidate_controls(candidate)
@@ -345,6 +360,9 @@ def run_screen(dataset, ratio, output_dir, candidates, steps=50,
         if type(steps) is not int or steps not in (0, 1, 25) or any(
                 type(step) is not int or step not in (0, 1, 25) or step > steps for step in (checkpoints or [])):
             raise ValueError("Source linear supports original0, probe1 and fixed25 only")
+    if any(candidate.get("assignment_kl_weight", 0) == 1 for candidate in candidates):
+        if teacher_backend is not None or initialization_source is not None or teacher_kernel != "relu":
+            raise ValueError("Assignment KL requires the original cached ReLU teacher route")
     if any(candidate.get("uniform_cell_q_prior_weight", 0) == 1 for candidate in candidates):
         if teacher_backend is not None or initialization_source is not None or teacher_kernel != "relu":
             raise ValueError("Prior objective requires the original cached ReLU teacher route")
@@ -487,6 +505,10 @@ def run_screen(dataset, ratio, output_dir, candidates, steps=50,
             # Keep legacy, unverified resume files separate from hardened inputs.
             identity.setdefault("nystrom_schema", 3)
         folder = root / _fingerprint(identity) / f"condensation_{condensation_seed}"
+        if identity.get("assignment_kl_weight") == 1:
+            recorded_path = folder.parent / "candidate.json"
+            if recorded_path.exists() and json.loads(recorded_path.read_text()) != identity:
+                raise ValueError("Assignment KL cache candidate differs from its recorded identity")
         if identity.get("uniform_cell_q_prior_weight") == 1:
             recorded_path = folder.parent / "candidate.json"
             if recorded_path.exists() and json.loads(recorded_path.read_text()) != identity:
@@ -541,6 +563,12 @@ def run_screen(dataset, ratio, output_dir, candidates, steps=50,
             from src.uniform_cell_q_prior import validate_cached as validate_prior_cached
             if state is not None:
                 validate_prior_cached(state, identity, z, q, assignment, condensation_seed, steps, resume=True)
+        if identity.get("assignment_kl_weight") == 1:
+            from src.initial_assignment_row_kl import validate_cached as validate_row_kl_cached
+            if state is not None:
+                validate_row_kl_cached(state, identity, z, q, assignment, condensation_seed, steps, resume=True)
+            elif any((folder / "checkpoints").glob("step_*.pt")):
+                raise ValueError("Assignment KL checkpoint cache lacks its bound resume")
         if teacher_backend is not None:
             from src.citation_gcn_teacher import bind_condensation_inputs
             bind_condensation_inputs(root, identity, condensation_seed, z, q, pinned_assignment, create=True)
@@ -614,6 +642,9 @@ def run_screen(dataset, ratio, output_dir, candidates, steps=50,
                     if "uniform_cell_q_prior_weight" in identity:
                         from src.uniform_cell_q_prior import core_options
                         prior_options = core_options(identity)
+                    if identity.get("assignment_kl_weight") == 1:
+                        from src.initial_assignment_row_kl import core_options as row_kl_options
+                        prior_options.update(row_kl_options(identity))
                     optimize_ce_assignment(z, q, assignment, penalty=identity["penalty"], steps=steps,
                         mixing=mixing,
                         lr=identity["lr"], assignment_rank=identity["rank"], factor_seed=condensation_seed,
@@ -643,6 +674,8 @@ def run_screen(dataset, ratio, output_dir, candidates, steps=50,
             snapshot = torch.load(snapshot_path, map_location=device, weights_only=False)
             if identity.get("uniform_cell_q_prior_weight") == 1:
                 validate_prior_cached(snapshot, identity, z, q, assignment, condensation_seed, steps, step=step)
+            if identity.get("assignment_kl_weight") == 1:
+                validate_row_kl_cached(snapshot, identity, z, q, assignment, condensation_seed, steps, step=step)
             if (identity["method"] == "nystrom"
                     and snapshot.get("inner_loss_weighting", "mass") != _nystrom_inner_weighting(identity)):
                 raise ValueError("Nyström checkpoint inner weighting differs from the candidate")
@@ -708,7 +741,8 @@ def run_screen(dataset, ratio, output_dir, candidates, steps=50,
                             "metric_input", "metric_alpha", "strength", "train_target_mix", "mixing",
                             "learn_temperature", "temperature_lr", "balance_steps", "balance_tol", "balance_backend", "initial_mass_schema", "mlp_initial_mass_schema", "mlp_initial_mass_source_digest", "mlp_output_centering", "mlp_source_centering_schema", "mlp_source_centering_source_digest", "assignment_coordinates", "source_linear_schema", "source_linear_source_digest", "surrogate_kernel", "surrogate_schema", "surrogate_source_digest",
                             "ntk_angle_guard", "ntk_norm_guard", "ntk_jitter", "uniform_cell_q_prior_weight",
-                            "uniform_cell_q_prior_schema", "uniform_cell_q_prior_source_digest") if key in frame.columns]
+                            "uniform_cell_q_prior_schema", "uniform_cell_q_prior_source_digest",
+                            "assignment_kl_weight", "assignment_kl_schema", "assignment_kl_source_digest") if key in frame.columns]
     keys += ["dropout", "input_scale", "epochs", "student_recipe"]
     grouped = frame.groupby(keys, dropna=False)
     if report_routes or "learn_temperature" in frame.columns:
@@ -740,6 +774,9 @@ def selected_test(root, choice, condensation_seeds=(0, 1, 2), student_seeds=(100
         raise ValueError("Finite-student controls are runtime-probe-only; run_screen/selected_test unsupported")
     root = Path(root)
     root_config = json.loads((root / "config.json").read_text())
+    if choice.get("assignment_kl_weight", 0) == 1:
+        if root_config.get("teacher_backend") is not None or root_config.get("teacher_kernel") not in (None, "relu"):
+            raise ValueError("Selected assignment KL requires its original ReLU teacher source")
     if choice.get("uniform_cell_q_prior_weight", 0) == 1:
         if root_config.get("teacher_backend") is not None or root_config.get("teacher_kernel") not in (None, "relu"):
             raise ValueError("Selected prior objective requires its original ReLU teacher source")
@@ -753,6 +790,13 @@ def selected_test(root, choice, condensation_seeds=(0, 1, 2), student_seeds=(100
         from src.uniform_cell_q_prior import KEYS
         if any(key.startswith("uniform_cell_q_prior_") and key not in KEYS for key in raw):
             raise ValueError("Unknown uniform-cell prior selection control")
+    if any(key.startswith("assignment_kl_") for key in raw):
+        ROW_KL_KEYS = ("assignment_kl_weight", "assignment_kl_schema", "assignment_kl_source_digest")
+        if any(key.startswith("assignment_kl_") and key not in ROW_KL_KEYS for key in raw):
+            raise ValueError("Unknown initial-assignment KL selection control")
+        if raw.get("assignment_kl_weight") == 1 and (not isinstance(raw.get("assignment_kl_source_digest"), str)
+                or type(choice.get("step")) is not int or choice["step"] < 0):
+            raise ValueError("Selected assignment KL must retain its source token/integer endpoint")
     _candidate_surrogate(raw)
     if raw.get("method") == "source_linear" or any(
             key.startswith(("source_linear", "assignment_coordinate")) for key in raw):
@@ -801,6 +845,10 @@ def selected_test(root, choice, condensation_seeds=(0, 1, 2), student_seeds=(100
                 for key in ("uniform_cell_q_prior_weight", "uniform_cell_q_prior_schema", "uniform_cell_q_prior_source_digest"):
                     if key not in raw or raw[key] != recorded.get(key):
                         raise ValueError("Selected row lost its recorded prior identity")
+            if any(key.startswith("assignment_kl_") for key in recorded):
+                for key in ("assignment_kl_weight", "assignment_kl_schema", "assignment_kl_source_digest"):
+                    if key not in raw or raw[key] != recorded.get(key):
+                        raise ValueError("Selected row lost its recorded assignment KL identity")
             if recorded.get("surrogate_kernel") is not None and raw.get("surrogate_kernel") != recorded["surrogate_kernel"]:
                 raise ValueError("Selected row lost its recorded NTK kernel identity")
     candidate = {key: choice[key] for key in ("method", "width", "lr", "T", "rank", "penalty")}
@@ -823,7 +871,8 @@ def selected_test(root, choice, condensation_seeds=(0, 1, 2), student_seeds=(100
                                                   "metric_input", "metric_alpha", "strength", "train_target_mix",
                                                   "balance_steps", "balance_tol", "balance_backend", "initial_mass_schema", "mlp_initial_mass_schema", "mlp_initial_mass_source_digest", "mlp_output_centering", "mlp_source_centering_schema", "mlp_source_centering_source_digest", "assignment_coordinates", "source_linear_schema", "source_linear_source_digest", "surrogate_kernel", "surrogate_schema", "surrogate_source_digest",
                                                   "ntk_angle_guard", "ntk_norm_guard", "ntk_jitter", "uniform_cell_q_prior_weight",
-                            "uniform_cell_q_prior_schema", "uniform_cell_q_prior_source_digest") if key in choice
+                            "uniform_cell_q_prior_schema", "uniform_cell_q_prior_source_digest",
+                            "assignment_kl_weight", "assignment_kl_schema", "assignment_kl_source_digest") if key in choice
                       and pd.notna(choice[key])})
     if "mixing" in choice:
         candidate["mixing"] = choice["mixing"]
@@ -842,7 +891,15 @@ def selected_test(root, choice, condensation_seeds=(0, 1, 2), student_seeds=(100
         if isinstance(value, bool) or not isinstance(value, Real) or not math.isfinite(value) or value != 1:
             raise ValueError("Selected prior schema must be exactly1")
         candidate["uniform_cell_q_prior_schema"] = int(value)
+    if "assignment_kl_schema" in candidate:
+        value = candidate["assignment_kl_schema"]
+        if isinstance(value, bool) or not isinstance(value, Real) or not math.isfinite(value) or value != 1:
+            raise ValueError("Selected assignment KL schema must be exactly1")
+        candidate["assignment_kl_schema"] = int(value)
     candidate = _candidate_surrogate(_candidate_nystrom_mass(candidate))
+    if candidate.get("assignment_kl_weight") == 1 and "candidate_path" in raw:
+        if Path(raw["candidate_path"]).resolve() != (root / _fingerprint(candidate)).resolve() or recorded != candidate:
+            raise ValueError("Selected assignment KL row differs from its recorded candidate/root")
     if candidate.get("uniform_cell_q_prior_weight") == 1 and "candidate_path" in raw:
         if Path(raw["candidate_path"]).resolve() != (root / _fingerprint(candidate)).resolve() or recorded != candidate:
             raise ValueError("Selected prior row differs from its recorded candidate/root")
@@ -916,7 +973,7 @@ def selected_test(root, choice, condensation_seeds=(0, 1, 2), student_seeds=(100
         labels, val_labels = teacher_inputs(graph, train, validation[1])
         validate_root(root, h=h, train_mask=train, train_labels=labels, val_mask=validation[1],
                       val_labels=val_labels, device=device, stop=stop)
-    if candidate["method"] != "source_linear" and candidate.get("mass_mode") != "initial" and candidate.get("surrogate_kernel") is None and candidate.get("mlp_output_centering") is None:
+    if candidate["method"] != "source_linear" and candidate.get("mass_mode") != "initial" and candidate.get("surrogate_kernel") is None and candidate.get("mlp_output_centering") is None and candidate.get("assignment_kl_weight", 0) != 1:
         save_json(selection, root / "selected.json")
         save_json(selection, root / f"selected_{selection_key}.json")
     logits = torch.load(root / "teacher.pt", map_location=device, weights_only=False)["logits"]
@@ -924,6 +981,23 @@ def selected_test(root, choice, condensation_seeds=(0, 1, 2), student_seeds=(100
         logits = logits.double()
     q = training_refined_targets(logits, candidate["T"], graph["y"], train,
                                  candidate.get("train_target_mix", 0.0))
+    if candidate.get("assignment_kl_weight") == 1:
+        from src.initial_assignment_row_kl import validate_cached as validate_row_kl_cached
+        for cond_seed in condensation_seeds:
+            inputs = torch.load(root / f"inputs_{cond_seed}.pt", map_location=device, weights_only=False)
+            current_assignment = _cached_initial_assignment(root, candidate, cond_seed, device)
+            existing = root / _fingerprint(candidate) / f"condensation_{cond_seed}"
+            resume_path = existing / "resume.pt"
+            if any((existing / "checkpoints").glob("step_*.pt")) and not resume_path.exists():
+                raise ValueError("Selected assignment KL checkpoint cache lacks its bound resume")
+            if resume_path.exists():
+                validate_row_kl_cached(torch.load(resume_path, map_location="cpu", weights_only=False),
+                                      candidate, inputs["z"], q, current_assignment, cond_seed, step, resume=True)
+            for cached_path in sorted((existing / "checkpoints").glob("step_*.pt")):
+                validate_row_kl_cached(torch.load(cached_path, map_location="cpu", weights_only=False),
+                                      candidate, inputs["z"], q, current_assignment, cond_seed, step)
+        save_json(selection, root / "selected.json")
+        save_json(selection, root / f"selected_{selection_key}.json")
     if candidate["method"] == "nystrom" and (candidate.get("mass_mode") == "initial" or candidate.get("surrogate_kernel") is not None):
         for cond_seed in condensation_seeds:
             existing = root / _fingerprint(candidate) / f"condensation_{cond_seed}"
@@ -977,6 +1051,9 @@ def selected_test(root, choice, condensation_seeds=(0, 1, 2), student_seeds=(100
             from src.uniform_cell_q_prior import validate_cached as validate_prior_cached
             current_assignment = _cached_initial_assignment(root, candidate, cond_seed, device)
             validate_prior_cached(snapshot, candidate, inputs["z"], q, current_assignment, cond_seed, step, step=step)
+        if candidate.get("assignment_kl_weight") == 1:
+            current_assignment = _cached_initial_assignment(root, candidate, cond_seed, device)
+            validate_row_kl_cached(snapshot, candidate, inputs["z"], q, current_assignment, cond_seed, step, step=step)
         if (candidate["method"] == "nystrom"
                 and snapshot.get("inner_loss_weighting", "mass") != _nystrom_inner_weighting(candidate)):
             raise ValueError("Nyström checkpoint inner weighting differs from the selection")
