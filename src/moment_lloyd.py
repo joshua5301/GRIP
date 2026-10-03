@@ -91,7 +91,9 @@ def initialize(x, cells, seed, block_size, iterations=20, return_info=False):
         if torch.equal(previous, assignment):
             converged = True
             break
-    info = dict(initialization_steps=step + 1, initialization_converged=converged)
+    info = dict(
+        initialization_steps=step + 1, initialization_converged=converged, initial_center_indices=indices
+    )
     return (assignment, info) if return_info else assignment
 
 

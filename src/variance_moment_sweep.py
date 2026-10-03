@@ -19,6 +19,7 @@ from src.evaluation import fit_gcn_diagnostic
 from src.io import _fingerprint, array_digest, save_json, save_state, write_table
 from src.moment_lloyd import moment_lloyd_partition
 from src.sweep_utils import grid_rows
+from src.teacher_calibration import calibrate_temperature, select_accuracy
 from src.variance_kl import variance_kl_partition
 from src.variance_moment_low_rank import low_rank_partition
 
@@ -166,8 +167,9 @@ def run_risk_sweep(
     initialization_steps=20,
     require_initialization_convergence=False,
     backtrack_steps=8,
+    temperature_bounds=(0.05, 20.0),
 ):
-    if teacher_selection not in ("grid", "validation_ce"):
+    if teacher_selection not in ("grid", "validation_ce", "accuracy_then_ce"):
         raise ValueError("Use grid or validation_ce teacher selection")
     lloyd = method in ("moment_lloyd_hybrid", "moment_lloyd_full_only", "moment_lloyd_filtered_batch")
     if method not in ("variance_moment", "variance_kl", "variance_moment_low_rank") and not lloyd:
@@ -181,6 +183,8 @@ def run_risk_sweep(
         bounds = {"cora": DEFAULT_SPACE["B"], "citeseer": [0.03, 0.1, 0.3, 1.0, 3.0]}
         space = dict(DEFAULT_SPACE, B=bounds.get(dataset, [0.1, 0.3, 1.0, 3.0, 10.0]))
     keys = set(space)
+    if teacher_selection == "accuracy_then_ce" and (space.get("T") != [1.0] or candidate_subset is not None):
+        raise ValueError("Calibrated teachers require placeholder T=[1.0] and no candidate subset")
     if teacher_selection == "validation_ce" and space.get("T") != [1.0]:
         raise ValueError("Teacher CE preselection requires T=[1.0]")
     required = {"gamma", "T", "lambda" if "lambda" in keys else "B"}
@@ -258,6 +262,7 @@ def run_risk_sweep(
             "variance_kl.py",
             "variance_moment_low_rank.py",
             "moment_lloyd.py",
+            "teacher_calibration.py",
             "distance_initialization.py",
             "evaluation.py",
             "models.py",
@@ -294,6 +299,8 @@ def run_risk_sweep(
         torch=str(torch.__version__),
     )
     config["method"] = method
+    if teacher_selection == "accuracy_then_ce":
+        config["temperature_bounds"] = list(temperature_bounds)
     if lloyd:
         config["initialization"] = "full_feature_kmeans++_lloyd"
         config["lloyd_options"] = dict(
@@ -390,6 +397,16 @@ def run_risk_sweep(
         )
     del phi, val_phi, weights
     write_table(pd.DataFrame(teacher_rows), root / "teacher_grid.csv")
+    if teacher_selection == "accuracy_then_ce":
+        selected_teacher = select_accuracy(teacher_rows)
+        gamma = selected_teacher["gamma"]
+        saved = torch.load(teacher_dir / f"{_fingerprint(dict(gamma=gamma))}.pt", map_location="cpu", weights_only=True)
+        calibration, curve = calibrate_temperature(saved["validation_logits"], val_labels, temperature_bounds)
+        selected_teacher.update(calibration)
+        save_json(selected_teacher, root / "selected_teacher.json")
+        write_table(pd.DataFrame(curve), root / "temperature_grid.csv")
+        candidates = [dict(candidate, T=calibration["T"]) for candidate in candidates if candidate["gamma"] == gamma]
+        logits = {gamma: logits[gamma]}
     if teacher_selection == "validation_ce":
         selected_teacher = _select_teacher_ce(teacher_rows)
         save_json(selected_teacher, root / "selected_teacher.json")

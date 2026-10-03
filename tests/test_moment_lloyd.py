@@ -81,6 +81,21 @@ def test_initialization_stability_and_limit():
         )
 
 
+def test_one_assignment_uses_same_kmeans_plus_plus_centers():
+    x, q, _ = example()
+    once = module.moment_lloyd_partition(x, q, 3, max_sweeps=0, initialization_steps=1)
+    converged = module.moment_lloyd_partition(
+        x, q, 3, max_sweeps=0, initialization_steps=100, require_initialization_convergence=True
+    )
+    assert once["initial_center_indices"] == converged["initial_center_indices"]
+    assert once["initialization_steps"] == 1
+    assert not once["initialization_converged"]
+    for j in range(3):
+        mask = once["assignment"] == j
+        torch.testing.assert_close(once["x"][j], x[mask].mean(0).float())
+        torch.testing.assert_close(once["y"][j], q[mask].mean(0).float())
+
+
 def test_filtered_backtracks_without_exact_scan(monkeypatch):
     x, q, _ = example()
     x = x - x.mean(0)

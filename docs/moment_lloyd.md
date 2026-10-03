@@ -22,6 +22,19 @@ relocations and accepts the first verified improvement, then rebuilds proposals.
 The scan forbids deleting singleton cells. A complete scan with no accepted move
 is stationarity to numerical tolerance. An iteration limit is not convergence.
 
+For a k-means++-only start, set `initialization_steps=1` and
+`require_initialization_convergence=False`: choose centers, assign once (repairing
+empty cells if necessary), and compute feature/label means. The converged comparison
+uses 300 and True. Both save `initial_center_indices` for paired verification.
+
+`teacher_selection="accuracy_then_ce"` selects gamma by validation accuracy,
+breaking ties by validation CE then smaller gamma. Supply placeholder `T=[1.0]`.
+After gamma selection, scalar temperature minimizes hard-label validation CE in
+inverse-temperature coordinates, bounded by `temperature_bounds=(0.05,20.0)`.
+Endpoints and T=1 (when feasible) are checked. The selected temperature replaces
+the placeholder before condensation; it is not a student hyperparameter sweep.
+Teacher grid, calibration curve, selected temperature and boundary flag are saved.
+
 Filtered-batch uses the same full proposal followed by top-gain prefixes (half,
 quarter, etc.) but never scans exact single moves. `backtrack_steps=8` limits the
 number of partial attempts for both filtered-batch and hybrid. Rejection or no
