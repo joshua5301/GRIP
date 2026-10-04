@@ -149,6 +149,62 @@ def _prepare(packet, B, observed, options, assignment, q, progress, stop):
         actual_optimizer_work=None, physical_student_fits=0)
 
 
+
+def prepared_payload_seal(artifact):
+    """Descriptor seal of every field except the two permitted source bindings."""
+    from src.kernel_mean_ce import _seal
+    payload={k:v for k,v in artifact.items() if k not in ('source','content_seal')}
+    context=dict(payload['context']);refs=dict(context['source_refs'])
+    refs.pop('current_source');context['source_refs']=refs;payload['context']=context
+    return _seal(payload)
+
+
+def _prepared_rebind(packet,B,ref,preparation,artifact):
+    """Read-only, separately pinned ROOT admission of a metadata-only rebind."""
+    declaration=B['prepared_source_rebind']
+    _require(isinstance(declaration,dict) and set(declaration)=={'path','sha256'}
+        and packet['readonly_files_sha256'].get(declaration['path'])==declaration['sha256'],
+        'ROOT prepared-source rebind receipt is missing its exact pin')
+    accepted=json.loads(Path(declaration['path']).read_text())
+    _require(type(accepted['schema']) is int and accepted['schema']==1
+        and accepted['kind']=='root_metadata_only_kernel_mean_prepared_source_rebind_v1'
+        and accepted['passed'] is True and accepted['metadata_only'] is True
+        and accepted['budget']==B['budget'] and accepted['old_source']==preparation['source']
+        and accepted['new_source']==packet['source'] and accepted['rebound_packet']==ref,
+        'ROOT rebind does not connect the actual OLD producer to this current source')
+    _require(accepted['allowed_changes']==['source','context.source_refs.current_source','content_seal']
+        and accepted['numerical_work']==dict(critic_moment_forwards=0,physical_moment_forwards=0,
+            kernel_calls=0,source_Phi_references=0,heads=0,adjoints=0,P_updates=0,students=0)
+        and all(type(value) is int for value in accepted['numerical_work'].values()),
+        'ROOT rebind must be metadata-only with exactly the two source fields and derived seal')
+    for name in ('original_packet','rebound_packet','original_context','rebound_context',
+                 'original_prepare_report','original_reference_arrays'):
+        pin=accepted[name]
+        _require(isinstance(pin,dict) and set(pin)=={'path','sha256'}
+            and packet['readonly_files_sha256'].get(pin['path'])==pin['sha256'],
+            'Old/new ROOT rebind lineage or FIRST raw reference is not frozen')
+    original_report=Path(B['input_folder'])/'prepare_report.json'
+    _require(accepted['original_prepare_report']==dict(path=str(original_report),sha256=_sha(original_report))
+        and accepted['original_packet']==preparation['native_kernel_mean_packet']
+        and accepted['original_reference_arrays']=={k:preparation['new_kernel_origin_reference_arrays'][k]
+            for k in ('path','sha256')} and preparation['new_kernel_origin_reference_arrays']['complete'] is True,
+        'ROOT rebind retargets the OLD successful prepare producer or its numerical cache')
+    _require(accepted['original_context']['path']==str(Path(accepted['original_packet']['path']).parent/'kernel_mean_context.json'),
+        'Original context path does not belong to the actual FIRST prepared packet')
+    old_context=json.loads(Path(accepted['original_context']['path']).read_text())
+    _require(old_context==preparation['kernel_mean_context']
+        and old_context['source_refs']['current_source']==accepted['old_source'],
+        'Original successful context has been relabeled')
+    expected=dict(old_context);expected['source_refs']=dict(old_context['source_refs'],current_source=packet['source'])
+    _require(artifact['context']==expected and json.loads(Path(accepted['rebound_context']['path']).read_text())==expected
+        and accepted['rebound_context']['path']==str(Path(ref['path']).parent/'kernel_mean_context.json')
+        and type(accepted['unchanged_payload_seal']) is str and len(accepted['unchanged_payload_seal'])==64
+        and all(c in '0123456789abcdef' for c in accepted['unchanged_payload_seal'])
+        and prepared_payload_seal(artifact)==accepted['unchanged_payload_seal'],
+        'Rebound packet changed numerical tensors/context or lacks the OLD immutable payload seal')
+    return accepted
+
+
 def _load_prepared(packet, B, observed):
     from src.kernel_mean_ce import _seal, _cpu
 
@@ -157,10 +213,14 @@ def _load_prepared(packet, B, observed):
     prepare_path = Path(B['input_folder']) / 'prepare_report.json'
     _require(str(prepare_path) in packet['readonly_files_sha256'], 'Passed FIRST representation preparation receipt unpinned')
     preparation = json.loads(prepare_path.read_text())
-    _require(preparation['passed'] is True and preparation['source'] == packet['source']
-        and preparation['new_kernel_P0_reference_passed'] is True
-        and preparation['native_kernel_mean_packet'] == ref, 'Prepared NEW kernel representation was not accepted')
+    _require(preparation['passed'] is True and preparation['new_kernel_P0_reference_passed'] is True,
+        'Original FIRST kernel representation preparation was not accepted')
     artifact = torch.load(ref['path'], map_location='cpu', weights_only=False)
+    if 'prepared_source_rebind' in B:
+        _prepared_rebind(packet,B,ref,preparation,artifact)
+    else:
+        _require(preparation['source']==packet['source'] and preparation['native_kernel_mean_packet']==ref,
+            'Different-source prepare requires separate ROOT metadata-only rebind admission')
     _, initial, digests, M0, serving, refs, assets, origin, _ = observed
     context = artifact['context']
     _require(artifact['schema'] == 1 and artifact['kind'] == KIND and artifact['source'] == packet['source']
@@ -389,8 +449,13 @@ def _run(protocol_path,budget,phase,mode,student_seeds,stop,progress):
                     'Evolving prefix must be pinned only at this sole pre-execution read')
             progress['receipt_path']=str(folder/('qualification.json' if phase=='qualify' else 'condensation_report.json'))
             steps=1 if phase=='qualify' else 25
-            progress.update(optimizer_invocation_attempts=1,kernel_mean_context=context,observed_initial_step=0 if state is None else state['step'])
-            state=optimize(z,q,assignment,artifact['initial_parameters'],phi,folder,steps,options,context,
+            progress.update(optimizer_invocation_attempts=0,kernel_mean_context=context,observed_initial_step=0 if state is None else state['step'])
+            initial_device=[p.detach().to(device=z.device).clone() for p in artifact['initial_parameters']]
+            _require(all(_equal(current,stored) for current,stored in zip(initial_device,artifact['initial_parameters'],strict=True)),
+                'Native device-only copy changed initial factor dtype/shape/full bytes')
+            progress['native_initial_device_copy_dtype_shape_bytes_preserved']=True
+            progress['optimizer_invocation_attempts']=1
+            state=optimize(z,q,assignment,initial_device,phi,folder,steps,options,context,
                 checkpoint_steps=(0,1,steps),resume_state=state,stop=stop)
             progress['optimizer_invocation_completed']=1;validate_core_resume(state,state['config'],context,folder)
             work=_work_delta(state,before);updates=1 if phase=='qualify' else 24
