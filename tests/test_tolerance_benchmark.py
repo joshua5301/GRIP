@@ -59,3 +59,8 @@ def test_tolerances_preserve_initialization_and_strict_validation(tmp_path, monk
     assert (root / "summary.csv").exists()
     benchmark.run_tolerance_benchmark(reference, tmp_path / "out", **options)
     assert len(calls) == 6
+    custom = dict(very_loose=(1e-4, 1e-2), extreme=(1e-3, 1e-1))
+    results, _ = benchmark.run_tolerance_benchmark(reference, tmp_path / "out", tolerances=custom, **options)
+    assert len(results) == 4
+    assert [(c["inner_tol"], c["cg_rtol"]) for c in calls[6:]] == list(custom.values()) + list(custom.values())[::-1]
+    assert all(v["grad_tol"] == 1e-7 for v in verifications)

@@ -16,3 +16,7 @@ outer CE. GCN validation uses uniform CE and the reference's search seeds; test
 accuracy is not evaluated. The comparison measures a fixed step budget, without
 selecting checkpoints by validation. Files remain inside the supplied output
 directory; completed timing trials are reused on rerun.
+
+An optional `tolerances` mapping overrides the default levels, for example
+`{"very_loose": (1e-4, 1e-2), "extreme": (1e-3, 1e-1)}`. Strict final
+verification remains unchanged regardless of the optimization tolerances.

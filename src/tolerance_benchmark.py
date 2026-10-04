@@ -19,9 +19,13 @@ TOLERANCES = dict(strict=(1e-7, 1e-6), relaxed=(1e-6, 1e-4), loose=(1e-5, 1e-3))
 
 def run_tolerance_benchmark(reference_run, output_dir, rank=64, tau=0.3, penalty=1e-6,
                             method="fixed_D", inner_loss_weighting="uniform", steps=100,
-                            repeats=2, lr=0.01, data_dir="/content/data/", device="cuda"):
+                            repeats=2, lr=0.01, data_dir="/content/data/", device="cuda", tolerances=None):
     if method not in ("fixed_D", "svd_UV") or repeats < 1 or steps < 1:
         raise ValueError("Require a supported method and positive budgets")
+    tolerances = dict(TOLERANCES if tolerances is None else tolerances)
+    if not tolerances or any(len(pair) != 2 or not all(0 < value < 1 for value in pair)
+                             for pair in tolerances.values()):
+        raise ValueError("Provide named pairs of inner and CG tolerances between zero and one")
     reference_run = Path(reference_run)
     reference = json.loads((reference_run / "config.json").read_text())
     config, selected = reference["source_config"], reference["selected"]
@@ -62,7 +66,7 @@ def run_tolerance_benchmark(reference_run, output_dir, rank=64, tau=0.3, penalty
     )).hexdigest()
     settings = dict(reference=str(reference_run), reference_config=reference, rank=rank, tau=tau,
                     penalty=penalty, method=method, inner_loss_weighting=inner_loss_weighting,
-                    steps=steps, repeats=repeats, lr=lr, tolerances=TOLERANCES, code=code)
+                    steps=steps, repeats=repeats, lr=lr, tolerances=tolerances, code=code)
     root = Path(output_dir) / _fingerprint(settings)
     root.mkdir(parents=True, exist_ok=True)
     save_json(settings, root / "config.json")
@@ -73,7 +77,7 @@ def run_tolerance_benchmark(reference_run, output_dir, rank=64, tau=0.3, penalty
 
     # Reverse alternate repeats to reduce a systematic timing-order advantage.
     trials = [(repeat, name) for repeat in range(repeats)
-              for name in (list(TOLERANCES) if repeat % 2 == 0 else list(TOLERANCES)[::-1])]
+              for name in (list(tolerances) if repeat % 2 == 0 else list(tolerances)[::-1])]
     timings = []
     for repeat, name in trials:
         folder = root / f"repeat_{repeat}" / name
@@ -82,8 +86,8 @@ def run_tolerance_benchmark(reference_run, output_dir, rank=64, tau=0.3, penalty
         if artifact.exists() and timing_path.exists():
             timings.append(json.loads(timing_path.read_text()))
             continue
-        inner_tol, cg_rtol = TOLERANCES[name]
-        print(f"{name} | 반복={repeat + 1} | inner_tol={inner_tol} | cg_rtol={cg_rtol}", flush=True)
+        inner_tol, cg_rtol = tolerances[name]
+        print(f"{name} | repeat={repeat + 1} | inner_tol={inner_tol} | cg_rtol={cg_rtol}", flush=True)
         sync()
         started = perf_counter()
         optimized = optimize_ce_assignment(
