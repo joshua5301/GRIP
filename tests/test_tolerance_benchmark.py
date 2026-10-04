@@ -31,7 +31,8 @@ def test_tolerances_preserve_initialization_and_strict_validation(tmp_path, monk
         material = torch.cat((z.new_ones(2, 1), z[:2], q[:2]), 1) / 2
         snapshot = dict(moments=material, theta=z.new_zeros(2, 2), teacher_ce=1.0)
         columns = ("assignment_seconds", "inner_seconds", "outer_seconds", "implicit_seconds",
-                   "backward_seconds", "cg_iterations", "inner_newton_cg_iterations", "inner_lbfgs_fallback")
+                   "backward_seconds", "cg_iterations", "inner_newton_cg_iterations", "inner_lbfgs_fallback",
+                   "cg_relative_residual")
         return dict(checkpoints={step: snapshot for step in options["checkpoint_steps"]},
                     history=[dict(step=1, **dict.fromkeys(columns, 1.0))])
 
@@ -71,3 +72,7 @@ def test_tolerances_preserve_initialization_and_strict_validation(tmp_path, monk
     assert len(results) == 12
     assert set(results.step) == {0, 1, 2}
     assert all(c["checkpoint_steps"] == [0, 1, 2] for c in calls[-4:])
+    benchmark.run_tolerance_benchmark(
+        reference, tmp_path / "out", tolerances=custom, implicit_method="diagonal", **options,
+    )
+    assert all(c["implicit_solver"] is benchmark.solve_head_diagonal for c in calls[-4:])

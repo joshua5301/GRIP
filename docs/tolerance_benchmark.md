@@ -27,3 +27,9 @@ The returned table then has one row per trial and checkpoint. Its
 `optimization_seconds` column repeats the total trial time: deduplicate by
 trial before aggregating timings. Separate calls with different `lr` values
 reuse the same stage-one initialization and allow a learning-rate comparison.
+
+`implicit_method="diagonal"` replaces only the implicit solve with the exact
+Hessian diagonal inverse applied to the outer gradient. Inner Newton solves
+remain unchanged. The full Hessian residual is reported honestly; the explicit
+approximation is allowed without satisfying the CG tolerance, but nonfinite
+directions still fail. This mode does not construct or invert the full Hessian.

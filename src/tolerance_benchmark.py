@@ -11,7 +11,12 @@ from src.distance_finetune import evaluation_splits, factorized_distance, factor
 from src.evaluation import fit_gcn_diagnostic
 from src.io import _fingerprint, save_json, save_state, write_table
 from src.moments import decode_moments
-from src.soft_ce_partition import optimize_ce_assignment, outer_value_gradient, solve_inner_newton_first
+from src.soft_ce_partition import (
+    optimize_ce_assignment,
+    outer_value_gradient,
+    solve_head_diagonal,
+    solve_inner_newton_first,
+)
 from src.variance_moment_sweep import _data_digest
 
 TOLERANCES = dict(strict=(1e-7, 1e-6), relaxed=(1e-6, 1e-4), loose=(1e-5, 1e-3))
@@ -20,9 +25,11 @@ TOLERANCES = dict(strict=(1e-7, 1e-6), relaxed=(1e-6, 1e-4), loose=(1e-5, 1e-3))
 def run_tolerance_benchmark(reference_run, output_dir, rank=64, tau=0.3, penalty=1e-6,
                             method="fixed_D", inner_loss_weighting="uniform", steps=100,
                             repeats=2, lr=0.01, data_dir="/content/data/", device="cuda", tolerances=None,
-                            checkpoint_steps=None):
+                            checkpoint_steps=None, implicit_method="cg"):
     if method not in ("fixed_D", "svd_UV") or repeats < 1 or steps < 1:
         raise ValueError("Require a supported method and positive budgets")
+    if implicit_method not in ("cg", "diagonal"):
+        raise ValueError("Choose cg or diagonal for the implicit solve")
     tolerances = dict(TOLERANCES if tolerances is None else tolerances)
     if not tolerances or any(len(pair) != 2 or not all(0 < value < 1 for value in pair)
                              for pair in tolerances.values()):
@@ -71,7 +78,7 @@ def run_tolerance_benchmark(reference_run, output_dir, rank=64, tau=0.3, penalty
     settings = dict(reference=str(reference_run), reference_config=reference, rank=rank, tau=tau,
                     penalty=penalty, method=method, inner_loss_weighting=inner_loss_weighting,
                     steps=steps, repeats=repeats, lr=lr, tolerances=tolerances, code=code,
-                    checkpoint_steps=checkpoints)
+                    checkpoint_steps=checkpoints, implicit_method=implicit_method)
     root = Path(output_dir) / _fingerprint(settings)
     root.mkdir(parents=True, exist_ok=True)
     save_json(settings, root / "config.json")
@@ -101,6 +108,7 @@ def run_tolerance_benchmark(reference_run, output_dir, rank=64, tau=0.3, penalty
             correction_scale=1 / tau if method == "fixed_D" else 1.0,
             inner_loss_weighting=inner_loss_weighting, inner_method="newton_first",
             implicit_warm_start=True, inner_tol=inner_tol, cg_rtol=cg_rtol,
+            implicit_solver=solve_head_diagonal if implicit_method == "diagonal" else None,
             cg_max_iter=2048, solver_mode="exact", checkpoint_steps=sorted(set(checkpoints) | {0}),
             folder=folder, save_assignment=False, save_resume=False,
         )
@@ -110,10 +118,11 @@ def run_tolerance_benchmark(reference_run, output_dir, rank=64, tau=0.3, penalty
         history = pd.DataFrame(optimized["history"])
         updates = history[(history.step > 0) & (history.step < steps)]
         timing = dict(repeat=repeat, tolerance=name, inner_tol=inner_tol, cg_rtol=cg_rtol,
+                      implicit_method=implicit_method,
                       optimization_seconds=seconds)
         for column in ("assignment_seconds", "inner_seconds", "outer_seconds", "implicit_seconds",
                        "backward_seconds", "cg_iterations", "inner_newton_cg_iterations",
-                       "inner_lbfgs_fallback"):
+                       "inner_lbfgs_fallback", "cg_relative_residual"):
             timing[column] = float(updates[column].mean())
         save_json(timing, timing_path)
         timings.append(timing)

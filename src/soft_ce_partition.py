@@ -57,6 +57,19 @@ def hessian_operator(x, labels, mass, theta, penalty):
 
 
 @torch.no_grad()
+def solve_head_diagonal(x, labels, mass, theta, penalty, rhs, rtol=1e-6, max_iter=512):
+    multiply, diagonal = hessian_operator(x, labels, mass, theta, penalty)
+    solution = rhs / diagonal
+    residual = float((multiply(solution) - rhs).norm())
+    relative = residual / max(float(rhs.norm()), 1e-30)
+    return solution, dict(
+        cg_iterations=0, cg_residual=residual, cg_relative_residual=relative,
+        cg_converged=relative <= rtol, hessian_solver="diagonal",
+        hessian_reduced_dimension=0, implicit_approximate=True,
+    )
+
+
+@torch.no_grad()
 def conjugate_gradient(
     multiply,
     rhs,
@@ -1079,7 +1092,8 @@ def optimize_ce_assignment(
                     row["implicit_correction_relative"] = float(
                         (vector - vector_before).norm() / vector.norm().clamp_min(1e-30)
                     )
-                if (refresh or row["implicit_fallback"]) and (not diagnostic["cg_converged"]):
+                if ((refresh or row["implicit_fallback"]) and not diagnostic["cg_converged"]
+                        and not diagnostic.get("implicit_approximate", False)):
                     failure = f"Implicit Hessian solve did not converge: solver={diagnostic['hessian_solver']}, relative residual={diagnostic['cg_relative_residual']:.3g}, target={cg_rtol:.3g}"
         row.update(
             best_J=best,
