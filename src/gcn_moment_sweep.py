@@ -27,6 +27,7 @@ def _metrics(model, pair):
 
 
 def fit_teacher(graph, train, validation, testing, settings, seed, folder):
+    folder.mkdir(parents=True, exist_ok=True)
     path = folder / "teacher.pt"
     if path.exists():
         return torch.load(path, map_location="cpu", weights_only=False)
@@ -60,7 +61,7 @@ def fit_teacher(graph, train, validation, testing, settings, seed, folder):
         scores = _forward(model, graph["x"], graph["adj"]).cpu()
         metrics = {f"{name}_{key}": value for name, pair in
                    (("train", (graph, train)), ("val", validation), ("test", testing))
-                   for key, value in _metrics(model, pair).items()}
+                   if pair is not None for key, value in _metrics(model, pair).items()}
     result = dict(logits=scores, state=best, epoch=best_epoch, seed=seed, **metrics)
     save_state(result, path)
     save_json(dict(epoch=best_epoch, seed=seed, **metrics), folder / "teacher_metrics.json")
@@ -68,11 +69,44 @@ def fit_teacher(graph, train, validation, testing, settings, seed, folder):
     return result
 
 
+def select_teacher(graph, train, validation, testing, settings, seed, folder, dropouts, penalties):
+    if (folder / "teacher.pt").exists():
+        return torch.load(folder / "teacher.pt", map_location="cpu", weights_only=False)
+    rows = []
+    for index, (dropout, penalty) in enumerate(product(dropouts, penalties)):
+        options = dict(settings, dropout=dropout, weight_decay=penalty)
+        candidate = folder / "teacher_search" / f"candidate_{index:03d}"
+        result = fit_teacher(graph, train, validation, None, options, seed, candidate)
+        rows.append(dict(candidate=index, dropout=dropout, weight_decay=penalty,
+                         val_acc=result["val_acc"], val_ce=result["val_ce"], epoch=result["epoch"]))
+        write_table(pd.DataFrame(rows), folder / "teacher_grid.csv")
+    selected = pd.DataFrame(rows).sort_values(
+        ["val_acc", "val_ce", "candidate"], ascending=[False, True, True],
+    ).iloc[0].to_dict()
+    selected["candidate"] = int(selected["candidate"])
+    path = folder / "teacher_search" / f"candidate_{selected['candidate']:03d}" / "teacher.pt"
+    result = torch.load(path, map_location="cpu", weights_only=False)
+    model = GCN(graph["x"].shape[1], settings["hidden"], result["logits"].shape[1],
+                2, selected["dropout"]).to(graph["x"].device)
+    model.load_state_dict(result["state"])
+    model.eval()
+    with torch.no_grad():
+        test = _metrics(model, testing)
+    result.update(test_acc=test["acc"], test_ce=test["ce"],
+                  dropout=selected["dropout"], weight_decay=selected["weight_decay"])
+    save_json(selected, folder / "selected_teacher.json")
+    save_json({key: value for key, value in result.items() if key not in ("state", "logits")},
+              folder / "teacher_metrics.json")
+    save_state(result, folder / "teacher.pt")
+    return result
+
+
 def run_gcn_moment_sweep(dataset, ratio, output_dir, temperatures, lambdas,
                          search_seeds=(0, 1, 2, 3, 4), final_seeds=tuple(range(100, 110)),
                          teacher_seed=0, max_sweeps=100, block_size=1024,
                          epochs=1000, eval_every=10, hidden=256, dropout=None,
-                         lr=0.01, weight_decay=0.0005, data_dir="/content/data/", device="cuda"):
+                         lr=0.01, weight_decay=0.0005, data_dir="/content/data/", device="cuda",
+                         teacher_dropouts=None, teacher_weight_decays=None):
     if (dataset, ratio) not in BUDGET or not temperatures or not lambdas:
         raise ValueError("Use a configured density and nonempty grids")
     if any(not 0 < float(t) < float("inf") for t in temperatures):
@@ -81,6 +115,14 @@ def run_gcn_moment_sweep(dataset, ratio, output_dir, temperatures, lambdas,
         raise ValueError("Lambdas must be finite and nonnegative")
     if not search_seeds or not final_seeds or set(search_seeds) & set(final_seeds):
         raise ValueError("Use nonempty disjoint search and final student seeds")
+    teacher_grid = teacher_dropouts is not None or teacher_weight_decays is not None
+    if teacher_grid:
+        if not teacher_dropouts or not teacher_weight_decays:
+            raise ValueError("Supply both nonempty teacher grids")
+        if any(not 0 <= float(p) < 1 for p in teacher_dropouts):
+            raise ValueError("Teacher dropout must be in [0, 1)")
+        if any(not 0 <= float(p) < float("inf") for p in teacher_weight_decays):
+            raise ValueError("Teacher weight decay must be finite and nonnegative")
     torch.backends.cuda.matmul.allow_tf32 = False
     torch.backends.cudnn.allow_tf32 = False
     graph, train, validation, testing, h = _prepare_dataset(dataset, data_dir, device)
@@ -99,6 +141,8 @@ def run_gcn_moment_sweep(dataset, ratio, output_dir, temperatures, lambdas,
                   source_digest=code, torch=str(torch.__version__),
                   objective="RMS feature variance + lambda * global cross-moment Frobenius norm",
                   seeding="feature_var", mode="filtered_batch", student_loss="uniform")
+    if teacher_grid:
+        config["teacher_grid"] = dict(dropouts=list(teacher_dropouts), weight_decays=list(teacher_weight_decays))
     root = Path(output_dir) / _fingerprint(config)
     root.mkdir(parents=True, exist_ok=True)
     save_json(config, root / "config.json")
@@ -106,7 +150,11 @@ def run_gcn_moment_sweep(dataset, ratio, output_dir, temperatures, lambdas,
         h = torch.load(root / "features.pt", map_location=device, weights_only=True)
     else:
         save_state(h, root / "features.pt")
-    teacher = fit_teacher(graph, train, validation, testing, settings, teacher_seed, root)
+    teacher = (
+        select_teacher(graph, train, validation, testing, settings, teacher_seed, root,
+                       teacher_dropouts, teacher_weight_decays)
+        if teacher_grid else fit_teacher(graph, train, validation, testing, settings, teacher_seed, root)
+    )
     logits = teacher["logits"].to(device)
     students, rows = [], []
     for index, (temperature, weight) in enumerate(tqdm(list(product(temperatures, lambdas)), desc=f"{dataset}: moment sweep")):

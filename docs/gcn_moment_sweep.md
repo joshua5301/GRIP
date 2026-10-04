@@ -21,3 +21,9 @@ Completed artifacts are cached under a configuration/data/code fingerprint.
 Interrupted individual fits restart. Final student seeds are disjoint from
 validation search seeds. Run `tests/test_gcn_moment_sweep.py` in Colab to check
 checkpoint restoration and test-only-after-selection behavior.
+
+Optional `teacher_dropouts` and `teacher_weight_decays` grids select a teacher
+by validation accuracy, then validation CE, then grid order. Teacher seed and
+learning rate stay fixed; student settings are unchanged. No candidate test
+metrics are computed during selection. The selected teacher alone receives a
+test evaluation. `teacher_grid.csv` and `selected_teacher.json` record selection.
