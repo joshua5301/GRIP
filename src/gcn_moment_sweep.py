@@ -106,7 +106,11 @@ def run_gcn_moment_sweep(dataset, ratio, output_dir, temperatures, lambdas,
                          teacher_seed=0, max_sweeps=100, block_size=1024,
                          epochs=1000, eval_every=10, hidden=256, dropout=None,
                          lr=0.01, weight_decay=0.0005, data_dir="/content/data/", device="cuda",
-                         teacher_dropouts=None, teacher_weight_decays=None):
+                         teacher_dropouts=None, teacher_weight_decays=None, partition_method="moment"):
+    if partition_method not in ("moment", "kmeans"):
+        raise ValueError("Choose moment or kmeans")
+    if partition_method == "kmeans" and list(lambdas) != [0.0]:
+        raise ValueError("K-means requires lambdas=[0.0]")
     if (dataset, ratio) not in BUDGET or not temperatures or not lambdas:
         raise ValueError("Use a configured density and nonempty grids")
     if any(not 0 < float(t) < float("inf") for t in temperatures):
@@ -141,6 +145,8 @@ def run_gcn_moment_sweep(dataset, ratio, output_dir, temperatures, lambdas,
                   source_digest=code, torch=str(torch.__version__),
                   objective="RMS feature variance + lambda * global cross-moment Frobenius norm",
                   seeding="feature_var", mode="filtered_batch", student_loss="uniform")
+    if partition_method == "kmeans":
+        config.update(mode="variance_sum", objective="RMS feature variance", partition_method="kmeans")
     if teacher_grid:
         config["teacher_grid"] = dict(dropouts=list(teacher_dropouts), weight_decays=list(teacher_weight_decays))
     root = Path(output_dir) / _fingerprint(config)
@@ -156,6 +162,7 @@ def run_gcn_moment_sweep(dataset, ratio, output_dir, temperatures, lambdas,
         if teacher_grid else fit_teacher(graph, train, validation, testing, settings, teacher_seed, root)
     )
     logits = teacher["logits"].to(device)
+    kmeans_partition = None
     students, rows = [], []
     for index, (temperature, weight) in enumerate(tqdm(list(product(temperatures, lambdas)), desc=f"{dataset}: moment sweep")):
         folder = root / f"candidate_{index:04d}"
@@ -165,10 +172,19 @@ def run_gcn_moment_sweep(dataset, ratio, output_dir, temperatures, lambdas,
             partition = torch.load(path, map_location="cpu", weights_only=False)
         else:
             q = (logits / temperature).softmax(1)
-            partition = moment_lloyd_partition(h, q, config["nodes"], mode="filtered_batch",
+            partition = moment_lloyd_partition(h, q, config["nodes"], mode=config["mode"],
                                               seeding="feature_var", moment_weight=weight,
-                                              max_sweeps=max_sweeps, block_size=block_size)
+                                              max_sweeps=max_sweeps, block_size=block_size) if kmeans_partition is None else dict(kmeans_partition)
+            if partition_method == "kmeans":
+                if not partition["converged"]:
+                    raise RuntimeError("K-means did not converge; increase max_sweeps")
+                assignment = partition["assignment"].to(q.device)
+                counts = torch.bincount(assignment, minlength=config["nodes"]).to(q)
+                partition["y"] = (q.new_zeros(config["nodes"], q.shape[1]).index_add_(
+                    0, assignment, q) / counts[:, None]).float().cpu()
             save_state(partition, path)
+        if partition_method == "kmeans":
+            kmeans_partition = partition
         x, y = partition["x"].to(device), partition["y"].to(device)
         scores = []
         for seed in search_seeds:

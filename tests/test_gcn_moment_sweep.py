@@ -63,3 +63,20 @@ def test_teacher_grid_selects_validation_and_preserves_student_settings(tmp_path
     assert settings["dropout"] == 0.9
     assert settings["weight_decay"] == 0.0005
     assert all(row["lr"] == 0.01 for row in calls)
+def test_zero_weight_var_part_lloyd_is_label_independent():
+    import torch
+
+    from src.moment_lloyd import moment_lloyd_partition
+    generator = torch.Generator().manual_seed(12)
+    x = torch.randn(40, 5, generator=generator)
+    q1 = torch.randn(40, 3, generator=generator).softmax(1)
+    q2 = torch.randn(40, 3, generator=generator).softmax(1)
+    options = dict(m=4, moment_weight=0., mode="variance_sum", seeding="feature_var", max_sweeps=200)
+    first = moment_lloyd_partition(x, q1, **options)
+    second = moment_lloyd_partition(x, q2, **options)
+    assert first["converged"] and second["converged"]
+    assert torch.equal(first["assignment"], second["assignment"])
+    torch.testing.assert_close(first["x"], second["x"])
+    assert all(b <= a + 1e-10 for a, b in zip(first["history"], first["history"][1:]))
+
+
