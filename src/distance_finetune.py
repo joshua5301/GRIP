@@ -72,6 +72,31 @@ def factorized_svd(left, right):
     return ql @ a, s, qr @ bt.T
 
 
+@torch.no_grad()
+def factorized_moment_cost(z, q, assignment, weight, chunk_size=2048):
+    cells = int(assignment.max()) + 1
+    counts = torch.bincount(assignment, minlength=cells).to(z)
+    if cells < 2 or bool((counts == 0).any()):
+        raise ValueError("Moment initialization requires at least two nonempty cells")
+    centers = z.new_zeros(cells, z.shape[1]).index_add_(0, assignment, z) / counts[:, None]
+    labels = q.new_zeros(cells, q.shape[1]).index_add_(0, assignment, q) / counts[:, None]
+    moment = z.T @ q / len(z) - centers.T @ (counts[:, None] * labels) / len(z)
+    direction = moment / moment.norm().clamp_min(1e-30)
+    cg = centers @ direction
+    left = torch.cat((z, q, z.new_ones(len(z), 1)), 1)
+    right = torch.cat((2 * centers + weight * (labels @ direction.T), weight * cg,
+                       (-centers.square().sum(1) - weight * (cg * labels).sum(1))[:, None]), 1)
+    right -= right.mean(0)
+    gaps = []
+    for block in left.split(chunk_size):
+        top = (block @ right.T).topk(2).values
+        gaps.append(top[:, 0] - top[:, 1])
+    gaps = torch.cat(gaps)
+    positive = gaps[gaps > 0]
+    scale = positive.median() if len(positive) else z.new_tensor(1.)
+    return left / scale, right, float(scale)
+
+
 def evaluation_splits(graph, train, validation, testing):
     splits = dict(train=(graph, train), val=validation, test=testing)
     return splits if validation[0] is not graph else {name: split[1] for name, split in splits.items()}
@@ -81,15 +106,19 @@ def run_distance_finetune(source, output_dir, ranks=(4, 8, 16), taus=(0.1, 0.3, 
                           penalties=(1e-5, 1e-4, 1e-3), steps=300,
                           checkpoints=(0, 25, 50, 100, 200, 300), lr=0.01,
                           inner_loss_weighting="mass", data_dir="/content/data/", device="cuda",
-                          methods=("fixed_D", "svd_UV"), continue_on_error=False):
+                          methods=("fixed_D", "svd_UV"), continue_on_error=False,
+                          inner_tol=1e-7, cg_rtol=1e-6):
     if not methods or len(set(methods)) != len(methods) or any(m not in ("fixed_D", "svd_UV") for m in methods):
         raise ValueError("Choose unique fixed_D and/or svd_UV methods")
     source = Path(source)
     config = json.loads((source / "config.json").read_text())
     selected = json.loads((source / "selected.json").read_text())
+    gcn_moment = config.get("mode") == "filtered_batch" and config.get("seeding") == "feature_var" and "settings" in config
+    if gcn_moment:
+        config = dict(config, condensation_seeds=[0], student=config["settings"])
     if config["dataset"] not in ("cora", "citeseer", "flickr", "reddit", "arxiv") or config["condensation_seeds"] != [0]:
         raise ValueError("Use a supported single deterministic partition source")
-    if config.get("method") != "moment_lloyd_normalized_variance":
+    if not gcn_moment and config.get("method") != "moment_lloyd_normalized_variance":
         raise ValueError("Use a normalized-variance stage-one partition")
     if not all(0 <= step <= steps for step in checkpoints):
         raise ValueError("Checkpoints must fit the step budget")
@@ -103,19 +132,23 @@ def run_distance_finetune(source, output_dir, ranks=(4, 8, 16), taus=(0.1, 0.3, 
         raise ValueError("Data differ from the stage-one run")
     masks = evaluation_splits(graph, train, validation, testing)
     h = torch.load(source / "features.pt", map_location=device, weights_only=True).double()
-    teacher = torch.load(source / "teachers" / f"{_fingerprint(dict(gamma=selected['gamma']))}.pt",
-                         map_location=device, weights_only=True)
+    teacher_path = source / "teacher.pt" if gcn_moment else source / "teachers" / f"{_fingerprint(dict(gamma=selected['gamma']))}.pt"
+    teacher = torch.load(teacher_path, map_location=device, weights_only=True)
     q = (teacher["logits"] / selected["T"]).softmax(1).double()
     del teacher
-    original = torch.load(source / f"candidate_{int(selected['candidate']):04d}" / "seed_0" / "partition.pt",
+    original_folder = source / f"candidate_{int(selected['candidate']):04d}"
+    original = torch.load(original_folder / ("partition.pt" if gcn_moment else "seed_0/partition.pt"),
                           map_location="cpu", weights_only=False)
     assignment = original["assignment"].to(device)
     offset = h.mean(0)
     scale = (h - offset).square().sum(1).mean().sqrt().clamp_min(1e-30)
     z = (h - offset) / scale
-    factorized = config["dataset"] in ("arxiv", "flickr", "reddit")
+    factorized = gcn_moment or config["dataset"] in ("arxiv", "flickr", "reddit")
     if factorized:
-        left, right, distance_scale = factorized_distance(h, q, assignment, selected["lambda"])
+        left, right, distance_scale = (
+            factorized_moment_cost(z, q, assignment, selected["lambda"])
+            if gcn_moment else factorized_distance(h, q, assignment, selected["lambda"])
+        )
         decomposition = factorized_svd(left, right) if "svd_UV" in methods else None
         zero_base = (z.new_zeros(len(z), 1), z.new_zeros(config["nodes"], 1))
     else:
@@ -126,7 +159,9 @@ def run_distance_finetune(source, output_dir, ranks=(4, 8, 16), taus=(0.1, 0.3, 
     settings = dict(source=str(source.resolve()), source_config=config, selected=selected, ranks=list(ranks),
                     taus=list(taus), penalties=list(penalties), steps=steps, checkpoints=checkpoints, lr=lr,
                     inner_loss_weighting=inner_loss_weighting, distance_scale=distance_scale, code=code,
-                    cg_max_iter=2048, cg_rtol=1e-6, inner_method="newton_first", methods=list(methods),
+                    cg_max_iter=2048, cg_rtol=cg_rtol, inner_tol=inner_tol,
+                    base_cost="moment_linearization" if gcn_moment else "normalized_variance_distance",
+                    inner_method="newton_first", methods=list(methods),
                     continue_on_error=continue_on_error)
     root = Path(output_dir) / _fingerprint(settings)
     root.mkdir(parents=True, exist_ok=True)
@@ -191,7 +226,8 @@ def run_distance_finetune(source, output_dir, ranks=(4, 8, 16), taus=(0.1, 0.3, 
                     initial_factors=factors if method == "svd_UV" else None,
                     checkpoint_steps=checkpoints, folder=folder, resume_state=state, save_resume=True,
                     save_assignment=False, inner_method="newton_first", implicit_warm_start=True,
-                    inner_loss_weighting=inner_loss_weighting, cg_max_iter=2048, cg_rtol=1e-6,
+                    inner_loss_weighting=inner_loss_weighting, cg_max_iter=2048,
+                    cg_rtol=cg_rtol, inner_tol=inner_tol,
                 )
             except (RuntimeError, FloatingPointError) as error:
                 if not continue_on_error:

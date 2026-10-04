@@ -5,6 +5,7 @@ from src.distance_finetune import (
     distance_logits,
     evaluation_splits,
     factorized_distance,
+    factorized_moment_cost,
     factorized_svd,
     svd_factors,
 )
@@ -12,6 +13,24 @@ from src.low_rank_assignment import FactorizedBaseMoments, logit_block
 from src.moment_seeding import normalized_variance_features
 from src.moments import make_material
 from src.soft_ce_partition import optimize_ce_assignment
+
+
+def test_moment_cost_factors_match_direct_assignment_derivative():
+    from src.moment_lloyd import assignment_cost
+    generator = torch.Generator().manual_seed(17)
+    z = torch.randn(15, 4, generator=generator, dtype=torch.float64)
+    z -= z.mean(0)
+    z /= z.square().sum(1).mean().sqrt()
+    q = torch.randn(15, 3, generator=generator, dtype=z.dtype).softmax(1)
+    assignment = torch.arange(15) % 3
+    centers = torch.stack([z[assignment == j].mean(0) for j in range(3)])
+    labels = torch.stack([q[assignment == j].mean(0) for j in range(3)])
+    moment = z.T @ q / len(z) - centers.T @ labels / 3
+    for weight in (0., 0.3, 3.):
+        left, right, scale = factorized_moment_cost(z, q, assignment, weight, chunk_size=4)
+        cost = assignment_cost(z, q, centers, labels, moment, weight)
+        torch.testing.assert_close(left @ right.T, -(cost - cost.mean(1, keepdim=True)) / scale)
+        torch.testing.assert_close((left @ right.T).softmax(1), (-cost / scale).softmax(1))
 
 
 def test_inductive_evaluation_keeps_separate_graphs_and_full_split_masks():

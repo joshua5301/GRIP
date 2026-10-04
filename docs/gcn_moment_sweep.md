@@ -27,3 +27,15 @@ by validation accuracy, then validation CE, then grid order. Teacher seed and
 learning rate stay fixed; student settings are unchanged. No candidate test
 metrics are computed during selection. The selected teacher alone receives a
 test evaluation. `teacher_grid.csv` and `selected_teacher.json` record selection.
+
+Pass this stage-one run to `distance_finetune.run_distance_finetune` to refine
+assignments with fixed moment-linearization costs. It uses exactly the saved
+S²X, centered scalar RMS normalization, selected temperature, and teacher.
+Costs are row-centered and divided by the median positive top-two cost gap.
+The fixed cost is stored as exact rectangular factors rather than an N-by-K
+matrix. Features and mean labels are decoded from soft assignment moments;
+features are restored to the original S²X scale for GCN evaluation.
+Hard stage one, soft step zero, and validation-selected learned results are
+reported separately. `inner_tol` and `cg_rtol` configure solver tolerances.
+The second stage minimizes teacher CE through the fitted linear head, not
+the first-stage variance-moment objective.
