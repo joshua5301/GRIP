@@ -32,6 +32,9 @@ def implementation_provenance():
 
 def dispatch(job, stop):
     options = dict(job["options"])
+    if job["kind"] == "citation_kernel_mean_ce":
+        from src.citation_kernel_mean_ce import run
+        return run(**options, stop=stop)
     if job["kind"] == "citation_sole_nystrom_graph_factor":
         from src.citation_sole_nystrom_graph_factor import run
         return run(**options, stop=stop)
