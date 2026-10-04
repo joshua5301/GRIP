@@ -32,6 +32,9 @@ def implementation_provenance():
 
 def dispatch(job, stop):
     options = dict(job["options"])
+    if job["kind"] == "single_joint_mean_CE_NEW132_saved_oracle_helper_parity_v1":
+        from src.single_joint_mean_ce_helper_parity import run
+        return run(**options, stop=stop)
     if job["kind"] == "single_joint_mean_CE_fresh_CPU_qualification_v2":
         from src.single_joint_mean_ce_cpu_qualification_v2 import run
         return run(**options, stop=stop)
