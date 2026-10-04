@@ -41,6 +41,14 @@ def _assets(B):
         Phi=str(phi), Phi_metadata=str(phi.with_suffix('.meta.json')))
 
 
+def _source_geometry_admission(packet, B, digest):
+    ref = B['source_geometry_acceptance']
+    if isinstance(ref, dict) and ref.get('kind') == 'original_native_NODE_P0_direct_H_RMS_no_head_geometry_admission_v1':
+        from src.citation_kernel_mean_geometry import load_admission
+        return load_admission(packet, B, digest)
+    return _geometry_certificate(packet, B, digest)
+
+
 def _observed_source(packet, B, h, z, q, assignment, transform, options, digest, stop):
     from src.kernel_mean_ce import _native_options, _runtime
     from src.moments import decode_moments
@@ -59,7 +67,7 @@ def _observed_source(packet, B, h, z, q, assignment, transform, options, digest,
     serving = dict(X=x0.detach().cpu().clone(), Q=y0.detach().cpu().clone(),
         uniform_weights=torch.full_like(mass, 1 / len(mass)).detach().cpu().clone())
     assets.update(z=_tensor_identity(z), Q=_tensor_identity(q), assignment=_tensor_identity(assignment))
-    geometry = _geometry_certificate(packet, B, digest)
+    geometry = _source_geometry_admission(packet, B, digest)
     refs = dict(nodes=len(z), cells=k, rank=options['assignment_rank'], dimension=d, classes=c,
         basis=phi.shape[1], chunk_size=options['chunk_size'], factor_seed=B['condensation_seed'], mixing=.05,
         original_options=_native_options(options), runtime=_runtime(z.device), device=str(z.device),
@@ -367,7 +375,14 @@ def _evaluate(packet,B,graph,train,validation,h,z,q,transform,mode,seeds,progres
     _require(str(checkpoint) in packet['readonly_files_sha256'],'Selected physical endpoint is not root-pinned')
     saved=torch.load(checkpoint,map_location='cpu',weights_only=False)
     moments=saved['physical_moments'] if mode==MODE else saved['moments']
-    x,y,mass=representative(moments,transform,z.shape[1],z.device)
+    if mode==CONTROL_CENTROID and 'centroid_control_representation' in B:
+        _require(B['centroid_control_representation']=='original_raw_H_centroid_moments_v1',
+            'Unknown explicit readonly centroid control coordinate representation')
+        from src.moments import decode_moments
+        x,y,mass=decode_moments(moments.to(z.device),h.shape[1]); x,y=x.float(),y.float()
+        progress['control_readout_representation']='original_raw_H_centroid_moments_v1'
+    else:
+        x,y,mass=representative(moments,transform,z.shape[1],z.device)
     settings={key:value for key,value in B['recipe'].items() if key!='input_scale'}
     records=[];progress.update(records=records,physical_student_fit_attempts=0,physical_student_fits=0,
         same_selected_weight_validation_routes=0,whole_epochs=0)

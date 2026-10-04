@@ -41,6 +41,9 @@ def dispatch(job, stop):
     if job["kind"] == "large_kernel_mean_row_tile":
         from src.large_kernel_mean_row_tile import run
         return run(**options, stop=stop)
+    if job["kind"] == "citation_original_geometry_admission":
+        from src.citation_kernel_mean_geometry import run
+        return run(**options, stop=stop)
     if job["kind"] == "citation_kernel_mean_ce":
         from src.citation_kernel_mean_ce import run
         return run(**options, stop=stop)
