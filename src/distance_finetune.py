@@ -102,12 +102,36 @@ def evaluation_splits(graph, train, validation, testing):
     return splits if validation[0] is not graph else {name: split[1] for name, split in splits.items()}
 
 
+def initialization_assignment(z, cells, method, seed):
+    if method == "random":
+        generator = torch.Generator(device=z.device).manual_seed(seed)
+        assignment = torch.empty(len(z), dtype=torch.long, device=z.device)
+        assignment[torch.randperm(len(z), generator=generator, device=z.device)] = torch.arange(
+            len(z), device=z.device) % cells
+        return assignment
+    if method != "kmeans":
+        raise ValueError("Choose random or kmeans")
+    import faiss
+    import numpy as np
+    data = np.ascontiguousarray(z.float().cpu().numpy())
+    model = faiss.Kmeans(data.shape[1], cells, niter=100, nredo=1, seed=seed,
+                         max_points_per_centroid=len(data), gpu=False)
+    model.train(data)
+    _, indices = model.index.search(data, 1)
+    assignment = torch.from_numpy(indices[:, 0].copy()).to(z.device)
+    if len(torch.unique(assignment)) != cells:
+        raise ValueError("K-means produced empty cells; use another initialization seed")
+    return assignment
+
+
 def run_distance_finetune(source, output_dir, ranks=(4, 8, 16), taus=(0.1, 0.3, 1.0),
                           penalties=(1e-5, 1e-4, 1e-3), steps=300,
                           checkpoints=(0, 25, 50, 100, 200, 300), lr=0.01,
                           inner_loss_weighting="mass", data_dir="/content/data/", device="cuda",
                           methods=("fixed_D", "svd_UV"), continue_on_error=False,
-                          inner_tol=1e-7, cg_rtol=1e-6):
+                          inner_tol=1e-7, cg_rtol=1e-6, initialization="stage_one", initialization_seed=0):
+    if initialization not in ("stage_one", "random", "kmeans"):
+        raise ValueError("Choose stage_one, random, or kmeans initialization")
     if not methods or len(set(methods)) != len(methods) or any(m not in ("fixed_D", "svd_UV") for m in methods):
         raise ValueError("Choose unique fixed_D and/or svd_UV methods")
     source = Path(source)
@@ -143,6 +167,15 @@ def run_distance_finetune(source, output_dir, ranks=(4, 8, 16), taus=(0.1, 0.3, 
     offset = h.mean(0)
     scale = (h - offset).square().sum(1).mean().sqrt().clamp_min(1e-30)
     z = (h - offset) / scale
+    if initialization != "stage_one":
+        if not gcn_moment:
+            raise ValueError("Initialization ablation currently requires a GCN moment source")
+        assignment = initialization_assignment(z, config["nodes"], initialization, initialization_seed)
+        counts = torch.bincount(assignment, minlength=config["nodes"]).to(z)
+        centers = z.new_zeros(config["nodes"], z.shape[1]).index_add_(0, assignment, z) / counts[:, None]
+        labels = q.new_zeros(config["nodes"], q.shape[1]).index_add_(0, assignment, q) / counts[:, None]
+        original = dict(assignment=assignment.cpu(), x=(centers * scale + offset).float().cpu(),
+                        y=labels.float().cpu())
     factorized = gcn_moment or config["dataset"] in ("arxiv", "flickr", "reddit")
     if factorized:
         left, right, distance_scale = (
@@ -162,10 +195,13 @@ def run_distance_finetune(source, output_dir, ranks=(4, 8, 16), taus=(0.1, 0.3, 
                     cg_max_iter=2048, cg_rtol=cg_rtol, inner_tol=inner_tol,
                     base_cost="moment_linearization" if gcn_moment else "normalized_variance_distance",
                     inner_method="newton_first", methods=list(methods),
-                    continue_on_error=continue_on_error)
+                    continue_on_error=continue_on_error, initialization=initialization,
+                    initialization_seed=initialization_seed)
     root = Path(output_dir) / _fingerprint(settings)
     root.mkdir(parents=True, exist_ok=True)
     save_json(settings, root / "config.json")
+    save_state(dict(assignment=assignment.cpu(), initialization=initialization,
+                    seed=initialization_seed), root / "initial_partition.pt")
     save_state(dict(offset=offset.cpu(), scale=scale.cpu()), root / "transform.pt")
     search_seeds, final_seeds = config["search_seeds"], config["final_seeds"]
 

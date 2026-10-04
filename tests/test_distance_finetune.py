@@ -7,12 +7,22 @@ from src.distance_finetune import (
     factorized_distance,
     factorized_moment_cost,
     factorized_svd,
+    initialization_assignment,
     svd_factors,
 )
 from src.low_rank_assignment import FactorizedBaseMoments, logit_block
 from src.moment_seeding import normalized_variance_features
 from src.moments import make_material
 from src.soft_ce_partition import optimize_ce_assignment
+
+
+def test_random_initialization_is_reproducible_nonempty_and_seeded():
+    z = torch.zeros(31, 4)
+    a = initialization_assignment(z, 7, "random", 0)
+    assert torch.equal(a, initialization_assignment(z, 7, "random", 0))
+    assert not torch.equal(a, initialization_assignment(z, 7, "random", 1))
+    counts = torch.bincount(a)
+    assert len(counts) == 7 and int(counts.max() - counts.min()) == 1
 
 
 def test_moment_cost_factors_match_direct_assignment_derivative():
