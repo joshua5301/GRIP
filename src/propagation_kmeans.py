@@ -31,13 +31,22 @@ def push_average_operator(adjacency):
 def push_labels(operator, source, alpha, tolerance=1e-6, max_steps=2000):
     if not 0 <= alpha < 1:
         raise ValueError("Alpha must be in [0, 1)")
+    if tolerance <= 0 or max_steps < 1:
+        raise ValueError("Tolerance and step budget must be positive")
+    output_dtype = source.dtype
+    source = source.double()
+    operator = operator.to(device=source.device, dtype=torch.float64)
+    row_mass = torch.sparse.mm(operator, source.new_ones(len(source), 1))
+    if not bool((row_mass > 0).all()):
+        raise ValueError("Push operator has an empty row")
     q = source.clone()
     for step in range(1, max_steps + 1):
-        updated = (1 - alpha) * source + alpha * torch.sparse.mm(operator, q)
+        updated = (1 - alpha) * source + alpha * torch.sparse.mm(operator, q) / row_mass
         delta = float((updated - q).abs().max())
         q = updated
         if delta <= tolerance * (1 - alpha):
-            return q, dict(iterations=step, residual=delta, converged=True)
+            return q.to(output_dtype), dict(iterations=step, residual=delta, converged=True,
+                                            solver_dtype="float64", error_bound=delta / (1 - alpha))
     raise RuntimeError(f"Push did not converge: alpha={alpha}, residual={delta}")
 
 
