@@ -260,8 +260,9 @@ def _native_options(options):
         raise ValueError("Disabled native node-weight options cannot carry an active parameter")
     for key in ("penalty", "lr", "inner_tol", "cg_rtol"):
         _number(options.get(key), positive=True)
-    for key in ("chunk_size", "outer_chunk_size", "inner_max_iter", "cg_max_iter", "cg_check_interval", "assignment_rank"):
+    for key in ("chunk_size", "outer_chunk_size", "inner_max_iter", "cg_max_iter", "assignment_rank"):
         _integer(options.get(key), 1)
+    _integer(options.get("cg_check_interval", 1), 1)
     _integer(options.get("factor_seed"))
     old = {k: v for k, v in options.items() if k not in ("save_resume", "data_digest")}
     return old
@@ -697,7 +698,7 @@ def optimize(z, q, assignment, initial_parameters, feature_map, phi, transform,
                 work[f"{mode}_head_interfaces"] += 1
                 fit = solve_inner_newton_first(features[mode], labels, weights, options["penalty"],
                     theta[mode], options["inner_max_iter"], options["inner_tol"],
-                    cg_max_iter=options["cg_max_iter"], cg_check_interval=options["cg_check_interval"])
+                    cg_max_iter=options["cg_max_iter"], cg_check_interval=options.get("cg_check_interval", 1))
                 theta[mode] = fit.pop("theta").detach()
                 fitted[mode] = _json_value(fit)
                 check_stop()
@@ -726,7 +727,7 @@ def optimize(z, q, assignment, initial_parameters, feature_map, phi, transform,
                     vector[mode], diagnostic = solve_head_system(augmented(features[mode]), labels, weights,
                         theta[mode], options["penalty"], rhs[mode], rtol=options["cg_rtol"],
                         max_iter=options["cg_max_iter"], initial=vector[mode],
-                        cg_check_interval=options["cg_check_interval"])
+                        cg_check_interval=options.get("cg_check_interval", 1))
                     diagnostics[mode] = dict(_json_value(diagnostic), evaluated=True)
                     check_stop()
                     if diagnostics[mode].get("cg_converged") is not True or not bool(torch.isfinite(vector[mode]).all()):

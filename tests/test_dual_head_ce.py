@@ -6,7 +6,7 @@ import pytest
 import torch
 
 from src.dual_head_ce import (
-    MODE, OBJECTIVE, POLICY, WORK_KEYS, _record_digest, validate_core_resume,
+    MODE, OBJECTIVE, POLICY, WORK_KEYS, _record_digest, validate_core_resume, _native_options,
 )
 from src.io import array_digest
 
@@ -94,3 +94,23 @@ def test_valid_metadata_envelope_and_reject_cross_head_scale_origin_optimizer_co
     for changed in corruptions:
         with pytest.raises(ValueError):
             validate_core_resume(changed, config, context)
+
+
+def test_original_resume_omits_default_cg_check_interval_without_changing_options():
+    # The original optimizer intentionally omits cg_check_interval=1 from its
+    # saved config. Loaders must preserve that config and use its existing
+    # solver default at call sites, before any head or assignment is evaluated.
+    options = dict(assignment_input="node", assignment_encoder="linear", mass_mode="free",
+        inner_loss_weighting="uniform", solver_mode="exact", inner_method="newton_first",
+        implicit_warm_start=True, mixing=.05, save_resume=True, save_assignment=False,
+        feature_control="joint", penalty=.001, lr=.01, inner_tol=1e-7, cg_rtol=1e-6,
+        chunk_size=4096, outer_chunk_size=65536, inner_max_iter=2000, cg_max_iter=512,
+        assignment_rank=8, factor_seed=0)
+    before = copy.deepcopy(options)
+    old = _native_options(options)
+    assert options == before and "cg_check_interval" not in old
+    assert old == {key: value for key, value in before.items() if key != "save_resume"}
+    explicit = dict(options, cg_check_interval=1)
+    assert _native_options(explicit)["cg_check_interval"] == 1
+    with pytest.raises(ValueError):
+        _native_options(dict(options, cg_check_interval=0))
