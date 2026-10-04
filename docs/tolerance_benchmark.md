@@ -20,3 +20,10 @@ directory; completed timing trials are reused on rerun.
 An optional `tolerances` mapping overrides the default levels, for example
 `{"very_loose": (1e-4, 1e-2), "extreme": (1e-3, 1e-1)}`. Strict final
 verification remains unchanged regardless of the optimization tolerances.
+
+`checkpoint_steps` optionally requests strict outer-CE verification and GCN
+validation for intermediate snapshots, including the initial and final steps.
+The returned table then has one row per trial and checkpoint. Its
+`optimization_seconds` column repeats the total trial time: deduplicate by
+trial before aggregating timings. Separate calls with different `lr` values
+reuse the same stage-one initialization and allow a learning-rate comparison.

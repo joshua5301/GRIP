@@ -19,13 +19,17 @@ TOLERANCES = dict(strict=(1e-7, 1e-6), relaxed=(1e-6, 1e-4), loose=(1e-5, 1e-3))
 
 def run_tolerance_benchmark(reference_run, output_dir, rank=64, tau=0.3, penalty=1e-6,
                             method="fixed_D", inner_loss_weighting="uniform", steps=100,
-                            repeats=2, lr=0.01, data_dir="/content/data/", device="cuda", tolerances=None):
+                            repeats=2, lr=0.01, data_dir="/content/data/", device="cuda", tolerances=None,
+                            checkpoint_steps=None):
     if method not in ("fixed_D", "svd_UV") or repeats < 1 or steps < 1:
         raise ValueError("Require a supported method and positive budgets")
     tolerances = dict(TOLERANCES if tolerances is None else tolerances)
     if not tolerances or any(len(pair) != 2 or not all(0 < value < 1 for value in pair)
                              for pair in tolerances.values()):
         raise ValueError("Provide named pairs of inner and CG tolerances between zero and one")
+    checkpoints = [steps] if checkpoint_steps is None else sorted(set(checkpoint_steps) | {0, steps})
+    if any(step < 0 or step > steps for step in checkpoints):
+        raise ValueError("Checkpoints must fit the step budget")
     reference_run = Path(reference_run)
     reference = json.loads((reference_run / "config.json").read_text())
     config, selected = reference["source_config"], reference["selected"]
@@ -66,7 +70,8 @@ def run_tolerance_benchmark(reference_run, output_dir, rank=64, tau=0.3, penalty
     )).hexdigest()
     settings = dict(reference=str(reference_run), reference_config=reference, rank=rank, tau=tau,
                     penalty=penalty, method=method, inner_loss_weighting=inner_loss_weighting,
-                    steps=steps, repeats=repeats, lr=lr, tolerances=tolerances, code=code)
+                    steps=steps, repeats=repeats, lr=lr, tolerances=tolerances, code=code,
+                    checkpoint_steps=checkpoints)
     root = Path(output_dir) / _fingerprint(settings)
     root.mkdir(parents=True, exist_ok=True)
     save_json(settings, root / "config.json")
@@ -96,7 +101,7 @@ def run_tolerance_benchmark(reference_run, output_dir, rank=64, tau=0.3, penalty
             correction_scale=1 / tau if method == "fixed_D" else 1.0,
             inner_loss_weighting=inner_loss_weighting, inner_method="newton_first",
             implicit_warm_start=True, inner_tol=inner_tol, cg_rtol=cg_rtol,
-            cg_max_iter=2048, solver_mode="exact", checkpoint_steps=[0, steps],
+            cg_max_iter=2048, solver_mode="exact", checkpoint_steps=sorted(set(checkpoints) | {0}),
             folder=folder, save_assignment=False, save_resume=False,
         )
         sync()
@@ -120,24 +125,25 @@ def run_tolerance_benchmark(reference_run, output_dir, rank=64, tau=0.3, penalty
         repeat, name = timing["repeat"], timing["tolerance"]
         folder = root / f"repeat_{repeat}" / name
         optimized = torch.load(folder / "optimized.pt", map_location="cpu", weights_only=False)
-        checkpoint = optimized["checkpoints"][steps]
-        c, y, mass = decode_moments(checkpoint["moments"].to(z), z.shape[1])
-        student_mass = torch.full_like(mass, 1 / len(mass)) if inner_loss_weighting == "uniform" else mass
-        fitted = solve_inner_newton_first(c, y, student_mass, penalty,
-                                         initial=checkpoint["theta"].to(z), grad_tol=1e-7,
-                                         cg_max_iter=2048)
-        if not fitted["inner_converged"]:
-            raise RuntimeError(f"Strict verification did not converge: {folder}")
-        ce, _ = outer_value_gradient(z, q, fitted["theta"], chunk_size=65536)
-        x = (c * scale + offset).float()
-        scores = pd.DataFrame([
-            fit_gcn_diagnostic(x, y.float(), torch.ones_like(mass), graph, None, masks, seed,
-                               folder=folder / "gcn_validation", **config["student"])
-            for seed in config["search_seeds"]
-        ])
-        records.append(dict(timing, reported_outer_ce=checkpoint["teacher_ce"],
-                            verified_outer_ce=ce, verification_gradient=fitted["inner_grad_max"],
-                            validation=float(scores.val_acc.mean()), validation_std=float(scores.val_acc.std())))
-        write_table(pd.DataFrame(records), root / "summary.csv")
+        for step in checkpoints:
+            checkpoint = optimized["checkpoints"][step]
+            c, y, mass = decode_moments(checkpoint["moments"].to(z), z.shape[1])
+            student_mass = torch.full_like(mass, 1 / len(mass)) if inner_loss_weighting == "uniform" else mass
+            fitted = solve_inner_newton_first(c, y, student_mass, penalty,
+                                             initial=checkpoint["theta"].to(z), grad_tol=1e-7,
+                                             cg_max_iter=2048)
+            if not fitted["inner_converged"]:
+                raise RuntimeError(f"Strict verification did not converge: {folder}, step={step}")
+            ce, _ = outer_value_gradient(z, q, fitted["theta"], chunk_size=65536)
+            x = (c * scale + offset).float()
+            scores = pd.DataFrame([
+                fit_gcn_diagnostic(x, y.float(), torch.ones_like(mass), graph, None, masks, seed,
+                                   folder=folder / "gcn_validation" / f"step_{step}", **config["student"])
+                for seed in config["search_seeds"]
+            ])
+            records.append(dict(timing, step=step, lr=lr, reported_outer_ce=checkpoint["teacher_ce"],
+                                verified_outer_ce=ce, verification_gradient=fitted["inner_grad_max"],
+                                validation=float(scores.val_acc.mean()), validation_std=float(scores.val_acc.std())))
+            write_table(pd.DataFrame(records), root / "summary.csv")
         del optimized
     return pd.DataFrame(records), root

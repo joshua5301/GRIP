@@ -32,7 +32,8 @@ def test_tolerances_preserve_initialization_and_strict_validation(tmp_path, monk
         snapshot = dict(moments=material, theta=z.new_zeros(2, 2), teacher_ce=1.0)
         columns = ("assignment_seconds", "inner_seconds", "outer_seconds", "implicit_seconds",
                    "backward_seconds", "cg_iterations", "inner_newton_cg_iterations", "inner_lbfgs_fallback")
-        return dict(checkpoints={options["steps"]: snapshot}, history=[dict(step=1, **dict.fromkeys(columns, 1.0))])
+        return dict(checkpoints={step: snapshot for step in options["checkpoint_steps"]},
+                    history=[dict(step=1, **dict.fromkeys(columns, 1.0))])
 
     def verify(c, y, mass, penalty, **options):
         verifications.append(options)
@@ -64,3 +65,9 @@ def test_tolerances_preserve_initialization_and_strict_validation(tmp_path, monk
     assert len(results) == 4
     assert [(c["inner_tol"], c["cg_rtol"]) for c in calls[6:]] == list(custom.values()) + list(custom.values())[::-1]
     assert all(v["grad_tol"] == 1e-7 for v in verifications)
+    results, _ = benchmark.run_tolerance_benchmark(
+        reference, tmp_path / "out", tolerances=custom, checkpoint_steps=[0, 1, 2], **options,
+    )
+    assert len(results) == 12
+    assert set(results.step) == {0, 1, 2}
+    assert all(c["checkpoint_steps"] == [0, 1, 2] for c in calls[-4:])
