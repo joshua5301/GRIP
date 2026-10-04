@@ -188,8 +188,14 @@ def _resident_phi(phi, device):
     return torch.from_numpy(np.array(phi, copy=True)).to(device=device)
 
 
-def _validate_inputs(z, q, assignment, initial, phi, options, context):
+def _validate_inputs(z, q, assignment, initial, phi, options, context, execution=None):
+    if execution is not None:
+        from src.kernel_mean_row_tile_execution import RowTileExecution
+        _require(type(execution) is RowTileExecution and phi is execution.rows,
+            "Only the pinned row-tile provider may replace resident source execution")
+        return execution.admit(z, q, assignment, initial, options, context)
     refs, assets, basis = _context(context)
+    _require("execution_backend" not in refs, "Resident route cannot consume row-tile context")
     old = _native_options(options)
     _require(torch.is_tensor(z) and z.ndim == 2, "Source z must be a matrix")
     n, k, r, d, c = (refs[x] for x in ("nodes", "cells", "rank", "dimension", "classes"))
@@ -246,10 +252,15 @@ def _record(record, config, context):
     keys = {"step", "config", "context", "moments", "theta", "vector", "vector_step",
         "parameters", "initial_parameters", "physical_moments", "effective_u", "CE", "CE0", "objective",
         "objective_name", "J_exact", "head_work", "warm_before", "last_pullback", "record_digest"}
+    if "execution_backend" in refs:
+        keys.add("execution_state")
     _require(isinstance(record, dict) and set(record) == keys and record["J_exact"] is True
         and record["objective_name"] == OBJECTIVE and _seal(record["config"]) == _seal(config)
         and _seal(record["context"]) == _seal(context), "Record/config/context changed")
     step = _int(record["step"])
+    if "execution_backend" in refs:
+        from src.kernel_mean_row_tile_execution import validate_execution_state
+        validate_execution_state(record["execution_state"], context, step)
     n, k, r, d, c = (refs[x] for x in ("nodes", "cells", "rank", "dimension", "classes"))
     _factor_digests(record["parameters"], n, k, r)
     _require(_factor_digests(record["initial_parameters"], n, k, r)
@@ -299,9 +310,11 @@ def _same_material(old, new):
 
 
 def _record_link(record):
-    return dict(record_digest=record["record_digest"], record_identity=_plain({key: record[key]
-        for key in ("parameters", "initial_parameters", "moments", "physical_moments", "effective_u", "theta",
-            "vector", "vector_step", "CE0", "warm_before", "last_pullback")}))
+    names = ("parameters", "initial_parameters", "moments", "physical_moments", "effective_u", "theta",
+        "vector", "vector_step", "CE0", "warm_before", "last_pullback")
+    if "execution_state" in record:
+        names += ("execution_state",)
+    return dict(record_digest=record["record_digest"], record_identity=_plain({key: record[key] for key in names}))
 
 
 def _history_link(row, record):
@@ -319,10 +332,12 @@ def _warm_link(record, parent_row):
     _require(_plain(record["warm_before"]) == expected, "Actual warm head/vector/parent provenance changed")
 
 
-def _history_identity(row, refs, width):
+def _history_identity(row, refs, width, context=None):
     identity = row.get("record_identity")
     keys = {"parameters", "initial_parameters", "moments", "physical_moments", "effective_u", "theta", "vector",
         "vector_step", "CE0", "warm_before", "last_pullback"}
+    if "execution_backend" in refs:
+        keys.add("execution_state")
     _require(isinstance(identity, dict) and set(identity) == keys, "History tensor descriptors missing")
     def descriptor(value, shape, dtype):
         _require(isinstance(value, dict) and set(value) == {"shape", "dtype", "digest"}
@@ -342,6 +357,9 @@ def _history_identity(row, refs, width):
     else:
         descriptor(identity["vector"], (c, width + 1), "torch.float64")
         _require(_int(identity["vector_step"]) <= row["step"], "History vector is ahead of factors")
+    if "execution_backend" in refs:
+        from src.kernel_mean_row_tile_execution import validate_execution_state
+        validate_execution_state(identity["execution_state"], context, row["step"])
     return identity
 
 
@@ -354,6 +372,10 @@ def validate_core_resume(state, expected_config, context, folder=None):
         "optimizer", "snapshots", "history", "current", "best_record", "frontiers",
         "initial_moments", "initial_physical_moments", "CE0", "work", "attempts", "checkpoint_files_sha256",
         "history_sha256", "state_digest"}
+    if "execution_backend" in refs:
+        from src.kernel_mean_row_tile_execution import execution_context
+        bound["kernel_mean_execution"] = execution_context(context)
+        keys.add("execution_state")
     _require(isinstance(state, dict) and set(state) == keys and type(state["schema"]) is int
         and state["schema"] == SCHEMA and _seal(expected_config) == _seal(bound)
         and _seal(state["config"]) == _seal(bound) and _seal(state["context"]) == _seal(context), "Resume schema/config/context changed")
@@ -425,7 +447,7 @@ def validate_core_resume(state, expected_config, context, folder=None):
             _history_link(row, rec)
             if step not in frontiers:
                 _warm_link(rec, None if step == 0 else history[step - 1])
-        identity = _history_identity(row, refs, width)
+        identity = _history_identity(row, refs, width, context)
         _require(type(row.get("record_digest")) is str and len(row["record_digest"]) == 64
             and all(c in "0123456789abcdef" for c in row["record_digest"])
             and identity["CE0"] == zero["CE0"], "History record descriptor missing")
@@ -454,6 +476,11 @@ def validate_core_resume(state, expected_config, context, folder=None):
             == work["physical_moment_forward_calls"] >= end + 1
         and work["adjoint_solves"] >= end and work["checkpoint_writes"] == len(snaps)
         and work["resume_writes"] >= len(snaps), "Actual optimizer/one-head/trajectory counts changed")
+    if "execution_backend" in refs:
+        from src.kernel_mean_row_tile_execution import validate_execution_state
+        validate_execution_state(state["execution_state"], context, end, work)
+        _require(_seal(state["execution_state"]) == _seal(current["execution_state"]),
+            "Current execution frontier differs from actual core work")
     pins = state["checkpoint_files_sha256"]
     _require(isinstance(pins, dict) and set(pins) == {f"step_{s:06d}.pt" for s in snaps}
         and state["state_digest"] == _seal({k: v for k, v in state.items() if k != "state_digest"}), "Resume/file/array seal changed")
@@ -475,15 +502,20 @@ def _write_state(value, path, exclusive=False):
 
 def optimize(z, q, assignment, initial_parameters, phi, folder, steps, options,
         context, checkpoint_steps=(0, 1, 25),
-        resume_state=None, stop=lambda: False):
+        resume_state=None, stop=lambda: False, execution=None):
     """One kernel-mean head and original native Adam; separate physical moments."""
     _int(steps); _require(callable(stop), "Stop must be callable")
+    if execution is not None:
+        from src.kernel_mean_row_tile_execution import RowTileExecution
+        _require(type(execution) is RowTileExecution, "Unrecognized kernel-mean execution provider")
     started = time.monotonic()
     def check():
+        if execution is not None:
+            execution.check()
         if stop() or time.monotonic() - started > 300:
             raise InterruptedError("Bounded kernel-mean invocation stopped; preserve last accepted prefix")
     check()
-    config = _validate_inputs(z, q, assignment, initial_parameters, phi, options, context)
+    config = _validate_inputs(z, q, assignment, initial_parameters, phi, options, context, execution)
     refs, _, basis = _context(context)
     _require(isinstance(checkpoint_steps, (list, tuple)) and all(type(s) is int and s >= 0 for s in checkpoint_steps), "Invalid checkpoint schedule")
     checkpoints, folder = {0, 1, steps, *checkpoint_steps}, Path(folder)
@@ -503,9 +535,13 @@ def optimize(z, q, assignment, initial_parameters, phi, folder, steps, options,
             json.dump(context, stream, indent=2, allow_nan=False)
     params = [p.detach().to(device=z.device).clone().requires_grad_() for p in initial_parameters]
     initial = _cpu(initial_parameters)
-    source_phi = _resident_phi(phi, z.device)
-    _matrix(source_phi, (len(z), basis), device=z.device)
-    material, physical_material = make_material(source_phi, q), make_material(z, q)
+    if execution is None:
+        source_phi = _resident_phi(phi, z.device)
+        _matrix(source_phi, (len(z), basis), device=z.device)
+        material, physical_material = make_material(source_phi, q), make_material(z, q)
+    else:
+        material = None
+        physical_material = make_material(z, q)
     adam = torch.optim.Adam(params, lr=options["lr"], eps=1e-12, foreach=False)
     work, attempts = dict.fromkeys(WORK_KEYS, 0), dict.fromkeys(ATTEMPT_KEYS, 0)
     snaps, history, frontiers, pins = {}, [], {}, {}
@@ -518,6 +554,8 @@ def optimize(z, q, assignment, initial_parameters, phi, folder, steps, options,
         start, CE0 = resume_state["step"], resume_state["CE0"]
         snaps, history, frontiers, pins = (dict(resume_state[k]) if k != "history" else list(resume_state[k]) for k in ("snapshots", "history", "frontiers", "checkpoint_files_sha256"))
         work, attempts = dict(resume_state["work"]), dict(resume_state["attempts"])
+        if execution is not None:
+            execution.restore(resume_state["execution_state"], start, work)
         parent, best = resume_state["current"], resume_state["best_record"]
         theta = parent["theta"].to(z.device)
         vector = None if parent["vector"] is None else parent["vector"].to(z.device)
@@ -540,7 +578,10 @@ def optimize(z, q, assignment, initial_parameters, phi, folder, steps, options,
                 parent_digest=None if parent is None else parent["record_digest"]))
             W = params[0]
             W.retain_grad()
-            M = call("moment_forward_calls", LowRankMoments.apply, W, params[1], assignment, material, .05, options["chunk_size"])
+            if execution is None:
+                M = call("moment_forward_calls", LowRankMoments.apply, W, params[1], assignment, material, .05, options["chunk_size"])
+            else:
+                M = call("moment_forward_calls", execution.critic_moments, W, params[1], assignment, q, step)
             centers, labels, mass = _decoded(M.detach(), basis)
             with torch.no_grad():
                 physical_M = call("physical_moment_forward_calls", LowRankMoments.apply,
@@ -560,7 +601,12 @@ def optimize(z, q, assignment, initial_parameters, phi, folder, steps, options,
                 cg_max_iter=options["cg_max_iter"], cg_check_interval=options.get("cg_check_interval", 1))
             theta, head = fit["theta"].detach(), _plain({k: v for k, v in fit.items() if k != "theta"})
             _require(head.get("inner_converged") is True and 0 <= head.get("inner_grad_max", math.inf) <= options["inner_tol"], "Kernel-mean stationary head failed")
-            check(); CE, rhs = outer_gradient(phi, q, theta, options["outer_chunk_size"]); _num(CE, positive=True)
+            check()
+            if execution is None:
+                CE, rhs = outer_gradient(phi, q, theta, options["outer_chunk_size"])
+            else:
+                CE, rhs = execution.outer(q, theta, step)
+            _num(CE, positive=True)
             if step == 0:
                 if CE0 is None:
                     CE0 = CE
@@ -583,6 +629,8 @@ def optimize(z, q, assignment, initial_parameters, phi, folder, steps, options,
                 vector=vector, vector_step=vector_step, parameters=params, initial_parameters=initial,
                 physical_moments=physical_M, effective_u=W, CE=CE, CE0=CE0, objective=objective, objective_name=OBJECTIVE,
                 J_exact=True, head_work=head, warm_before=warm, last_pullback=last_pullback))
+            if execution is not None:
+                record["execution_state"] = execution.checkpoint_state(step, work)
             record["record_digest"] = _seal(record)
             row.update(_record_link(record))
             if step in frontiers:
@@ -609,12 +657,16 @@ def optimize(z, q, assignment, initial_parameters, phi, folder, steps, options,
                     initial_physical_moments=snaps[0]["physical_moments"],
                     CE0=CE0, work=next_work, attempts=next_attempts, checkpoint_files_sha256=pins,
                     history_sha256=hashlib.sha256(csv_path.read_bytes()).hexdigest()))
+                if execution is not None:
+                    state["execution_state"] = json.loads(json.dumps(record["execution_state"], allow_nan=False))
                 state["state_digest"] = _seal(state)
                 validate_core_resume(state, config, context, folder)
                 call("resume_writes", _write_state, state, folder / "resume.pt")
             if step == steps:
                 check(); _files(refs["files_sha256"]); _files(refs["current_source"]["files"])
                 _require(_runtime(z.device) == refs["runtime"], "Runtime changed during invocation")
+                if execution is not None:
+                    execution.finish()
                 return state
             check()
             G = complete_moment_cotangent(M.detach(), basis, theta, vector, options["penalty"], CE0)
@@ -631,6 +683,18 @@ def optimize(z, q, assignment, initial_parameters, phi, folder, steps, options,
             error=str(error), elapsed_seconds=time.monotonic() - started, work=work, attempts=attempts,
             completed_returned_calls_only=True, interrupted_operation_interiors="unknown",
             qualification=False, no_retry_or_rescue=True)
+        if execution is not None:
+            raw_path = folder / "execution_failure_partial.pt"
+            failure["execution_partial"] = dict(path=str(raw_path), exists=False, bytes=0,
+                sha256=None, successful_resume=False)
+            try:
+                failure["execution_partial"]["sha256"] = _write_state(execution.failure_evidence(), raw_path, exclusive=True)
+            except BaseException as observation_error:
+                failure["execution_partial"]["observation_error"] = repr(observation_error)
+            finally:
+                failure["execution_partial"]["exists"] = raw_path.exists()
+                if raw_path.exists():
+                    failure["execution_partial"]["bytes"] = raw_path.stat().st_size
         try:
             with (folder / "failure.json").open("x") as stream:
                 json.dump(failure, stream, indent=2, allow_nan=False)
