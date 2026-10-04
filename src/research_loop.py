@@ -32,6 +32,9 @@ def implementation_provenance():
 
 def dispatch(job, stop):
     options = dict(job["options"])
+    if job["kind"] == "large_canonical_inductive_validation_v1":
+        from src.large_canonical_inductive_validation import run
+        return run(**options, stop=stop)
     if job["kind"] == "large_new_source_cold25_three_critic_v1":
         from src.large_new_source_cold25 import run
         return run(**options, stop=stop)
