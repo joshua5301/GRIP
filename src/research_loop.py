@@ -41,6 +41,9 @@ def dispatch(job, stop):
     if job["kind"] == "large_kernel_mean_row_tile":
         from src.large_kernel_mean_row_tile import run
         return run(**options, stop=stop)
+    if job["kind"] == "canonical_saved_NODE_P_raw_H_Q_six_export_preflight_v1":
+        from src.citation_canonical_P_export import run
+        return run(**options, stop=stop)
     if job["kind"] == "citation_kernel_mean_seed_capture":
         from src.citation_kernel_mean_seed_capture import run
         return run(**options, stop=stop)
