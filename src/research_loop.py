@@ -32,6 +32,9 @@ def implementation_provenance():
 
 def dispatch(job, stop):
     options = dict(job["options"])
+    if job["kind"] == "single_joint_mean_CE_native_qualification_and_continuation_v1":
+        from src.single_joint_mean_ce_native_qualification import run
+        return run(**options, stop=stop)
     if job["kind"] == "single_joint_mean_CE_cache_only_source_admission_capture_v1":
         from src.single_joint_mean_ce_source_capture import run
         return run(**options, stop=stop)
