@@ -13,6 +13,7 @@ from src.io import array_digest
 
 KIND = 'original_native_NODE_P0_direct_H_RMS_no_head_geometry_admission_v1'
 RAW_H = 'original_raw_H_centroid_moments_v1'
+_BUDGET_CELLS = {'cora35': 35, 'cora140': 140}
 LIMITS = dict(max_seconds=300, peak_allocated_bytes=4 * 1024**3, peak_reserved_bytes=6 * 1024**3)
 
 
@@ -61,7 +62,7 @@ def run(protocol_path, protocol_sha256, budget, stop=lambda: False):
     declaration = json.loads(Path(protocol_path).read_text()); B = declaration['budget_packets'][budget]
     _require(declaration['kind'] == KIND and declaration['geometry_resource_limits'] == LIMITS
         and declaration['geometry_absolute_bound'] == 1e-12 and B['dataset'] == 'cora'
-        and B['budget'] == 'cora35' and B['condensation_seed'] == 0
+        and B['budget'] in _BUDGET_CELLS and B['budget'] == budget and B['condensation_seed'] == 0
         and B['centroid_control_representation'] == RAW_H, 'Unknown prospective geometry domain')
     folder = Path(B['geometry_folder']); _require(not folder.exists(), 'Fresh geometry namespace required')
     folder.mkdir(parents=True); started = time.monotonic(); arrays = {}; progress = dict(schema=1, kind=KIND,
@@ -92,7 +93,7 @@ def run(protocol_path, protocol_sha256, budget, stop=lambda: False):
             'fixed_Cora_ROW35_70_140_original_source_material_linear_readout_certified'
             and any(parent.get('path') == certref['path'] and parent.get('sha256') == certref['sha256']
                 for parent in closure['parents']) and len(cases) == 1
-            and cases[0]['cells'] == 35 and cases[0]['reference_id'] == B['baseline_id']
+            and cases[0]['cells'] == _BUDGET_CELLS[budget] and cases[0]['reference_id'] == B['baseline_id']
             and cases[0]['recipe_id'] == B['recipe_id'] and cases[0]['source_P0_linear_certificate_passed'] is True
             and cases[0]['current_M0_bitwise_equal_cached_NODE0'] is True
             and cases[0]['actual_FP32_X_Q_F64_uniform_equal'] is True
