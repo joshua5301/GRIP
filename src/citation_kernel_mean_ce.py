@@ -43,7 +43,8 @@ def _assets(B):
 
 def _source_geometry_admission(packet, B, digest):
     ref = B['source_geometry_acceptance']
-    if isinstance(ref, dict) and ref.get('kind') == 'original_native_NODE_P0_direct_H_RMS_no_head_geometry_admission_v1':
+    if isinstance(ref, dict) and ref.get('kind') in ('original_native_NODE_P0_direct_H_RMS_no_head_geometry_admission_v1',
+            'original_AT_native_NODE_P0_direct_H_RMS_no_head_geometry_admission_v1'):
         from src.citation_kernel_mean_geometry import load_admission
         return load_admission(packet, B, digest)
     if isinstance(ref, dict) and ref.get('kind') == 'seed_specific_original_NODE_P0_direct_H_RMS_no_head_capture_v1':

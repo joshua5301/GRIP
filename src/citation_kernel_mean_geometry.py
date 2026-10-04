@@ -12,8 +12,9 @@ from src.citation_graph_factor import _json_write, _state_write, _original_paths
 from src.io import array_digest
 
 KIND = 'original_native_NODE_P0_direct_H_RMS_no_head_geometry_admission_v1'
+AT_KIND = 'original_AT_native_NODE_P0_direct_H_RMS_no_head_geometry_admission_v1'
 RAW_H = 'original_raw_H_centroid_moments_v1'
-_BUDGET_CELLS = {'cora35': 35, 'cora140': 140}
+_BUDGET_CELLS = {'cora35': 35, 'cora140': 140, 'citeseer30': 30}
 LIMITS = dict(max_seconds=300, peak_allocated_bytes=4 * 1024**3, peak_reserved_bytes=6 * 1024**3)
 
 
@@ -27,19 +28,49 @@ def _identity(value):
     return dict(shape=list(value.shape), dtype=str(value.dtype), tensor=array_digest(value.detach().cpu().numpy()))
 
 
+def _AT_origin(packet, B):
+    """Consume literal accepted AT metadata; no fabricated BB compatibility fields."""
+    refs = [B['original_AT_certificate'],B['original_AT_closure']]
+    _require(all(packet['readonly_files_sha256'].get(r['path']) == r['sha256'] for r in refs), 'AT evidence unpinned')
+    cert,closure = [json.loads(Path(r['path']).read_text()) for r in refs]
+    root = B['original_AT_root']; old = cert['roots'][root]; summary = closure['summary'][root]
+    scope = closure['qualification_scope']
+    _require(root == 'ca115f4751a1' and old['cells'] == 30 and old['source_root'] == B['family_root']
+        and cert['passed'] is True and old['source_P0_linear_certificate_passed'] is True
+        and old['reference']['manual_current_native_baseline_U0_V0_exact'] is True
+        and old['reference']['actual_FP32_P0_X_Q_uniform_equal_reference'] is True
+        and closure['source_certificate_integrity_accepted'] is True
+        and closure['original_source_P0_cached_NODE_certificates_qualified'] is True
+        and closure['evidence'] == refs[0] and closure['source_assets_unchanged'] is True
+        and scope['dataset'] == 'citeseer' and scope['citation_features'] == 'row' and scope['cells'] == [30,120]
+        and type(scope['condensation_seed']) is int and type(B['condensation_seed']) is int
+        and scope['condensation_seed'] == B['condensation_seed'] == 0
+        and scope['reference_candidate_id'] == B['baseline_id'] == 'a2d47970c967'
+        and scope['future_separately_preregistered_fixed_experiments_only'] is True
+        and summary['cells'] == 30 and summary['original_source_P0_linear_certificates_passed'] is True
+        and summary['actual_FP32_P0_X_Q_and_supplied_FP64_uniform_weights_equal_reference'] is True
+        and summary['original_cached_linear_certificates'] == old['reference']['original_linear_certificates']
+        and summary['P0_input_digest'] == old['reference']['input_digest'], 'Original AT admission differs')
+    return old
+
+
 def load_admission(packet, B, digest):
     ref = B['source_geometry_acceptance']
-    _require(ref['kind'] == KIND and packet['readonly_files_sha256'].get(ref['path']) == ref['sha256'],
+    accepted_kind = ref['kind']; origin_name = 'AT' if accepted_kind == AT_KIND else 'BB'
+    _require(accepted_kind in (KIND,AT_KIND) and packet['readonly_files_sha256'].get(ref['path']) == ref['sha256'],
         'Typed new geometry admission is unpinned')
     report = json.loads(Path(ref['path']).read_text())
     error = report['affine_inverse_vs_direct_H_centroid_max_absolute']
-    _require(report['kind'] == KIND and report['passed'] is True and report['budget'] == B['budget']
+    _require(report['kind'] == accepted_kind and report['passed'] is True and report['budget'] == B['budget']
         and report['source'] == packet['source'] and report['native_data_digest'] == digest
         and type(error) in (int, float) and math.isfinite(error) and 0 <= error <= 1e-12
         and report['source_geometry_checked_before_any_candidate_head_or_P_update'] is True
-        and report['original_BB_P0_and_serving_metadata_matched'] is True
+        and report[f'original_{origin_name}_P0_and_serving_metadata_matched'] is True
         and report['raw_H_centroid_P0_serving_exact_original_physical_P0'] is True,
         'New no-head source/readout geometry admission failed')
+    if accepted_kind == AT_KIND:
+        _require(report['original_AT_certificate_and_closure'] == dict(
+            certificate=B['original_AT_certificate'],closure=B['original_AT_closure']), 'AT acceptance refs changed')
     _require(report['original_files_sha256'] == packet['original_files_sha256']
         and {str(p) for p in _original_paths(B)} <= set(report['original_files_sha256'])
         and all(packet['readonly_files_sha256'].get(path) == pin
@@ -60,12 +91,15 @@ def run(protocol_path, protocol_sha256, budget, stop=lambda: False):
 
     _require(_sha(protocol_path) == protocol_sha256, 'Geometry protocol bytes changed')
     declaration = json.loads(Path(protocol_path).read_text()); B = declaration['budget_packets'][budget]
-    _require(declaration['kind'] == KIND and declaration['geometry_resource_limits'] == LIMITS
-        and declaration['geometry_absolute_bound'] == 1e-12 and B['dataset'] == 'cora'
+    kind = declaration['kind']; at = kind == AT_KIND
+    _require(((kind == KIND and B['dataset'] == 'cora' and budget in ('cora35','cora140'))
+        or (at and B['dataset'] == 'citeseer' and budget == 'citeseer30'))
+        and declaration['geometry_resource_limits'] == LIMITS
+        and declaration['geometry_absolute_bound'] == 1e-12
         and B['budget'] in _BUDGET_CELLS and B['budget'] == budget and B['condensation_seed'] == 0
         and B['centroid_control_representation'] == RAW_H, 'Unknown prospective geometry domain')
     folder = Path(B['geometry_folder']); _require(not folder.exists(), 'Fresh geometry namespace required')
-    folder.mkdir(parents=True); started = time.monotonic(); arrays = {}; progress = dict(schema=1, kind=KIND,
+    folder.mkdir(parents=True); started = time.monotonic(); arrays = {}; progress = dict(schema=1, kind=kind,
         budget=budget, source=declaration['source'], protocol=dict(path=str(protocol_path), sha256=protocol_sha256),
         passed=False, old_head_or_FD_replays=0, head_solves=0, P_updates=0, optimizer_steps=0, student_fits=0,
         native_factor_generations=0, teacher_map_Phi_fits=0, original_M0_remomentizations=0,
@@ -83,24 +117,29 @@ def run(protocol_path, protocol_sha256, budget, stop=lambda: False):
     try:
         torch.cuda.init(); torch.cuda.reset_peak_memory_stats(); guard()
         packet, B, _, _, _, h, z, q, assignment, transform, options, digest = _source(protocol_path, budget, guard)
-        certref = B['original_BB_certificate']; closeref = B['original_BB_closure']
-        _require(all(packet['readonly_files_sha256'].get(r['path']) == r['sha256'] for r in (certref, closeref)),
-            'Original accepted BB certificate/closure unpinned')
-        cert = json.loads(Path(certref['path']).read_text()); old = cert['roots'][B['original_BB_root']]
-        closure = json.loads(Path(closeref['path']).read_text())
-        cases = [case for case in closure['per_case'] if case['root'] == B['original_BB_root']]
-        _require(closure['passed'] is True and closure['classification'] ==
-            'fixed_Cora_ROW35_70_140_original_source_material_linear_readout_certified'
-            and any(parent.get('path') == certref['path'] and parent.get('sha256') == certref['sha256']
-                for parent in closure['parents']) and len(cases) == 1
-            and cases[0]['cells'] == _BUDGET_CELLS[budget] and cases[0]['reference_id'] == B['baseline_id']
-            and cases[0]['recipe_id'] == B['recipe_id'] and cases[0]['source_P0_linear_certificate_passed'] is True
-            and cases[0]['current_M0_bitwise_equal_cached_NODE0'] is True
-            and cases[0]['actual_FP32_X_Q_F64_uniform_equal'] is True
-            and cases[0]['original_source_context'] == old['source_context'], 'BB root acceptance closure differs')
-        _require(cert['passed'] is True and old['passed'] is True and old['source_P0_linear_certificate_passed'] is True
-            and old['reference']['current_native_M0_bitwise_equal_cached_NODE0'] is True
-            and old['reference']['actual_FP32_P0_X_Q_uniform_equal_reference'] is True, 'BB source/P0 not accepted')
+        if at:
+            old = _AT_origin(packet, B)
+            progress['original_AT_certificate_and_closure'] = dict(
+                certificate=B['original_AT_certificate'],closure=B['original_AT_closure'])
+        else:
+            certref = B['original_BB_certificate']; closeref = B['original_BB_closure']
+            _require(all(packet['readonly_files_sha256'].get(r['path']) == r['sha256'] for r in (certref, closeref)),
+                'Original accepted BB certificate/closure unpinned')
+            cert = json.loads(Path(certref['path']).read_text()); old = cert['roots'][B['original_BB_root']]
+            closure = json.loads(Path(closeref['path']).read_text())
+            cases = [case for case in closure['per_case'] if case['root'] == B['original_BB_root']]
+            _require(closure['passed'] is True and closure['classification'] ==
+                'fixed_Cora_ROW35_70_140_original_source_material_linear_readout_certified'
+                and any(parent.get('path') == certref['path'] and parent.get('sha256') == certref['sha256']
+                    for parent in closure['parents']) and len(cases) == 1
+                and cases[0]['cells'] == _BUDGET_CELLS[budget] and cases[0]['reference_id'] == B['baseline_id']
+                and cases[0]['recipe_id'] == B['recipe_id'] and cases[0]['source_P0_linear_certificate_passed'] is True
+                and cases[0]['current_M0_bitwise_equal_cached_NODE0'] is True
+                and cases[0]['actual_FP32_X_Q_F64_uniform_equal'] is True
+                and cases[0]['original_source_context'] == old['source_context'], 'BB root acceptance closure differs')
+            _require(cert['passed'] is True and old['passed'] is True and old['source_P0_linear_certificate_passed'] is True
+                and old['reference']['current_native_M0_bitwise_equal_cached_NODE0'] is True
+                and old['reference']['actual_FP32_P0_X_Q_uniform_equal_reference'] is True, 'BB source/P0 not accepted')
         _require(all(packet['readonly_files_sha256'].get(str(Path(B['family_root']) / name)) == pin
             for name, pin in old['source_context']['assets'].items()), 'BB source asset bytes differ')
         _, initial, _ = _native_parameters(packet, B, z, assignment, options, digest)
@@ -118,7 +157,7 @@ def run(protocol_path, protocol_sha256, budget, stop=lambda: False):
         arrays.update(original_physical_X=x.detach().cpu().clone(), original_physical_Q=y.detach().cpu().clone(),
             original_uniform_weights=weights.detach().cpu().clone())
         _require([_identity(v) for v in (x, y, weights)] == old['reference']['student_inputs'], 'Original P0 serving changed')
-        progress['original_BB_P0_and_serving_metadata_matched'] = True
+        progress['original_AT_P0_and_serving_metadata_matched' if at else 'original_BB_P0_and_serving_metadata_matched'] = True
         cpu0 = B['centroid_Nystrom_checkpoint0']; _require(packet['readonly_files_sha256'].get(cpu0['path']) == cpu0['sha256'], 'Raw-H control P0 unpinned')
         raw = torch.load(cpu0['path'], map_location=z.device, weights_only=False)
         _require(type(raw['step']) is int and raw['step'] == 0, 'Raw-H control initial step differs')
