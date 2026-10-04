@@ -584,8 +584,43 @@ def optimize_ce_assignment(
                                    "graph_assignment_kl_sha256", "graph_assignment_kl_context",
                                    "kernel_commutation_mode", "kernel_commutation_context", "kernel_commutation_inputs",
                                    "conditional_label_entropy_mode", "conditional_label_entropy_context",
-                                   "soft_cell_mass_KL_mode", "soft_cell_mass_KL_context"}:
+                                   "soft_cell_mass_KL_mode", "soft_cell_mass_KL_context",
+                                   "graph_factor_mode", "graph_factor_artifact",
+                                   "graph_factor_sha256", "graph_factor_context"}:
         raise ValueError("Unknown MLP initial-mass control")
+    # Parse after the original locals-derived config: inactive calls keep their
+    # original signature, config, factor factory and numerical path.
+    graph_factor_mode = mlp_initial_options.get("graph_factor_mode")
+    graph_factor_active = graph_factor_mode is not None
+    graph_factor_artifact = mlp_initial_options.get("graph_factor_artifact")
+    graph_factor_sha256 = mlp_initial_options.get("graph_factor_sha256")
+    graph_factor_context = mlp_initial_options.get("graph_factor_context")
+    if graph_factor_active:
+        from src.graph_factor_context import MODE as graph_mode
+        graph_keys = {"graph_factor_mode", "graph_factor_artifact",
+                      "graph_factor_sha256", "graph_factor_context"}
+        if (set(mlp_initial_options) - graph_keys or graph_factor_mode != graph_mode
+                or torch.get_default_dtype() != torch.float32
+                or assignment_input != "node" or assignment_encoder != "linear"
+                or type(assignment_rank) is not int or assignment_rank < 1
+                or mass_mode != "free" or inner_loss_weighting != "uniform"
+                or solver_mode != "exact" or inner_method != "newton_first"
+                or implicit_warm_start is not True or node_weighting
+                or temperature_logits is not None or outer_targets is not None
+                or outer_indices is not None or implicit_solver is not None
+                or inner_solver is not None or cache_assignment or save_assignment
+                or not save_resume or mixing != .05
+                or not isinstance(graph_factor_artifact, str)
+                or not isinstance(graph_factor_sha256, str)
+                or not isinstance(graph_factor_context, dict)):
+            raise ValueError("Graph factors require unchanged original NODE/free/uniform exact CE")
+        resume_config.update(graph_factor_mode=graph_factor_mode,
+                             graph_factor_artifact=graph_factor_artifact,
+                             graph_factor_sha256=graph_factor_sha256,
+                             graph_factor_context=graph_factor_context)
+    elif any(value is not None for value in (graph_factor_artifact, graph_factor_sha256,
+                                             graph_factor_context)):
+        raise ValueError("Graph factor provenance requires its explicit mode")
     mlp_initial_mass_schema = mlp_initial_options.get("mlp_initial_mass_schema")
     mlp_initial_mass_source = mlp_initial_options.get("mlp_initial_mass_source")
     centering_mode = mlp_initial_options.get("mlp_output_centering")
@@ -907,7 +942,7 @@ def optimize_ce_assignment(
         raise ValueError("Checkpoint steps must be integers within the optimization budget")
     if checkpoints or mass_mode == "initial" or centered_active or source_linear_active or row_kl_active or node_factor_active:
         checkpoints.update((0, steps))
-    if graph_kl_active or commutation_active or entropy_active or soft_mass_active:
+    if graph_kl_active or commutation_active or entropy_active or soft_mass_active or graph_factor_active:
         checkpoints.update((0, steps))
     snapshots = {}
     _check_assignment_stop(stop)
@@ -919,7 +954,26 @@ def optimize_ce_assignment(
         raise ValueError("Outer loss requires at least one node")
     full_features = augmented(outer_z)
     clusters = int(assignment.max()) + 1
-    if source_linear_active:
+    if graph_factor_active:
+        from src.graph_factor_context import load_frozen_graph, validate_context_and_resume
+        from src.graph_factor_context import attach_snapshot as attach_graph_snapshot
+        from src.graph_factor_context import attach_resume as attach_graph_resume
+        from src.graph_factor import GraphProduct
+        graph_loaded = load_frozen_graph(
+            graph_factor_artifact, graph_factor_sha256,
+            dict(nodes=len(z), cells=clusters, rank=assignment_rank,
+                 dimension=z.shape[1], classes=q.shape[1]), z.device, graph_factor_context)
+        graph_operator = graph_loaded["operator"]
+        u, v = [p.detach().clone().requires_grad_() for p in graph_loaded["initial_parameters"]]
+        parameters = [u, v]
+        graph_factor_initial = validate_context_and_resume(
+            z, q, assignment, parameters, graph_operator, graph_factor_context, resume_config,
+            steps, resume_state=resume_state, folder=folder)
+        graph_factor_best_parameters = (None if resume_state is None else
+                                       cpu_state(resume_state["graph_factor_best_parameters"]))
+        graph_factor_pullback = (None if resume_state is None else
+                                cpu_state(resume_state["graph_factor_last_pullback"]))
+    elif source_linear_active:
         from src.source_linear_assignment import original_context as linear_context
         from src.source_linear_assignment import validate_resume as validate_linear_resume
         source_context, source_initial = linear_context(
@@ -1224,6 +1278,10 @@ def optimize_ce_assignment(
         elif row_kl_active:
             moments, row_kl = InitialAssignmentKLMoments.apply(
                 u, v, assignment, material, mixing, chunk_size, row_kl_reference["log_probability"])
+        elif graph_factor_active:
+            effective_u = GraphProduct.apply(u, graph_operator)
+            effective_u.retain_grad()
+            moments = LowRankMoments.apply(effective_u, v, assignment, material, mixing, chunk_size)
         elif assignment_rank is not None:
             operation = CachedLowRankMoments if cache_assignment else LowRankMoments
             moments = operation.apply(u, v, assignment, material, mixing, chunk_size)
@@ -1421,9 +1479,17 @@ def optimize_ce_assignment(
                 row.update(assignment_kl_scale=scale, normalized_objective=objective / scale)
             if graph_kl_active:
                 row.update(graph_assignment_kl_scale=scale, normalized_objective=objective / scale)
+            if graph_factor_active:
+                if (not np.isfinite(scale) or scale <= 1e-12
+                        or scale != graph_factor_context["native_origin"]["teacher_ce"]):
+                    raise ValueError("Graph factors changed the original positive CE0 scale")
+                row.update(normalized_objective=value / scale,
+                           objective_name="original_teacher_CE_over_original_positive_CE0")
             if fitted["inner_converged"] and objective < best:
                 best, best_step = (objective, step)
                 best_moments, best_theta = (moments.detach().cpu(), theta.cpu())
+                if graph_factor_active:
+                    graph_factor_best_parameters = cpu_state(parameters)
                 if save_assignment:
                     best_parameters = [parameter.detach().clone() for parameter in parameters]
                     best_dual = dual.clone() if dual is not None else None
@@ -1565,6 +1631,9 @@ def optimize_ce_assignment(
             if soft_mass_active:
                 attach_soft_mass_snapshot(snapshot, soft_mass_context, resume_config, parameters,
                                         soft_mass_CE0, soft_mass_Omega0, soft_mass_value, objective)
+            if graph_factor_active:
+                attach_graph_snapshot(snapshot, graph_factor_context, resume_config, parameters,
+                                      effective_u, graph_operator, scale, pullback=graph_factor_pullback)
             snapshots[step] = snapshot
             if folder is not None:
                 checkpoint_dir = folder / "checkpoints"
@@ -1617,6 +1686,10 @@ def optimize_ce_assignment(
                 attach_entropy_resume(state, entropy_context, entropy_initial, entropy_CE0, entropy_E0)
             if soft_mass_active:
                 attach_soft_mass_resume(state, soft_mass_context, soft_mass_initial, soft_mass_CE0, soft_mass_Omega0)
+            if graph_factor_active:
+                attach_graph_resume(state, graph_factor_context, graph_factor_initial,
+                                    graph_factor_best_parameters, graph_operator,
+                                    pullback=graph_factor_pullback)
             if folder is not None:
                 torch.save(state, folder / "resume.tmp.pt")
                 (folder / "resume.tmp.pt").replace(folder / "resume.pt")
@@ -1671,6 +1744,14 @@ def optimize_ce_assignment(
             raise FloatingPointError("Missing or nonfinite CE/entropy native factor gradient")
         if soft_mass_active and any(p.grad is None or not bool(torch.isfinite(p.grad).all()) for p in parameters):
             raise FloatingPointError("Missing or nonfinite CE/soft cell mass KL native factor gradient")
+        if graph_factor_active:
+            gradients = (effective_u.grad, u.grad, v.grad)
+            if any(gradient is None or gradient.dtype != torch.float32
+                   or gradient.device != parameter.device or gradient.shape != parameter.shape
+                   or not bool(torch.isfinite(gradient).all())
+                   for gradient, parameter in zip(gradients, (effective_u, u, v), strict=True)):
+                raise FloatingPointError("Missing or nonfinite graph-factor native gradient")
+            graph_factor_pullback = cpu_state(dict(step=step, gW=effective_u.grad, gU=u.grad, gV=v.grad))
         if temperature_logits is not None:
             if log_temperature.grad is None or not bool(torch.isfinite(log_temperature.grad)):
                 raise FloatingPointError("Missing or nonfinite temperature gradient")
@@ -1722,6 +1803,10 @@ def optimize_ce_assignment(
                       objective_name="teacher_CE_plus_source_row_KL_current_to_initial")
     if node_factor_active:
         result.update(node_factor_mode=node_factor_mode, node_factor_context=node_factor_context)
+    if graph_factor_active:
+        result.update(graph_factor_mode=graph_factor_mode, graph_factor_context=cpu_state(graph_factor_context),
+                      graph_factor_last_pullback=cpu_state(graph_factor_pullback),
+                      objective_name="original_teacher_CE_over_original_positive_CE0")
     if graph_kl_active:
         result.update(graph_assignment_kl_context=graph_kl_context,
                       objective_name="teacher_CE_plus_KL_current_to_frozen_graph_diffused_P0")
