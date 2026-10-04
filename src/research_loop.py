@@ -32,6 +32,9 @@ def implementation_provenance():
 
 def dispatch(job, stop):
     options = dict(job["options"])
+    if job["kind"] == "large_kernel_mean_new_source_capture_v1":
+        from src.large_kernel_mean_source_capture import run
+        return run(**options, stop=stop)
     if job["kind"] == "large_kernel_mean_validation":
         from src.large_kernel_mean_validation import run
         return run(**options, stop=stop)
