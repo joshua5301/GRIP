@@ -32,6 +32,9 @@ def implementation_provenance():
 
 def dispatch(job, stop):
     options = dict(job["options"])
+    if job["kind"] == "large_kernel_mean_row_tile":
+        from src.large_kernel_mean_row_tile import run
+        return run(**options, stop=stop)
     if job["kind"] == "citation_kernel_mean_ce":
         from src.citation_kernel_mean_ce import run
         return run(**options, stop=stop)
