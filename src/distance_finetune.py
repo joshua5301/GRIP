@@ -97,6 +97,23 @@ def factorized_moment_cost(z, q, assignment, weight, chunk_size=2048):
     return left / scale, right, float(scale)
 
 
+@torch.no_grad()
+def factorized_feature_distance(z, assignment, chunk_size=2048):
+    cells = int(assignment.max()) + 1
+    counts = torch.bincount(assignment, minlength=cells).to(z)
+    if cells < 2 or bool((counts == 0).any()):
+        raise ValueError("Feature distance requires at least two nonempty cells")
+    centers = z.new_zeros(cells, z.shape[1]).index_add_(0, assignment, z) / counts[:, None]
+    left = torch.cat((2 * z, z.new_ones(len(z), 1)), 1)
+    right = torch.cat((centers, -centers.square().sum(1, keepdim=True)), 1)
+    right -= right.mean(0)
+    gaps = torch.cat([(block @ right.T).topk(2).values.diff(dim=1).neg().flatten()
+                      for block in left.split(chunk_size)])
+    positive = gaps[gaps > 0]
+    scale = positive.median() if len(positive) else z.new_tensor(1.)
+    return left / scale, right, float(scale)
+
+
 def evaluation_splits(graph, train, validation, testing):
     splits = dict(train=(graph, train), val=validation, test=testing)
     return splits if validation[0] is not graph else {name: split[1] for name, split in splits.items()}
@@ -138,11 +155,15 @@ def run_distance_finetune(source, output_dir, ranks=(4, 8, 16), taus=(0.1, 0.3, 
     config = json.loads((source / "config.json").read_text())
     selected = json.loads((source / "selected.json").read_text())
     gcn_moment = config.get("mode") == "filtered_batch" and config.get("seeding") == "feature_var" and "settings" in config
-    if gcn_moment:
+    gcn_kmeans = config.get("partition_method") == "kmeans" and "settings" in config
+    gcn_source = gcn_moment or gcn_kmeans
+    if gcn_kmeans and float(selected["lambda"]) != 0:
+        raise ValueError("Feature-only source must have zero label/moment weight")
+    if gcn_source:
         config = dict(config, condensation_seeds=[0], student=config["settings"])
     if config["dataset"] not in ("cora", "citeseer", "flickr", "reddit", "arxiv") or config["condensation_seeds"] != [0]:
         raise ValueError("Use a supported single deterministic partition source")
-    if not gcn_moment and config.get("method") != "moment_lloyd_normalized_variance":
+    if not gcn_source and config.get("method") != "moment_lloyd_normalized_variance":
         raise ValueError("Use a normalized-variance stage-one partition")
     if not all(0 <= step <= steps for step in checkpoints):
         raise ValueError("Checkpoints must fit the step budget")
@@ -156,12 +177,12 @@ def run_distance_finetune(source, output_dir, ranks=(4, 8, 16), taus=(0.1, 0.3, 
         raise ValueError("Data differ from the stage-one run")
     masks = evaluation_splits(graph, train, validation, testing)
     h = torch.load(source / "features.pt", map_location=device, weights_only=True).double()
-    teacher_path = source / "teacher.pt" if gcn_moment else source / "teachers" / f"{_fingerprint(dict(gamma=selected['gamma']))}.pt"
+    teacher_path = source / "teacher.pt" if gcn_source else source / "teachers" / f"{_fingerprint(dict(gamma=selected['gamma']))}.pt"
     teacher = torch.load(teacher_path, map_location=device, weights_only=True)
     q = (teacher["logits"] / selected["T"]).softmax(1).double()
     del teacher
     original_folder = source / f"candidate_{int(selected['candidate']):04d}"
-    original = torch.load(original_folder / ("partition.pt" if gcn_moment else "seed_0/partition.pt"),
+    original = torch.load(original_folder / ("partition.pt" if gcn_source else "seed_0/partition.pt"),
                           map_location="cpu", weights_only=False)
     assignment = original["assignment"].to(device)
     offset = h.mean(0)
@@ -176,9 +197,10 @@ def run_distance_finetune(source, output_dir, ranks=(4, 8, 16), taus=(0.1, 0.3, 
         labels = q.new_zeros(config["nodes"], q.shape[1]).index_add_(0, assignment, q) / counts[:, None]
         original = dict(assignment=assignment.cpu(), x=(centers * scale + offset).float().cpu(),
                         y=labels.float().cpu())
-    factorized = gcn_moment or config["dataset"] in ("arxiv", "flickr", "reddit")
+    factorized = gcn_source or config["dataset"] in ("arxiv", "flickr", "reddit")
     if factorized:
         left, right, distance_scale = (
+            factorized_feature_distance(z, assignment) if gcn_kmeans else
             factorized_moment_cost(z, q, assignment, selected["lambda"])
             if gcn_moment else factorized_distance(h, q, assignment, selected["lambda"])
         )
@@ -193,7 +215,8 @@ def run_distance_finetune(source, output_dir, ranks=(4, 8, 16), taus=(0.1, 0.3, 
                     taus=list(taus), penalties=list(penalties), steps=steps, checkpoints=checkpoints, lr=lr,
                     inner_loss_weighting=inner_loss_weighting, distance_scale=distance_scale, code=code,
                     cg_max_iter=2048, cg_rtol=cg_rtol, inner_tol=inner_tol,
-                    base_cost="moment_linearization" if gcn_moment else "normalized_variance_distance",
+                    base_cost="feature_squared_distance" if gcn_kmeans else
+                    "moment_linearization" if gcn_moment else "normalized_variance_distance",
                     inner_method="newton_first", methods=list(methods),
                     continue_on_error=continue_on_error, initialization=initialization,
                     initialization_seed=initialization_seed)

@@ -5,6 +5,7 @@ from src.distance_finetune import (
     distance_logits,
     evaluation_splits,
     factorized_distance,
+    factorized_feature_distance,
     factorized_moment_cost,
     factorized_svd,
     initialization_assignment,
@@ -23,6 +24,17 @@ def test_random_initialization_is_reproducible_nonempty_and_seeded():
     assert not torch.equal(a, initialization_assignment(z, 7, "random", 1))
     counts = torch.bincount(a)
     assert len(counts) == 7 and int(counts.max() - counts.min()) == 1
+
+
+def test_feature_distance_matches_squared_euclidean_softmax():
+    generator = torch.Generator().manual_seed(5)
+    z = torch.randn(19, 4, generator=generator, dtype=torch.float64)
+    assignment = torch.arange(19) % 3
+    centers = torch.stack([z[assignment == j].mean(0) for j in range(3)])
+    distance = (z[:, None] - centers[None]).square().sum(2)
+    left, right, scale = factorized_feature_distance(z, assignment, chunk_size=5)
+    torch.testing.assert_close(left @ right.T, -(distance - distance.mean(1, keepdim=True)) / scale)
+    torch.testing.assert_close((left @ right.T).softmax(1), (-distance / scale).softmax(1))
 
 
 def test_moment_cost_factors_match_direct_assignment_derivative():
