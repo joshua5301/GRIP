@@ -35,6 +35,9 @@ def dispatch(job, stop):
     if job["kind"] == "large_source_reuse_cold25_three_critic_v1":
         from src.large_source_reuse_cold25 import run
         return run(**options, stop=stop)
+    if job["kind"] == "large_kernel_mean_source_reuse_capture446_v1":
+        from src.large_kernel_mean_source_reuse_capture446 import run
+        return run(**options, stop=stop)
     if job["kind"] == "large_kernel_mean_source_reuse_capture_v1":
         from src.large_kernel_mean_source_reuse_capture import run
         return run(**options, stop=stop)
