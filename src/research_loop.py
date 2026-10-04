@@ -32,6 +32,9 @@ def implementation_provenance():
 
 def dispatch(job, stop):
     options = dict(job["options"])
+    if job["kind"] == "joint_inner_physical_only_source_outer_native_qualification_and_continuation_v1":
+        from src.joint_physical_only_source_outer_native_qualification import run
+        return run(**options, stop=stop)
     if job["kind"] == "centered_trace_joint_common_RMS_inverse_physical_five_arm_validation_v1":
         from src.centered_trace_joint_common_physical_serving import run
         return run(**options, stop=stop)
