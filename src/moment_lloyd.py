@@ -124,6 +124,9 @@ def moment_lloyd_partition(
     seeding="feature",
     greedy_trials=4,
 ):
+    raw_variance = mode == "raw_variance"
+    if raw_variance:
+        mode = "variance_sum"
     if mode not in ("hybrid", "full_only", "filtered_batch", "variance", "normalized_variance", "variance_sum", "kl") or not 1 <= m <= len(H):
         raise ValueError("Invalid mode or cell count")
     if not math.isfinite(moment_weight) or moment_weight < 0 or max_sweeps < 0 or block_size < 1:
@@ -136,7 +139,7 @@ def moment_lloyd_partition(
     x, q = H.detach().double(), Q.detach().double()
     offset = x.mean(0)
     x = x - offset
-    scale = x.square().sum(1).mean().sqrt().clamp_min(1e-30)
+    scale = x.new_tensor(1.0) if raw_variance else x.square().sum(1).mean().sqrt().clamp_min(1e-30)
     x = x / scale
     energy, original = x.square().sum(1).mean(), x.T @ q / len(x)
     hierarchical = {"bound_pca": "pca", "bound_var": "var", "bound_pca_sse": "pca_sse", "feature_var": "var"}
@@ -325,7 +328,7 @@ def moment_lloyd_partition(
         sweeps=len(records),
         converged=converged,
         status=status,
-        mode=mode,
+        mode="raw_variance" if raw_variance else mode,
         seconds=perf_counter() - started,
         seed=seed,
         moment_weight=moment_weight,

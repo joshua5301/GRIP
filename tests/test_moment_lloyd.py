@@ -66,6 +66,31 @@ def test_variance_sum_without_label_normalization():
     assert result["converged"]
 
 
+def test_raw_variance_uses_original_feature_units():
+    x, q, _ = example()
+    x = 7 * x + 3
+    weight = 0.7
+    result = module.moment_lloyd_partition(
+        x, q, 3, mode="raw_variance", seeding="bound_var", moment_weight=weight, max_sweeps=300,
+    )
+    assignment = result["assignment"]
+    cx = torch.stack([x[assignment == j].mean(0) for j in range(3)])
+    cq = torch.stack([q[assignment == j].mean(0) for j in range(3)])
+    expected = (x - cx[assignment]).square().sum(1).mean()
+    expected += weight * (q - cq[assignment]).square().sum(1).mean()
+    assert result["J"] == pytest.approx(float(expected), abs=1e-9)
+    assert torch.allclose(result["x"].double(), cx, atol=1e-6)
+    assert result["mode"] == "raw_variance"
+    gx = (x - x.mean(0)).square().sum(1).mean()
+    gq = (q - q.mean(0)).square().sum(1).mean()
+    normalized = module.moment_lloyd_partition(
+        x, q, 3, mode="normalized_variance", seeding="bound_var",
+        moment_weight=float(weight * gq / gx), max_sweeps=300,
+    )
+    assert torch.equal(assignment, normalized["assignment"])
+    assert result["J"] == pytest.approx(normalized["J"] * float(gx), abs=1e-9)
+
+
 def test_exact_move_matches_reaggregation():
     x, q, assignment = example()
     energy, original = x.square().sum(1).mean(), x.T @ q / len(x)

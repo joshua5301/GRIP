@@ -173,7 +173,7 @@ def run_risk_sweep(
 ):
     if teacher_selection not in ("grid", "validation_ce", "accuracy_only", "accuracy_then_ce", "calibrated_ce"):
         raise ValueError("Use grid or validation_ce teacher selection")
-    lloyd = method in ("moment_lloyd_hybrid", "moment_lloyd_full_only", "moment_lloyd_filtered_batch", "moment_lloyd_variance", "moment_lloyd_normalized_variance", "moment_lloyd_kl")
+    lloyd = method in ("moment_lloyd_hybrid", "moment_lloyd_full_only", "moment_lloyd_filtered_batch", "moment_lloyd_variance", "moment_lloyd_normalized_variance", "moment_lloyd_raw_variance", "moment_lloyd_kl")
     if method not in ("variance_moment", "variance_kl", "variance_moment_low_rank") and not lloyd:
         raise ValueError("Unknown partition method")
     if (dataset, ratio) not in BUDGET:
@@ -327,6 +327,9 @@ def run_risk_sweep(
     if method == "moment_lloyd_normalized_variance":
         config["objective"] = "feature_variance / global_feature_variance + alpha * label_variance / global_label_variance"
         config["coefficient"] = "lambda grid stores alpha; global variances fixed before clustering; zero-variance terms omitted"
+    if method == "moment_lloyd_raw_variance":
+        config["objective"] = "raw propagated feature variance + lambda * label variance"
+        config["coefficient"] = "lambda is absolute; no feature RMS or label variance normalization"
     if method == "variance_moment_low_rank":
         config["assignment"] = dict(
             rank=space.get("rank", assignment_rank),

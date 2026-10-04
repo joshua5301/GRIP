@@ -1,5 +1,12 @@
 # Normalized variance sum
 
+Use `method="moment_lloyd_raw_variance"` for the control objective
+`Vx + lambda * Vq` in original propagated-feature units. This also disables
+the internal feature RMS normalization; centering alone preserves distances.
+Var-Part seeding uses `[x, sqrt(lambda) * (q - mean(q))]`. A normalized
+setting at a fixed temperature has equivalent raw coefficient
+`lambda = alpha * Gx / Gq`, with both global variances measured in original units.
+
 For centered propagated features x and teacher probabilities q, freeze global
 variances Gx and Gq before partitioning. Minimize Vx/Gx + alpha Vq/Gq through
 Var-Part initialization and Lloyd assignment/mean updates in the joint space
