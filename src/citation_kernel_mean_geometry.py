@@ -171,3 +171,46 @@ def run(protocol_path, protocol_sha256, budget, stop=lambda: False):
     if error is not None:
         raise RuntimeError('Terminal original source-geometry admission failure; preserve evidence') from error
     return progress
+
+
+def load_seed_admission(packet, B, digest):
+    """Admit the actual new seed capture and its cold matched controls by pins."""
+    from src.citation_kernel_mean_seed_capture import KIND as seed_kind
+
+    ref = B['source_geometry_acceptance']
+    _require(ref['kind'] == seed_kind and {k:ref[k] for k in ('path','sha256')} == B['passed_capture_report']
+        and packet['readonly_files_sha256'].get(ref['path']) == ref['sha256'], 'Fresh seed geometry report unpinned')
+    report = json.loads(Path(ref['path']).read_text()); error = report['affine_inverse_vs_direct_H_centroid_max_absolute']
+    _require(report['kind'] == seed_kind and report['passed'] is True and report['phase'] == 'capture'
+        and report['budget'] == B['budget'] and report['condensation_seed'] == B['condensation_seed']
+        and report['source'] == packet['source'] and report['native_data_digest'] == digest
+        and report['new_seed_own_origin'] is True and report['raw_H_P0_physical_readout_fullbyte_equal'] is True
+        and report['counts']['native_factory_calls'] == 1 and report['counts']['head_solves_from_capture'] == 0
+        and report['actual_P_updates'] == 0 and report['geometry_bound'] == 1e-12
+        and type(error) in (int,float) and math.isfinite(error) and 0 <= error <= 1e-12,
+        'Fresh seed source/native/direct-H geometry not accepted')
+    _require(report['captured_origin'] == B['captured_origin'] and report['native_P0_factors'] == B['native_P0_factors']
+        and all(packet['readonly_files_sha256'].get(p) == s for p,s in report['source_files_sha256'].items())
+        and all(packet['readonly_files_sha256'].get(B[k]['path']) == B[k]['sha256']
+            for k in ('captured_origin','native_P0_factors','linear_control_report','centroid_control_report')),
+        'Actual fresh capture/source/control lineage differs')
+    baseline = Path(B['baseline_folder'])
+    expected = dict(linear={str(k):dict(path=str(baseline/f'checkpoints/step_{k:06d}.pt'),
+        sha256=packet['readonly_files_sha256'][str(baseline/f'checkpoints/step_{k:06d}.pt')]) for k in (0,25)},
+        controlNy={'0':B['centroid_Nystrom_checkpoint0'],'25':B['centroid_Nystrom_checkpoint25']})
+    _require(B['baseline_snapshot0'] == expected['linear']['0']['path']
+        and B['centroid_control_representation'] == RAW_H, 'Seed physical endpoint paths differ')
+    for phase,key in (('linear','linear_control_report'),('controlNy','centroid_control_report')):
+        control = json.loads(Path(B[key]['path']).read_text())
+        _require(control['kind'] == seed_kind and control['passed'] is True and control['phase'] == phase
+            and control['budget'] == B['budget'] and control['condensation_seed'] == B['condensation_seed']
+            and control['source'] == packet['source'] and control['source_origin'] == B['captured_origin']
+            and control['physical_P0_readout_exact_new_capture'] is True and control['actual_P_updates'] == 25
+            and control['counts']['frozen_factory_calls'] == 1 and control['counts']['native_factory_calls'] == 0
+            and control['endpoints'] == expected[phase]
+            and all(packet['readonly_files_sha256'].get(r['path']) == r['sha256']
+                for r in [*control['endpoints'].values(),control['resume']]),
+            'New matched control does not belong to the fresh native seed and endpoints')
+    return dict(acceptance=ref, report=dict(path=ref['path'],sha256=ref['sha256']), original_residual=error,
+        original_RMS_geometry_metadata_reused=False, fresh_seed_geometry_already_measured=True,
+        RMS_geometry_numeric_replays=0)
