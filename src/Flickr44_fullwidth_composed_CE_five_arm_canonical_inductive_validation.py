@@ -161,7 +161,7 @@ def run(protocol_path,protocol_sha256,phase,arm=None,stop=lambda:False):
             validate_evaluated_state(state,n["expected_config"],folder=state["artifact_folder"])
             gate("own_pure_E25_state",state["step"]==25 and _plain(state["current_evaluation"])==n["endpoint"]
                 and _plain(state["context"])==n["context"] and _plain(state["input_contract"])==n["input_contract"] and state["work"]==n["core_work"]
-                and _plain(state["last_completed_update"])==n["last_update"])
+                and json.loads(json.dumps(_plain(state["last_completed_update"]),sort_keys=True,allow_nan=False))==n["last_update"])
             counts["PT_load_attempts"]+=1;mapped=torch.load(science["required_refs"]["source122_arrays"]["path"],map_location="cpu",weights_only=False,mmap=True)
             counts["PT_loads"]+=1;counts["signed_source122_mmap_loads"]+=1;hard=mapped["hard"].detach().clone();saved["returned_small_hard"]=hard;del mapped
             cap=read(science["required_refs"]["source122_report"])
