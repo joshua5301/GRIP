@@ -1,4 +1,6 @@
 import hashlib
+import json
+import shutil
 from itertools import product
 from pathlib import Path
 
@@ -14,6 +16,18 @@ from src.io import _fingerprint, save_json, save_state, write_table
 from src.models import GCN
 from src.moment_lloyd import moment_lloyd_partition
 from src.variance_moment_sweep import _data_digest
+
+
+def shared_source_identity(source, config):
+    source = Path(source)
+    previous = json.loads((source / "config.json").read_text())
+    for key in ("dataset", "data_digest", "teacher_seed", "settings", "teacher_grid"):
+        if previous.get(key) != config.get(key):
+            raise ValueError(f"Shared teacher source differs: {key}")
+    return dict(path=str(source.resolve()), **{
+        name.replace(".pt", "_sha256"): hashlib.sha256((source / name).read_bytes()).hexdigest()
+        for name in ("teacher.pt", "features.pt")
+    })
 
 
 def _metrics(model, pair):
@@ -106,7 +120,8 @@ def run_gcn_moment_sweep(dataset, ratio, output_dir, temperatures, lambdas,
                          teacher_seed=0, max_sweeps=100, block_size=1024,
                          epochs=1000, eval_every=10, hidden=256, dropout=None,
                          lr=0.01, weight_decay=0.0005, data_dir="/content/data/", device="cuda",
-                         teacher_dropouts=None, teacher_weight_decays=None, partition_method="moment"):
+                         teacher_dropouts=None, teacher_weight_decays=None, partition_method="moment",
+                         shared_teacher_source=None):
     if partition_method not in ("moment", "kmeans"):
         raise ValueError("Choose moment or kmeans")
     if partition_method == "kmeans" and list(lambdas) != [0.0]:
@@ -149,9 +164,17 @@ def run_gcn_moment_sweep(dataset, ratio, output_dir, temperatures, lambdas,
         config.update(mode="variance_sum", objective="RMS feature variance", partition_method="kmeans")
     if teacher_grid:
         config["teacher_grid"] = dict(dropouts=list(teacher_dropouts), weight_decays=list(teacher_weight_decays))
+    if shared_teacher_source is not None:
+        config["shared_source"] = shared_source_identity(shared_teacher_source, config)
     root = Path(output_dir) / _fingerprint(config)
     root.mkdir(parents=True, exist_ok=True)
     save_json(config, root / "config.json")
+    if shared_teacher_source is not None:
+        for name in ("features.pt", "teacher.pt", "teacher_metrics.json", "teacher_grid.csv",
+                     "selected_teacher.json", "teacher_history.csv"):
+            source_path = Path(shared_teacher_source) / name
+            if source_path.exists():
+                shutil.copy2(source_path, root / name)
     if (root / "features.pt").exists():
         h = torch.load(root / "features.pt", map_location=device, weights_only=True)
     else:

@@ -1,7 +1,23 @@
+import json
+
 import pytest
 import torch
 
 import src.gcn_moment_sweep as module
+
+
+def test_shared_teacher_identity_checks_protocol_and_file_contents(tmp_path):
+    config = dict(dataset="cora", data_digest="abc", teacher_seed=0, settings={"lr": .01})
+    (tmp_path / "config.json").write_text(json.dumps(config))
+    (tmp_path / "teacher.pt").write_bytes(b"teacher")
+    (tmp_path / "features.pt").write_bytes(b"features")
+    first = module.shared_source_identity(tmp_path, config)
+    (tmp_path / "teacher.pt").write_bytes(b"different teacher")
+    second = module.shared_source_identity(tmp_path, config)
+    assert first["teacher_sha256"] != second["teacher_sha256"]
+    assert first["features_sha256"] == second["features_sha256"]
+    with pytest.raises(ValueError, match="data_digest"):
+        module.shared_source_identity(tmp_path, dict(config, data_digest="other"))
 
 
 def test_teacher_restores_validation_checkpoint_and_tests_once(tmp_path, monkeypatch):
