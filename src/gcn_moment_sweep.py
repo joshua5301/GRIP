@@ -121,9 +121,13 @@ def run_gcn_moment_sweep(dataset, ratio, output_dir, temperatures, lambdas,
                          epochs=1000, eval_every=10, hidden=256, dropout=None,
                          lr=0.01, weight_decay=0.0005, data_dir="/content/data/", device="cuda",
                          teacher_dropouts=None, teacher_weight_decays=None, partition_method="moment",
-                         shared_teacher_source=None):
+                         shared_teacher_source=None, initialization_space="features"):
     if partition_method not in ("moment", "kmeans", "kl", "variance_sum"):
         raise ValueError("Choose moment, kmeans, kl, or variance_sum")
+    if initialization_space not in ("features", "joint"):
+        raise ValueError("Choose features or joint initialization")
+    if initialization_space == "joint" and partition_method != "variance_sum":
+        raise ValueError("Joint initialization requires variance_sum")
     if partition_method == "kmeans" and list(lambdas) != [0.0]:
         raise ValueError("K-means requires lambdas=[0.0]")
     if (dataset, ratio) not in BUDGET or not temperatures or not lambdas:
@@ -166,6 +170,8 @@ def run_gcn_moment_sweep(dataset, ratio, output_dir, temperatures, lambdas,
         label_term = "label KL" if partition_method == "kl" else "label variance"
         config.update(mode=partition_method, partition_method=partition_method,
                       objective=f"RMS feature variance + lambda * {label_term}")
+    if initialization_space == "joint":
+        config.update(seeding="bound_var", initialization_space="joint")
     if teacher_grid:
         config["teacher_grid"] = dict(dropouts=list(teacher_dropouts), weight_decays=list(teacher_weight_decays))
     if shared_teacher_source is not None:
@@ -200,7 +206,7 @@ def run_gcn_moment_sweep(dataset, ratio, output_dir, temperatures, lambdas,
         else:
             q = (logits / temperature).softmax(1)
             partition = moment_lloyd_partition(h, q, config["nodes"], mode=config["mode"],
-                                              seeding="feature_var", moment_weight=weight,
+                                              seeding=config["seeding"], moment_weight=weight,
                                               max_sweeps=max_sweeps, block_size=block_size) if kmeans_partition is None else dict(kmeans_partition)
             if partition_method == "kmeans":
                 if not partition["converged"]:

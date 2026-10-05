@@ -113,3 +113,26 @@ def test_label_objectives_share_feature_initialization():
         assert all(b <= a + 1e-10 for a, b in zip(p["history"], p["history"][1:]))
 
 
+def test_joint_variance_initialization_matches_objective_space():
+    from src.moment_lloyd import moment_lloyd_partition
+    from src.moment_seeding import pca_partition
+
+    generator = torch.Generator().manual_seed(42)
+    x = torch.randn(40, 5, generator=generator, dtype=torch.float64)
+    q = torch.randn(40, 3, generator=generator, dtype=torch.float64).softmax(1)
+    centered = x - x.mean(0)
+    z = centered / centered.square().sum(1).mean().sqrt()
+    weight = 0.3
+    joint = torch.cat((z, weight**0.5 * (q - q.mean(0))), dim=1)
+    expected, _ = pca_partition(joint, 4, method="var")
+    result = moment_lloyd_partition(x, q, 4, mode="variance_sum", moment_weight=weight,
+                                    seeding="bound_var", max_sweeps=0)
+    assert torch.equal(result["assignment"], expected)
+
+
+def test_joint_initialization_rejects_other_objectives(tmp_path):
+    with pytest.raises(ValueError, match="requires variance_sum"):
+        module.run_gcn_moment_sweep("cora", 0.026, tmp_path, [1.], [1.],
+                                    partition_method="kl", initialization_space="joint")
+
+
