@@ -32,6 +32,9 @@ def implementation_provenance():
 
 def dispatch(job, stop):
     options = dict(job["options"])
+    if job["kind"] == "single_composed_centroid_joint_CE_common_RMS_inverse_physical_seven_arm_validation_v1":
+        from src.single_composed_centroid_joint_CE_common_physical_serving import run
+        return run(**options, stop=stop)
     if job["kind"] == "single_composed_centroid_joint_CE_fresh_generalQ_CPU_complete_chain_qualification_v1":
         from src.composed_centroid_joint_ce_cpu_qualification import run
         return run(**options, stop=stop)
