@@ -32,6 +32,9 @@ def implementation_provenance():
 
 def dispatch(job, stop):
     options = dict(job["options"])
+    if job["kind"] == "Flickr44_original_fullwidth_composed_streaming_native_qualification_and_continuation_v1":
+        from src.Flickr44_fullwidth_composed_joint_ce_streaming_native_qualification import run
+        return run(**options, stop=stop)
     if job["kind"] == "Flickr_shared_original_source122_filebacked_component_export_stageFE_v1":
         from src.Flickr_shared_fullwidth_component_export import run
         return run(**options, stop=stop)
