@@ -32,6 +32,9 @@ def implementation_provenance():
 
 def dispatch(job, stop):
     options = dict(job["options"])
+    if job["kind"] == "Cora140_single_composed_CE_native_qualification_and_continuation_stageFB_v1":
+        from src.Cora140_single_composed_CE_native_qualification import run
+        return run(**options, stop=stop)
     if job["kind"] == "original_rawQ_physical_source_owning_capture_v1":
         from src.rawQ_physical_source_owning import run
         return run(**options, stop=stop)
