@@ -12,6 +12,7 @@ from src.data import _prepare_dataset
 from src.distance_finetune import evaluation_splits
 from src.evaluation import fit_gcn_diagnostic
 from src.io import _fingerprint, save_json, save_state
+from src.moment_lloyd import moment_lloyd_partition
 from src.moments import decode_moments
 from src.soft_ce_partition import optimize_ce_assignment
 from src.variance_moment_sweep import _data_digest
@@ -21,7 +22,9 @@ def run_attention_sweep(source, output_dir, ranks=(8, 16, 32), taus=(0.1, 0.3, 1
                         penalties=(1e-5, 1e-4, 1e-3), steps=300,
                         checkpoints=(0, 25, 50, 100, 200, 300), lr=0.01,
                         methods=("metric", "attention"), data_dir="/content/data/", device="cuda",
-                        assignment_seed=0):
+                        assignment_seed=0, initialization="source", kmeans_max_sweeps=1000):
+    if initialization not in ("source", "kmeans"):
+        raise ValueError("Choose source or kmeans initialization")
     source = Path(source)
     config = json.loads((source / "config.json").read_text())
     selected = json.loads((source / "selected.json").read_text())
@@ -45,26 +48,39 @@ def run_attention_sweep(source, output_dir, ranks=(8, 16, 32), taus=(0.1, 0.3, 1
     del teacher
     original = torch.load(source / f"candidate_{int(selected['candidate']):04d}" / "partition.pt",
                           map_location=device, weights_only=False)
+    if initialization == "kmeans":
+        original = moment_lloyd_partition(
+            h, q, config["nodes"], mode="variance_sum", seeding="feature_var",
+            moment_weight=0., max_sweeps=kmeans_max_sweeps,
+            block_size=config.get("block_size", 1024))
+        if not original["converged"]:
+            raise RuntimeError("K-means did not converge; increase kmeans_max_sweeps")
+        original["x"], original["y"] = original["x"].to(device), original["y"].to(device)
+        original["assignment"] = original["assignment"].to(device)
     assignment = original["assignment"]
     offset = h.mean(0)
     scale = (h - offset).square().sum(1).mean().sqrt().clamp_min(1e-30)
     z = (h - offset) / scale
-    inputs = torch.cat((z, selected["lambda"]**0.5 * (q - q.mean(0))), 1)
+    inputs = z if initialization == "kmeans" else torch.cat((z, selected["lambda"]**0.5 * (q - q.mean(0))), 1)
     counts = torch.bincount(assignment, minlength=config["nodes"]).to(z)
     centers = inputs.new_zeros(config["nodes"], inputs.shape[1]).index_add_(0, assignment, inputs) / counts[:, None]
     files = ("attention_sweep.py", "attention_assignment.py", "soft_ce_partition.py",
-             "low_rank_assignment.py", "moments.py", "head.py", "evaluation.py", "models.py", "data.py")
+             "low_rank_assignment.py", "moments.py", "head.py", "evaluation.py", "models.py", "data.py",
+             "moment_lloyd.py", "moment_seeding.py")
     code = hashlib.sha256(b"".join((Path(__file__).parent / f).read_bytes() for f in files)).hexdigest()
     identity = dict(source=str(source.resolve()), source_config=config, selected=selected,
                     ranks=list(ranks), taus=list(taus), penalties=list(penalties), steps=steps,
                     checkpoints=checkpoints, lr=lr, methods=list(methods), code=code,
                     assignment_seed=assignment_seed,
+                    initialization=initialization, kmeans_max_sweeps=kmeans_max_sweeps,
+                    distance_space="RMS features" if initialization == "kmeans" else "joint features and labels",
                     inner_tol=1e-5, cg_rtol=1e-3, inner_loss="uniform", student_loss="uniform",
                     artifacts={f: hashlib.sha256((source / f).read_bytes()).hexdigest()
                                for f in ("teacher.pt", "features.pt")})
     root = Path(output_dir) / _fingerprint(identity)
     root.mkdir(parents=True, exist_ok=True)
     save_json(identity, root / "config.json")
+    save_state(original, root / "initial_partition.pt")
 
     def evaluate(x, y, folder, final=False):
         seeds = config["final_seeds"] if final else config["search_seeds"]

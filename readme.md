@@ -262,6 +262,13 @@ See [algorithm and stopping semantics](docs/moment_lloyd.md).
 
 # Saved teacher width comparison
 
+`run_attention_sweep(initialization="kmeans", methods=["svd_UV"])` keeps the
+saved teacher and label temperature but replaces the starting partition with
+feature-only Var-Part followed by converged Lloyd updates. SVD then approximates
+the centered negative squared RMS-feature distances to those centroids. No label
+distance or fixed distance term remains. This changes both the partition and
+distance space relative to the joint-label source; it is a pipeline ablation.
+
 `run_attention_sweep(methods=["random_UV"], assignment_seed=0)` provides a
 random-direction control for `svd_UV`: Gaussian U/V columns match the SVD factor
 column norms, with centered V and no fixed distance logits. This still uses
