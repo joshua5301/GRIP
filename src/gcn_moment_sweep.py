@@ -33,6 +33,51 @@ def shared_source_identity(source, config):
     })
 
 
+def width_source_identity(source, candidate, config):
+    source = Path(source)
+    previous = json.loads((source / "config.json").read_text())
+    for key in ("dataset", "data_digest"):
+        if previous.get(key) != config[key]:
+            raise ValueError(f"Width teacher source differs: {key}")
+    if previous.get("seed") != config["teacher_seed"]:
+        raise ValueError("Width teacher source differs: seed")
+    grid = pd.read_csv(source / "teacher_grid.csv")
+    rows = grid.loc[grid.candidate == candidate]
+    if len(rows) != 1:
+        raise ValueError("Width teacher candidate must identify exactly one saved teacher")
+    row = rows.iloc[0]
+    width = int(row["width"] if "width" in row else row["hidden"])
+    path = source / f"candidate_{int(candidate):03d}" / "teacher.pt"
+    return dict(path=str(source.resolve()), candidate=int(candidate), hidden=width,
+                dropout=float(row.dropout), training=previous["training"],
+                teacher_path=str(path.resolve()), **{
+                    name: hashlib.sha256(file.read_bytes()).hexdigest()
+                    for name, file in (("teacher_sha256", path),
+                                       ("features_sha256", source / "features.pt"))
+                })
+
+
+def load_width_teacher(identity, root, graph, testing):
+    if (root / "teacher.pt").exists():
+        return torch.load(root / "teacher.pt", map_location="cpu", weights_only=False)
+    result = torch.load(identity["teacher_path"], map_location="cpu", weights_only=False)
+    model = GCN(graph["x"].shape[1], identity["hidden"], int(graph["y"].max()) + 1,
+                2, identity["dropout"]).to(graph["x"].device)
+    model.load_state_dict(result["state"])
+    if result["logits"].shape != (len(graph["x"]), int(graph["y"].max()) + 1):
+        raise ValueError("Width teacher logits differ from the condensation graph")
+    model.eval()
+    with torch.no_grad():
+        test = _metrics(model, testing)
+    result.update(hidden=identity["hidden"], dropout=identity["dropout"],
+                  test_acc=test["acc"], test_ce=test["ce"])
+    save_state(result, root / "teacher.pt")
+    save_json(identity, root / "selected_teacher.json")
+    save_json({k: v for k, v in result.items() if k not in ("state", "logits")},
+              root / "teacher_metrics.json")
+    return result
+
+
 def _metrics(model, pair):
     graph, mask = pair
     prediction = _forward(model, graph["x"], graph["adj"])
@@ -125,7 +170,15 @@ def run_gcn_moment_sweep(dataset, ratio, output_dir, temperatures, lambdas,
                          lr=0.01, weight_decay=0.0005, data_dir="/content/data/", device="cuda",
                          teacher_dropouts=None, teacher_weight_decays=None, partition_method="moment",
                          shared_teacher_source=None, initialization_space="features",
-                         teacher_type="gcn", teacher_penalties=None):
+                         teacher_type="gcn", teacher_penalties=None,
+                         width_teacher_source=None, width_teacher_candidate=None):
+    if (width_teacher_source is None) != (width_teacher_candidate is None):
+        raise ValueError("Supply both width_teacher_source and width_teacher_candidate")
+    if width_teacher_source is not None and (
+        teacher_type != "gcn" or shared_teacher_source is not None
+        or teacher_dropouts is not None or teacher_weight_decays is not None
+    ):
+        raise ValueError("Width teacher reuse requires a GCN source without other teacher sources or grids")
     if teacher_type not in ("gcn", "sgc"):
         raise ValueError("Choose gcn or sgc teacher")
     if teacher_type == "sgc":
@@ -197,9 +250,14 @@ def run_gcn_moment_sweep(dataset, ratio, output_dir, temperatures, lambdas,
                       teacher_normalization="pool-centered global RMS", teacher_bias_regularized=True)
     if shared_teacher_source is not None:
         config["shared_source"] = shared_source_identity(shared_teacher_source, config)
+    if width_teacher_source is not None:
+        config["width_teacher_source"] = width_source_identity(
+            width_teacher_source, width_teacher_candidate, config)
     root = Path(output_dir) / _fingerprint(config)
     root.mkdir(parents=True, exist_ok=True)
     save_json(config, root / "config.json")
+    if width_teacher_source is not None:
+        shutil.copy2(Path(width_teacher_source) / "features.pt", root / "features.pt")
     if shared_teacher_source is not None:
         for name in ("features.pt", "teacher.pt", "teacher_metrics.json", "teacher_grid.csv",
                      "selected_teacher.json", "teacher_history.csv"):
@@ -210,11 +268,15 @@ def run_gcn_moment_sweep(dataset, ratio, output_dir, temperatures, lambdas,
         h = torch.load(root / "features.pt", map_location=device, weights_only=True)
     else:
         save_state(h, root / "features.pt")
-    teacher = select_sgc_teacher(h, graph, train, validation, testing, teacher_penalties, root) if teacher_type == "sgc" else (
-        select_teacher(graph, train, validation, testing, settings, teacher_seed, root,
-                       teacher_dropouts, teacher_weight_decays)
-        if teacher_grid else fit_teacher(graph, train, validation, testing, settings, teacher_seed, root)
-    )
+    if width_teacher_source is not None:
+        teacher = load_width_teacher(config["width_teacher_source"], root, graph, testing)
+    elif teacher_type == "sgc":
+        teacher = select_sgc_teacher(h, graph, train, validation, testing, teacher_penalties, root)
+    elif teacher_grid:
+        teacher = select_teacher(graph, train, validation, testing, settings, teacher_seed, root,
+                                 teacher_dropouts, teacher_weight_decays)
+    else:
+        teacher = fit_teacher(graph, train, validation, testing, settings, teacher_seed, root)
     logits = teacher["logits"].to(device)
     kmeans_partition = None
     students, rows = [], []

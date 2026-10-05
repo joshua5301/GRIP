@@ -260,3 +260,12 @@ with a `lambda` grid. Both use the same full-feature k-means++ initialization,
 preserve the variance–moment objective, and evaluate uniform-CE GCN students.
 See [algorithm and stopping semantics](docs/moment_lloyd.md).
 
+# Saved teacher width comparison
+
+`run_gcn_moment_sweep` accepts `width_teacher_source` (a saved GCN width/dropout
+search directory) and `width_teacher_candidate` (its teacher grid candidate ID).
+It verifies the dataset, split digest and teacher seed, fingerprints the saved
+teacher and features, and reuses them without retraining. `hidden` and `dropout`
+remain student settings. Use identical condensation grids and student seeds for
+the validation-selected width and the best validation-selected width-256 teacher.
+

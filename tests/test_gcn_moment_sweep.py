@@ -6,6 +6,39 @@ import torch
 import src.gcn_moment_sweep as module
 
 
+def test_width_teacher_identity_keeps_student_settings(tmp_path):
+    config = dict(dataset="cora", data_digest="abc", seed=0, training={"lr": .01})
+    (tmp_path / "config.json").write_text(json.dumps(config))
+    module.pd.DataFrame([dict(candidate=0, hidden=128, dropout=.9)]).to_csv(
+        tmp_path / "teacher_grid.csv", index=False)
+    folder = tmp_path / "candidate_000"
+    folder.mkdir()
+    (folder / "teacher.pt").write_bytes(b"teacher")
+    (tmp_path / "features.pt").write_bytes(b"features")
+    request = dict(dataset="cora", data_digest="abc", teacher_seed=0, settings={"hidden": 256})
+    identity = module.width_source_identity(tmp_path, 0, request)
+    assert identity["hidden"] == 128
+    assert request["settings"]["hidden"] == 256
+    with pytest.raises(ValueError, match="data_digest"):
+        module.width_source_identity(tmp_path, 0, dict(request, data_digest="other"))
+    with pytest.raises(ValueError, match="exactly one"):
+        module.width_source_identity(tmp_path, 1, request)
+
+
+def test_saved_width_teacher_uses_teacher_architecture(tmp_path, monkeypatch):
+    model = module.GCN(3, 4, 2, 2, .5)
+    source = tmp_path / "source.pt"
+    module.save_state(dict(state=model.state_dict(), logits=torch.zeros(3, 2),
+                           val_acc=80., epoch=1), source)
+    identity = dict(teacher_path=str(source), hidden=4, dropout=.5)
+    graph = dict(x=torch.eye(3), y=torch.tensor([0, 1, 0]))
+    monkeypatch.setattr(module, "_metrics", lambda model, pair: dict(acc=70., ce=1.))
+    result = module.load_width_teacher(identity, tmp_path, graph, None)
+    assert result["hidden"] == 4
+    assert result["test_acc"] == 70.
+    assert torch.equal(result["logits"], torch.zeros(3, 2))
+
+
 def test_shared_teacher_identity_checks_protocol_and_file_contents(tmp_path):
     config = dict(dataset="cora", data_digest="abc", teacher_seed=0, settings={"lr": .01})
     (tmp_path / "config.json").write_text(json.dumps(config))
