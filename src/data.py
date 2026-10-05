@@ -55,7 +55,7 @@ def normalize_adj_sparse(data):
     return adj
 
 
-def _prepare_dataset(name, data_dir, device):
+def _prepare_dataset(name, data_dir, device, include_split_features=False):
     args = SimpleNamespace(dataset_name=name, raw_data_dir=str(data_dir).rstrip("/") + "/")
     datasets = get_dataset(args)
 
@@ -78,6 +78,12 @@ def _prepare_dataset(name, data_dir, device):
         source = datasets[0] if isinstance(datasets, list) else datasets
         propagation = normalize_adj_sparse(source).coalesce().to_sparse_csr().to(device)
         H = torch.sparse.mm(propagation, torch.sparse.mm(propagation, train["x"]))
+        if include_split_features:
+            train["sgc_features"] = H
+            if isinstance(datasets, list):
+                for raw, packed in zip(datasets[1:], (validation[0], testing[0])):
+                    operator = normalize_adj_sparse(raw).coalesce().to_sparse_csr().to(device)
+                    packed["sgc_features"] = torch.sparse.mm(operator, torch.sparse.mm(operator, packed["x"]))
     return train, train_mask, validation, testing, H
 
 

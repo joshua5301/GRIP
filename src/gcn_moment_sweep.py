@@ -15,12 +15,15 @@ from src.evaluation import _forward, fit_gcn_diagnostic
 from src.io import _fingerprint, save_json, save_state, write_table
 from src.models import GCN
 from src.moment_lloyd import moment_lloyd_partition
+from src.sgc_teacher import select_sgc_teacher
 from src.variance_moment_sweep import _data_digest
 
 
 def shared_source_identity(source, config):
     source = Path(source)
     previous = json.loads((source / "config.json").read_text())
+    if previous.get("teacher_type", "gcn") != config.get("teacher_type", "gcn"):
+        raise ValueError("Shared teacher source differs: teacher_type")
     for key in ("dataset", "data_digest", "teacher_seed", "settings", "teacher_grid"):
         if previous.get(key) != config.get(key):
             raise ValueError(f"Shared teacher source differs: {key}")
@@ -121,7 +124,17 @@ def run_gcn_moment_sweep(dataset, ratio, output_dir, temperatures, lambdas,
                          epochs=1000, eval_every=10, hidden=256, dropout=None,
                          lr=0.01, weight_decay=0.0005, data_dir="/content/data/", device="cuda",
                          teacher_dropouts=None, teacher_weight_decays=None, partition_method="moment",
-                         shared_teacher_source=None, initialization_space="features"):
+                         shared_teacher_source=None, initialization_space="features",
+                         teacher_type="gcn", teacher_penalties=None):
+    if teacher_type not in ("gcn", "sgc"):
+        raise ValueError("Choose gcn or sgc teacher")
+    if teacher_type == "sgc":
+        if teacher_dropouts is not None or teacher_weight_decays is not None or not teacher_penalties:
+            raise ValueError("SGC teacher requires only teacher_penalties")
+        if any(not 0 < float(p) < float("inf") for p in teacher_penalties):
+            raise ValueError("SGC penalties must be finite and positive")
+    elif teacher_penalties is not None:
+        raise ValueError("teacher_penalties requires an SGC teacher")
     if partition_method not in ("moment", "kmeans", "kl", "variance_sum"):
         raise ValueError("Choose moment, kmeans, kl, or variance_sum")
     if initialization_space not in ("features", "joint"):
@@ -148,7 +161,10 @@ def run_gcn_moment_sweep(dataset, ratio, output_dir, temperatures, lambdas,
             raise ValueError("Teacher weight decay must be finite and nonnegative")
     torch.backends.cuda.matmul.allow_tf32 = False
     torch.backends.cudnn.allow_tf32 = False
-    graph, train, validation, testing, h = _prepare_dataset(dataset, data_dir, device)
+    graph, train, validation, testing, h = (
+        _prepare_dataset(dataset, data_dir, device, include_split_features=True)
+        if teacher_type == "sgc" else _prepare_dataset(dataset, data_dir, device)
+    )
     splits = dict(train=(graph, train), val=validation, test=testing)
     masks = splits if validation[0] is not graph else {key: pair[1] for key, pair in splits.items()}
     settings = dict(epochs=epochs, eval_every=eval_every, hidden=hidden,
@@ -156,6 +172,8 @@ def run_gcn_moment_sweep(dataset, ratio, output_dir, temperatures, lambdas,
                     lr=lr, weight_decay=weight_decay)
     files = ("gcn_moment_sweep.py", "moment_lloyd.py", "moment_seeding.py", "evaluation.py",
              "models.py", "data.py", "io.py")
+    if teacher_type == "sgc":
+        files += ("sgc_teacher.py", "head.py")
     code = hashlib.sha256(b"".join((Path(__file__).parent / name).read_bytes() for name in files)).hexdigest()
     config = dict(dataset=dataset, ratio=ratio, nodes=BUDGET[(dataset, ratio)],
                   temperatures=list(temperatures), lambdas=list(lambdas), teacher_seed=teacher_seed,
@@ -174,6 +192,9 @@ def run_gcn_moment_sweep(dataset, ratio, output_dir, temperatures, lambdas,
         config.update(seeding="bound_var", initialization_space="joint")
     if teacher_grid:
         config["teacher_grid"] = dict(dropouts=list(teacher_dropouts), weight_decays=list(teacher_weight_decays))
+    if teacher_type == "sgc":
+        config.update(teacher_type="sgc", teacher_grid=dict(penalties=list(teacher_penalties)),
+                      teacher_normalization="pool-centered global RMS", teacher_bias_regularized=True)
     if shared_teacher_source is not None:
         config["shared_source"] = shared_source_identity(shared_teacher_source, config)
     root = Path(output_dir) / _fingerprint(config)
@@ -189,7 +210,7 @@ def run_gcn_moment_sweep(dataset, ratio, output_dir, temperatures, lambdas,
         h = torch.load(root / "features.pt", map_location=device, weights_only=True)
     else:
         save_state(h, root / "features.pt")
-    teacher = (
+    teacher = select_sgc_teacher(h, graph, train, validation, testing, teacher_penalties, root) if teacher_type == "sgc" else (
         select_teacher(graph, train, validation, testing, settings, teacher_seed, root,
                        teacher_dropouts, teacher_weight_decays)
         if teacher_grid else fit_teacher(graph, train, validation, testing, settings, teacher_seed, root)
