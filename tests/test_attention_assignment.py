@@ -6,13 +6,15 @@ from src.moments import make_material
 from src.soft_ce_partition import optimize_ce_assignment
 
 
-@pytest.mark.parametrize("method", ["metric", "attention", "low_rank"])
+@pytest.mark.parametrize("method", ["metric", "attention", "low_rank", "svd_UV"])
 def test_chunked_moments_and_gradients_match_dense(method):
     torch.manual_seed(4)
     x, c = torch.randn(12, 5, dtype=torch.double), torch.randn(3, 5, dtype=torch.double)
     model = AttentionAssignment(x, c, 2, 0.3, method)
     material = torch.randn(12, 7, dtype=torch.double)
-    if method == "low_rank":
+    if method == "svd_UV":
+        logits = model.u @ model.v.T / (2**0.5 * model.tau)
+    elif method == "low_rank":
         logits = (-torch.cdist(x, c).square() + model.u @ model.v.T / 2**0.5) / model.tau
     elif method == "metric":
         a, b = x @ model.query, c @ model.query
@@ -31,7 +33,7 @@ def test_chunked_moments_and_gradients_match_dense(method):
         torch.testing.assert_close(first, second)
 
 
-@pytest.mark.parametrize("method", ["metric", "attention", "low_rank"])
+@pytest.mark.parametrize("method", ["metric", "attention", "low_rank", "svd_UV"])
 def test_custom_assignment_bilevel_smoke(method, tmp_path):
     torch.manual_seed(5)
     z = torch.randn(12, 2, dtype=torch.double)
@@ -46,3 +48,15 @@ def test_custom_assignment_bilevel_smoke(method, tmp_path):
         inner_method="newton_first", cg_max_iter=512)
     torch.testing.assert_close(result["checkpoints"][0]["moments"].to(expected), expected)
     assert torch.isfinite(result["checkpoints"][1]["moments"]).all()
+
+
+def test_distance_svd_reconstructs_centered_logits():
+    torch.manual_seed(7)
+    x, c = torch.randn(13, 4, dtype=torch.double), torch.randn(5, 4, dtype=torch.double)
+    model = AttentionAssignment(x, c, 5, 0.3, "svd_UV")
+    target = -torch.cdist(x, c).square()
+    target -= target.mean(1, keepdim=True)
+    torch.testing.assert_close(model.u @ model.v.T / 5**0.5, target)
+    assert not bool(model.left.any()) and not bool(model.right.any())
+    u, v = model.factors()
+    torch.testing.assert_close((u @ v.T / 5**0.5).softmax(1), (target / 0.3).softmax(1))

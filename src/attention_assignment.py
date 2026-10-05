@@ -6,10 +6,25 @@ from src.io import array_digest
 from src.low_rank_assignment import FactorizedBaseMoments
 
 
+@torch.no_grad()
+def distance_svd(inputs, centers, rank):
+    left = torch.cat((2 * inputs, torch.ones_like(inputs[:, :1])), 1)
+    right = torch.cat((centers, -centers.square().sum(1, keepdim=True)), 1)
+    right = right - right.mean(0)
+    ql, rl = torch.linalg.qr(left, mode="reduced")
+    qr, rr = torch.linalg.qr(right, mode="reduced")
+    a, s, bt = torch.linalg.svd(rl @ rr.T, full_matrices=False)
+    if not 1 <= rank <= len(s):
+        raise ValueError("SVD rank exceeds the factorized distance dimensions")
+    scale = s[:rank].sqrt() * rank**0.25
+    return ((ql @ a[:, :rank]) * scale, (qr @ bt[:rank].T) * scale,
+            float(s[rank:].norm() / s.norm().clamp_min(1e-30)))
+
+
 class AttentionAssignment(torch.nn.Module):
     def __init__(self, inputs, centers, rank, tau, method, seed=0):
         super().__init__()
-        if method not in ("metric", "attention", "low_rank") or rank < 1 or not math.isfinite(tau) or tau <= 0:
+        if method not in ("metric", "attention", "low_rank", "svd_UV") or rank < 1 or not math.isfinite(tau) or tau <= 0:
             raise ValueError("Invalid attention configuration")
         self.method, self.rank, self.tau, self.seed = method, rank, tau, seed
         self.register_buffer("inputs", inputs.detach())
@@ -17,7 +32,11 @@ class AttentionAssignment(torch.nn.Module):
         generator = torch.Generator(device=inputs.device).manual_seed(seed)
         weight = torch.randn(inputs.shape[1], rank, device=inputs.device,
                              dtype=inputs.dtype, generator=generator) / math.sqrt(inputs.shape[1])
-        if method == "low_rank":
+        self.svd_relative_error = 0.0
+        if method == "svd_UV":
+            u, v, self.svd_relative_error = distance_svd(inputs, centers, rank)
+            self.u, self.v = torch.nn.Parameter(u), torch.nn.Parameter(v)
+        elif method == "low_rank":
             self.u = torch.nn.Parameter(inputs.new_zeros(len(inputs), rank))
             self.v = torch.nn.Parameter(torch.randn(len(centers), rank, device=inputs.device,
                                                     dtype=inputs.dtype, generator=generator))
@@ -27,15 +46,16 @@ class AttentionAssignment(torch.nn.Module):
             self.key = torch.nn.Parameter(weight.clone())
         left = torch.cat((2 * inputs, torch.ones_like(inputs[:, :1])), 1)
         right = torch.cat((centers, -centers.square().sum(1, keepdim=True)), 1)
-        self.register_buffer("left", left / tau if method != "attention" else inputs.new_zeros(len(inputs), 1))
-        self.register_buffer("right", right if method != "attention" else inputs.new_zeros(len(centers), 1))
+        fixed = method in ("metric", "low_rank")
+        self.register_buffer("left", left / tau if fixed else inputs.new_zeros(len(inputs), 1))
+        self.register_buffer("right", right if fixed else inputs.new_zeros(len(centers), 1))
 
     def identity(self):
         return dict(method=self.method, rank=self.rank, tau=self.tau, seed=self.seed,
                     digest=array_digest(*[v.detach().cpu().numpy() for v in self.state_dict().values()]))
 
     def factors(self):
-        if self.method == "low_rank":
+        if self.method in ("low_rank", "svd_UV"):
             return self.u / self.tau, self.v
         a = self.inputs @ self.query
         b = self.centers @ (self.query if self.method == "metric" else self.key)
