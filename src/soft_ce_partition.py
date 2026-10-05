@@ -542,6 +542,7 @@ def optimize_ce_assignment(
     initial_dense_logits=None,
     initial_factors=None,
     base_factors=None,
+    assignment_model=None,
 ):
     if feature_control != "joint" or initial_representatives is not None:
         raise ValueError("Only clustering-derived features and labels are supported")
@@ -579,8 +580,18 @@ def optimize_ce_assignment(
             "initial_dense_logits",
             "initial_factors",
             "base_factors",
+            "assignment_model",
         )
     }
+    if assignment_model is not None:
+        if (save_assignment or assignment_rank is not None or assignment_input != "node"
+                or mass_mode != "free" or node_weighting or temperature_logits is not None
+                or base_logits is not None or base_factors is not None or sparse_k is not None
+                or initial_dense_logits is not None):
+            raise ValueError("Custom assignments require plain free-mass mode and save_assignment=False")
+        resume_config["assignment_model"] = assignment_model.identity()
+    else:
+        resume_config.pop("assignment_model", None)
     if base_logits is not None:
         supported = assignment_input == "node" or (
             assignment_input == "features" and assignment_encoder == "dual_mlp"
@@ -757,7 +768,9 @@ def optimize_ce_assignment(
         raise ValueError("Outer loss requires at least one node")
     full_features = augmented(outer_z)
     clusters = int(assignment.max()) + 1
-    if sparse_k is not None:
+    if assignment_model is not None:
+        parameters = list(assignment_model.parameters())
+    elif sparse_k is not None:
         candidate_indices, sparse_logits = initialize_sparse(z, assignment, clusters, sparse_k, mixing)
         parameters = [sparse_logits]
     elif assignment_encoder == "prototype":
@@ -869,7 +882,9 @@ def optimize_ce_assignment(
             if assignment_encoder == "dual_mlp":
                 v = encode_nodes(anchor_inputs, cell_parameters)
         balance = dict(balance_iterations=0, row_residual=np.nan, column_residual=np.nan)
-        if sparse_k is not None:
+        if assignment_model is not None:
+            moments = assignment_model(material, chunk_size)
+        elif sparse_k is not None:
             moments = SparseMoments.apply(sparse_logits, candidate_indices, material, clusters, chunk_size)
         elif node_weighting:
             node_weights, weight_kl = normalized_node_weights(node_logits)
