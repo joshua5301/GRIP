@@ -32,6 +32,12 @@ def implementation_provenance():
 
 def dispatch(job, stop):
     options = dict(job["options"])
+    if job["kind"] == "fullwidth_coupled_row_backend_literal_CPU_qualification_stageFC_v1":
+        from src.fullwidth_coupled_row_backend_CPU_qualification import run
+        return run(**options, stop=stop)
+    if job["kind"] == "Cora35_Citeseer30_single_composed_CE_native_qualification_and_continuation_stageFD_v1":
+        from src.Cora35_Citeseer30_single_composed_CE_native_qualification import run
+        return run(**options, stop=stop)
     if job["kind"] == "Cora140_single_composed_CE_five_arm_common_canonical_H_validation_stageFB_v1":
         from src.Cora140_single_composed_CE_canonical_serving import run
         return run(**options, stop=stop)
