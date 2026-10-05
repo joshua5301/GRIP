@@ -162,13 +162,11 @@ def run(protocol_path, protocol_sha256, stop=lambda: False):
             value=hn[:,None]*an[None,:]/(d*bandwidth)*relu@mapping
             own('analytic_map_'+role,value); count('independent_source_analytic_map' if role=='source' else 'independent_endpoint_analytic_maps')
             return value
-        paths=dict(coarsening=str(Path(feature_centroids.__code__.co_filename).resolve()),nystrom=str(Path(NystromMap.__call__.__code__.co_filename).resolve()))
+        counted_code_objects={id(feature_centroids.__code__):'original_feature_centroids_calls',
+            id(quotient_adjacency.__code__):'original_coarsening_quotient_adjacency_calls',
+            id(NystromMap.__call__.__code__):'original_map_calls_total'}
         def profile(frame,event,arg):
-            name=frame.f_code.co_name; path=str(Path(frame.f_code.co_filename).resolve())
-            key=None
-            if path==paths['coarsening'] and name=='feature_centroids': key='original_feature_centroids_calls'
-            elif path==paths['coarsening'] and name=='quotient_adjacency': key='original_coarsening_quotient_adjacency_calls'
-            elif path==paths['nystrom'] and name=='__call__': key='original_map_calls_total'
+            key=counted_code_objects.get(id(frame.f_code))
             if key and event=='call': attempt(key)
             if key and event=='return' and arg is not None: count(key)
             if old_profile is not None: old_profile(frame,event,arg)
@@ -343,7 +341,13 @@ def run(protocol_path, protocol_sha256, stop=lambda: False):
         try:
             if torch is not None:
                 try:
-                    attempt('own_raw_evidence_writes'); guard()
+                    attempt('own_raw_evidence_writes')
+                    try:guard()
+                    except BaseException as error:
+                        report['failure_serialization_guard_error']=repr(error)
+                        report['completed']=False
+                        if report['failure'] is None:report['failure']=dict(type='FailureSerializationResourceBoundary',message=str(error))
+                    # Failure evidence uses only the already registered CPU tree; no new clone or mathematics.
                     with arrays.open('xb') as f:torch.save(saved,f);f.flush();os.fsync(f.fileno())
                     report['raw_evidence']['write_completed']=True; count('own_raw_evidence_writes')
                 except BaseException as error: report['raw_write_error']=repr(error)
@@ -364,7 +368,8 @@ def run(protocol_path, protocol_sha256, stop=lambda: False):
             with rp.open('x') as f:json.dump(observed(report),f,indent=2,allow_nan=False);f.write('\n');f.flush();os.fsync(f.fileno())
             try:guard()
             except BaseException as error:
-                report.update(passed=False,completed=False,resources=peaks(),failure=dict(type='FinalSerializationResourceBoundary',message=str(error)))
+                report.update(passed=False,completed=False,resources=peaks(),final_serialization_guard_error=repr(error))
+                if report['failure'] is None:report['failure']=dict(type='FinalSerializationResourceBoundary',message=str(error))
                 with rp.open('w') as f:json.dump(observed(report),f,indent=2,allow_nan=False);f.write('\n');f.flush();os.fsync(f.fileno())
         finally:signal.signal(signal.SIGALRM,old_signal);signal.setitimer(signal.ITIMER_REAL,*old_timer)
     require(report['passed'],'Terminal FQ CPU proof failure; preserve namespace and no rescue')
