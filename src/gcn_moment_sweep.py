@@ -122,8 +122,8 @@ def run_gcn_moment_sweep(dataset, ratio, output_dir, temperatures, lambdas,
                          lr=0.01, weight_decay=0.0005, data_dir="/content/data/", device="cuda",
                          teacher_dropouts=None, teacher_weight_decays=None, partition_method="moment",
                          shared_teacher_source=None):
-    if partition_method not in ("moment", "kmeans"):
-        raise ValueError("Choose moment or kmeans")
+    if partition_method not in ("moment", "kmeans", "kl", "variance_sum"):
+        raise ValueError("Choose moment, kmeans, kl, or variance_sum")
     if partition_method == "kmeans" and list(lambdas) != [0.0]:
         raise ValueError("K-means requires lambdas=[0.0]")
     if (dataset, ratio) not in BUDGET or not temperatures or not lambdas:
@@ -162,6 +162,10 @@ def run_gcn_moment_sweep(dataset, ratio, output_dir, temperatures, lambdas,
                   seeding="feature_var", mode="filtered_batch", student_loss="uniform")
     if partition_method == "kmeans":
         config.update(mode="variance_sum", objective="RMS feature variance", partition_method="kmeans")
+    elif partition_method in ("kl", "variance_sum"):
+        label_term = "label KL" if partition_method == "kl" else "label variance"
+        config.update(mode=partition_method, partition_method=partition_method,
+                      objective=f"RMS feature variance + lambda * {label_term}")
     if teacher_grid:
         config["teacher_grid"] = dict(dropouts=list(teacher_dropouts), weight_decays=list(teacher_weight_decays))
     if shared_teacher_source is not None:

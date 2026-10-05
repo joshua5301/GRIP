@@ -96,3 +96,20 @@ def test_zero_weight_var_part_lloyd_is_label_independent():
     assert all(b <= a + 1e-10 for a, b in zip(first["history"], first["history"][1:]))
 
 
+def test_label_objectives_share_feature_initialization():
+    from src.moment_lloyd import moment_lloyd_partition
+
+    generator = torch.Generator().manual_seed(42)
+    x = torch.randn(40, 5, generator=generator)
+    q = torch.randn(40, 3, generator=generator).softmax(1)
+    partitions = [
+        moment_lloyd_partition(x, q, 4, mode=mode, moment_weight=0.3,
+                               seeding="feature_var", max_sweeps=200)
+        for mode in ("filtered_batch", "kl", "variance_sum")
+    ]
+    assert len({p["initial_assignment_digest"] for p in partitions}) == 1
+    for p in partitions[1:]:
+        assert p["converged"]
+        assert all(b <= a + 1e-10 for a, b in zip(p["history"], p["history"][1:]))
+
+
