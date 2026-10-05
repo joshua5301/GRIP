@@ -26,7 +26,7 @@ def run_attention_sweep(source, output_dir, ranks=(8, 16, 32), taus=(0.1, 0.3, 1
     selected = json.loads((source / "selected.json").read_text())
     if config.get("partition_method") != "variance_sum" or config.get("initialization_space") != "joint":
         raise ValueError("Use a joint Var-Part label-variance source")
-    if not methods or any(m not in ("metric", "attention") for m in methods):
+    if not methods or any(m not in ("metric", "attention", "low_rank") for m in methods):
         raise ValueError("Invalid methods")
     checkpoints = sorted(set(checkpoints) | {0, steps})
     if any(s < 0 or s > steps for s in checkpoints):
