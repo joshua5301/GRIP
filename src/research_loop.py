@@ -32,6 +32,9 @@ def implementation_provenance():
 
 def dispatch(job, stop):
     options = dict(job["options"])
+    if job['kind'] == 'Cora35_stored_three_arm_quotient_graph_action_zero_fit_diagnostic_v1':
+        from src.quotient_graph_action_diagnostic import run
+        return run(**options, stop=stop)
     if job['kind'] == 'Cora35_original_quotient_fixed25_three_arm_paired_GCN_RAW_X_MLP_validation_v1':
         from src.quotient_composed_ce_native_student_validation import run
         return run(**options, stop=stop)
