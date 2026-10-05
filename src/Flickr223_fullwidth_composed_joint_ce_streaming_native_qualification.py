@@ -297,7 +297,13 @@ def run(protocol_path,protocol_sha256,budget,mode,stop=lambda:False):
                 report["witnesses"]=owner.witness_records;report["witness_attempts"]=owner.witness_attempts;report["witness_returns"]=owner.witness_returns
                 saved["last_operator_evidence"]=owner.last_evidence
             try:
-                report["raw_evidence"]=storage.write(storage.own("wrapper_evidence",saved),arrays_path,exclusive=True)
+                storage.retained["live_wrapper_evidence"]=saved
+                if owner is not None:
+                    saved["last_operator_evidence"]=storage.own("last_operator_evidence",saved["last_operator_evidence"])
+                storage.retained["wrapper_evidence"]=saved
+                require(all(v.device.type=="cpu" and not v.requires_grad and v.grad_fn is None for v in provider.tensors(saved)),
+                    "Final raw evidence must already be detached owning CPU records; no copying fallback")
+                report["raw_evidence"]=storage.write(saved,arrays_path,exclusive=True)
             except BaseException as error:
                 report["passed"]=False;report["failure"]=report["failure"] or dict(error_type=type(error).__name__,error=str(error))
                 last=getattr(storage,"last_write",None)
