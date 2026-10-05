@@ -262,6 +262,12 @@ See [algorithm and stopping semantics](docs/moment_lloyd.md).
 
 # Saved teacher width comparison
 
+`run_attention_sweep(methods=["random_UV"], assignment_seed=0)` provides a
+random-direction control for `svd_UV`: Gaussian U/V columns match the SVD factor
+column norms, with centered V and no fixed distance logits. This still uses
+distance-derived scales; it does not preserve SVD directions or singular values
+of the product. Use the same source, rank/tau/penalty grid and student seeds.
+
 `run_gcn_moment_sweep` accepts `width_teacher_source` (a saved GCN width/dropout
 search directory) and `width_teacher_candidate` (its teacher grid candidate ID).
 It verifies the dataset, split digest and teacher seed, fingerprints the saved

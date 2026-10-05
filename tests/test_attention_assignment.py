@@ -6,13 +6,13 @@ from src.moments import make_material
 from src.soft_ce_partition import optimize_ce_assignment
 
 
-@pytest.mark.parametrize("method", ["metric", "attention", "low_rank", "svd_UV"])
+@pytest.mark.parametrize("method", ["metric", "attention", "low_rank", "svd_UV", "random_UV"])
 def test_chunked_moments_and_gradients_match_dense(method):
     torch.manual_seed(4)
     x, c = torch.randn(12, 5, dtype=torch.double), torch.randn(3, 5, dtype=torch.double)
     model = AttentionAssignment(x, c, 2, 0.3, method)
     material = torch.randn(12, 7, dtype=torch.double)
-    if method == "svd_UV":
+    if method in ("svd_UV", "random_UV"):
         logits = model.u @ model.v.T / (2**0.5 * model.tau)
     elif method == "low_rank":
         logits = (-torch.cdist(x, c).square() + model.u @ model.v.T / 2**0.5) / model.tau
@@ -33,7 +33,7 @@ def test_chunked_moments_and_gradients_match_dense(method):
         torch.testing.assert_close(first, second)
 
 
-@pytest.mark.parametrize("method", ["metric", "attention", "low_rank", "svd_UV"])
+@pytest.mark.parametrize("method", ["metric", "attention", "low_rank", "svd_UV", "random_UV"])
 def test_custom_assignment_bilevel_smoke(method, tmp_path):
     torch.manual_seed(5)
     z = torch.randn(12, 2, dtype=torch.double)
@@ -60,3 +60,18 @@ def test_distance_svd_reconstructs_centered_logits():
     assert not bool(model.left.any()) and not bool(model.right.any())
     u, v = model.factors()
     torch.testing.assert_close((u @ v.T / 5**0.5).softmax(1), (target / 0.3).softmax(1))
+
+
+def test_random_uv_matches_scale_without_distance_directions():
+    torch.manual_seed(7)
+    x, c = torch.randn(13, 4, dtype=torch.double), torch.randn(5, 4, dtype=torch.double)
+    svd = AttentionAssignment(x, c, 3, .3, "svd_UV")
+    random = AttentionAssignment(x, c, 3, .3, "random_UV", seed=0)
+    same = AttentionAssignment(x, c, 3, .3, "random_UV", seed=0)
+    other = AttentionAssignment(x, c, 3, .3, "random_UV", seed=1)
+    for key in ("u", "v"):
+        torch.testing.assert_close(getattr(random, key).norm(dim=0), getattr(svd, key).norm(dim=0))
+        torch.testing.assert_close(getattr(random, key), getattr(same, key))
+        assert not torch.allclose(getattr(random, key), getattr(other, key))
+    assert not bool(random.left.any()) and not bool(random.right.any())
+    assert not torch.allclose(random.u @ random.v.T, svd.u @ svd.v.T)

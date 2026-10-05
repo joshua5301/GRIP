@@ -24,7 +24,7 @@ def distance_svd(inputs, centers, rank):
 class AttentionAssignment(torch.nn.Module):
     def __init__(self, inputs, centers, rank, tau, method, seed=0):
         super().__init__()
-        if method not in ("metric", "attention", "low_rank", "svd_UV") or rank < 1 or not math.isfinite(tau) or tau <= 0:
+        if method not in ("metric", "attention", "low_rank", "svd_UV", "random_UV") or rank < 1 or not math.isfinite(tau) or tau <= 0:
             raise ValueError("Invalid attention configuration")
         self.method, self.rank, self.tau, self.seed = method, rank, tau, seed
         self.register_buffer("inputs", inputs.detach())
@@ -33,8 +33,18 @@ class AttentionAssignment(torch.nn.Module):
         weight = torch.randn(inputs.shape[1], rank, device=inputs.device,
                              dtype=inputs.dtype, generator=generator) / math.sqrt(inputs.shape[1])
         self.svd_relative_error = 0.0
-        if method == "svd_UV":
+        if method in ("svd_UV", "random_UV"):
             u, v, self.svd_relative_error = distance_svd(inputs, centers, rank)
+            if method == "random_UV":
+                factors = []
+                for index, reference in enumerate((u, v)):
+                    random = torch.randn(reference.shape, device=inputs.device,
+                                         dtype=inputs.dtype, generator=generator)
+                    if index == 1:
+                        random -= random.mean(0)
+                    random *= reference.norm(dim=0) / random.norm(dim=0).clamp_min(1e-30)
+                    factors.append(random)
+                u, v = factors
             self.u, self.v = torch.nn.Parameter(u), torch.nn.Parameter(v)
         elif method == "low_rank":
             self.u = torch.nn.Parameter(inputs.new_zeros(len(inputs), rank))
@@ -55,7 +65,7 @@ class AttentionAssignment(torch.nn.Module):
                     digest=array_digest(*[v.detach().cpu().numpy() for v in self.state_dict().values()]))
 
     def factors(self):
-        if self.method in ("low_rank", "svd_UV"):
+        if self.method in ("low_rank", "svd_UV", "random_UV"):
             return self.u / self.tau, self.v
         a = self.inputs @ self.query
         b = self.centers @ (self.query if self.method == "metric" else self.key)

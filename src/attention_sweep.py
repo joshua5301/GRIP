@@ -20,13 +20,14 @@ from src.variance_moment_sweep import _data_digest
 def run_attention_sweep(source, output_dir, ranks=(8, 16, 32), taus=(0.1, 0.3, 1.0),
                         penalties=(1e-5, 1e-4, 1e-3), steps=300,
                         checkpoints=(0, 25, 50, 100, 200, 300), lr=0.01,
-                        methods=("metric", "attention"), data_dir="/content/data/", device="cuda"):
+                        methods=("metric", "attention"), data_dir="/content/data/", device="cuda",
+                        assignment_seed=0):
     source = Path(source)
     config = json.loads((source / "config.json").read_text())
     selected = json.loads((source / "selected.json").read_text())
     if config.get("partition_method") != "variance_sum" or config.get("initialization_space") != "joint":
         raise ValueError("Use a joint Var-Part label-variance source")
-    if not methods or any(m not in ("metric", "attention", "low_rank", "svd_UV") for m in methods):
+    if not methods or any(m not in ("metric", "attention", "low_rank", "svd_UV", "random_UV") for m in methods):
         raise ValueError("Invalid methods")
     checkpoints = sorted(set(checkpoints) | {0, steps})
     if any(s < 0 or s > steps for s in checkpoints):
@@ -57,6 +58,7 @@ def run_attention_sweep(source, output_dir, ranks=(8, 16, 32), taus=(0.1, 0.3, 1
     identity = dict(source=str(source.resolve()), source_config=config, selected=selected,
                     ranks=list(ranks), taus=list(taus), penalties=list(penalties), steps=steps,
                     checkpoints=checkpoints, lr=lr, methods=list(methods), code=code,
+                    assignment_seed=assignment_seed,
                     inner_tol=1e-5, cg_rtol=1e-3, inner_loss="uniform", student_loss="uniform",
                     artifacts={f: hashlib.sha256((source / f).read_bytes()).hexdigest()
                                for f in ("teacher.pt", "features.pt")})
@@ -84,8 +86,10 @@ def run_attention_sweep(source, output_dir, ranks=(8, 16, 32), taus=(0.1, 0.3, 1
         if path.exists():
             optimized = torch.load(path, map_location="cpu", weights_only=False)
         else:
-            model = AttentionAssignment(inputs, centers, rank, tau, method)
-            save_json(dict(svd_relative_error=model.svd_relative_error), folder / "initialization.json")
+            model = AttentionAssignment(inputs, centers, rank, tau, method, seed=assignment_seed)
+            save_json(dict(svd_relative_error=model.svd_relative_error if method == "svd_UV" else None,
+                           initialization="random Gaussian with SVD column norms" if method == "random_UV" else method,
+                           assignment_seed=assignment_seed), folder / "initialization.json")
             resume = folder / "resume.pt"
             state = torch.load(resume, map_location="cpu", weights_only=False) if resume.exists() else None
             optimized = optimize_ce_assignment(
