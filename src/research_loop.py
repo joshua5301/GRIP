@@ -32,6 +32,9 @@ def implementation_provenance():
 
 def dispatch(job, stop):
     options = dict(job["options"])
+    if job["kind"] == "Flickr223_fullwidth_composed_CE_five_arm_canonical_inductive_validation_v1":
+        from src.Flickr223_fullwidth_composed_CE_five_arm_canonical_inductive_validation import run
+        return run(**options, stop=stop)
     if job["kind"] == "Flickr223_original_fullwidth_composed_streaming_native_qualification_and_continuation_v1":
         from src.Flickr223_fullwidth_composed_joint_ce_streaming_native_qualification import run
         return run(**options, stop=stop)
