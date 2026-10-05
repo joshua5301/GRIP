@@ -1,4 +1,4 @@
-"""Unexecuted EZ literal general-Q CPU complete-chain proof; no old oracle/fixture."""
+"""Unexecuted EZ SAME-literal general-Q proof with fixed Decimal80 scalar Armijo."""
 import hashlib
 import json
 import math
@@ -6,10 +6,11 @@ import resource
 import signal
 import sys
 import time
+from decimal import Decimal, Context, localcontext, ROUND_HALF_EVEN
 from pathlib import Path
 
 KIND = "single_composed_centroid_joint_CE_fresh_generalQ_CPU_complete_chain_qualification_v1"
-SCIENCE_SHA = "df4c8715ee1d5245bc7716676c27904d642468e79d678a09a05b92f113e4215f"
+SCIENCE_SHA = "5f58ddb5b076d140bd8d9877445344d6590fa9d2bb2ad3ef3efeb1a629e11bc6"
 
 
 def require(ok, message):
@@ -55,7 +56,8 @@ def run(protocol_path, protocol_sha256, stop=lambda: False):
             hash_error=None, write_completed=False), head_summaries=[], FD_summaries=[])
     report["attempts"] = dict(stationary_heads=0, adjoints=0, public_raw_cotangent_calls=0,
         public_complete_cotangent_calls=0, generic_moment_gradient_calls=0)
-    report["arithmetic_work"] = dict(dense_Hessians=0, Newton_steps=0, Armijo_trials=0)
+    report["arithmetic_work"] = dict(dense_Hessians=0, Newton_steps=0, Armijo_trials=0, Decimal_scalar_objective_evaluations=0)
+    report["scalar_Armijo_arithmetic"] = dict(precision=80, rounding="ROUND_HALF_EVEN", all_heads=True, fallback=False, precision_search=False)
     saved, torch = {}, None
     old_handler, old_timer = signal.getsignal(signal.SIGALRM), signal.getitimer(signal.ITIMER_REAL)
 
@@ -143,6 +145,19 @@ def run(protocol_path, protocol_sha256, stop=lambda: False):
         def inner(x,t,theta):
             lp=(x@theta.T).log_softmax(1)
             return -(t*lp).sum()/k + penalty*theta.square().sum()/2
+        def decimal_inner(x_values,t_values,theta):
+            # Only the scalar line-search objective uses fixed high precision.
+            report["arithmetic_work"]["Decimal_scalar_objective_evaluations"]+=1
+            with localcontext(Context(prec=80,rounding=ROUND_HALF_EVEN)):
+                th=[[Decimal.from_float(float(v)) for v in row] for row in theta.tolist()]
+                total=Decimal(0)
+                for xi,ti in zip(x_values,t_values):
+                    logits=[sum((a*b for a,b in zip(xi,tr)),Decimal(0)) for tr in th]
+                    shift=max(logits)
+                    lse=shift+sum(((value-shift).exp() for value in logits),Decimal(0)).ln()
+                    total+=sum((target*(lse-value) for target,value in zip(ti,logits)),Decimal(0))
+                ridge=sum((v*v for row in th for v in row),Decimal(0))
+                return total/Decimal(k)+Decimal.from_float(float(penalty))*ridge/Decimal(2)
         def dense_terms(x,t,theta):
             p=(x@theta.T).softmax(1); s=t.sum(1)
             gradient=((s[:,None]*p-t).T@x)/k+penalty*theta
@@ -159,27 +174,42 @@ def run(protocol_path, protocol_sha256, stop=lambda: False):
             theta=torch.zeros((c,F+1),dtype=torch.float64); iterations=0; trials=0
             row=dict(role=role,theta=theta.clone(),physical_moments=mp.detach().clone(),centers=cen.detach().clone(),targets=t.detach().clone(),features=None)
             heads.append(row);saved["heads"]=heads
+            summary=dict(role=role,completed=False,head_gradient_abs_max=None,Newton_steps=0,Armijo_trials=0,
+                inner_loss=None,last_theta_FP64=theta.tolist(),last_alpha=None,
+                last_Decimal_current_value=None,last_Decimal_candidate_value=None,last_Decimal_Armijo_rhs=None)
+            report["head_summaries"].append(summary)
             f=independent_features(cen,role);row["features"]=f.detach().clone()
             x=torch.cat((f,torch.ones((k,1),dtype=torch.float64)),1)
+            x_values=[[Decimal.from_float(float(v)) for v in ri] for ri in x.tolist()]
+            t_values=[[Decimal.from_float(float(v)) for v in ri] for ri in t.tolist()]
             for iteration in range(101):
                 check(); gradient,H=dense_terms(x,t,theta); norm=float(gradient.abs().max())
                 row.update(theta=theta.detach().clone(),gradient=gradient.detach().clone(),Hessian=H.detach().clone(),head_gradient_abs_max=norm,Newton_steps=iterations,Armijo_trials=trials)
+                summary.update(head_gradient_abs_max=norm,Newton_steps=iterations,Armijo_trials=trials,last_theta_FP64=theta.tolist())
                 if norm<=1e-12: break
                 require(iteration<100,"Frozen independent Newton100 exhausted")
                 direction=torch.linalg.solve(H,gradient.reshape(-1)).reshape_as(theta); descent=(gradient*direction).sum()
                 require(bool(torch.isfinite(direction).all()) and float(descent)>0,"Independent Newton descent")
-                value=inner(x,t,theta); alpha=1.
+                value=decimal_inner(x_values,t_values,theta); alpha=1.
+                summary["last_Decimal_current_value"]=str(value)
                 for trial in range(60):
                     check(); trials+=1;report["arithmetic_work"]["Armijo_trials"]+=1
                     candidate=theta-alpha*direction
-                    if float(inner(x,t,candidate))<=float(value-1e-4*alpha*descent): break
+                    candidate_value=decimal_inner(x_values,t_values,candidate)
+                    with localcontext(Context(prec=80,rounding=ROUND_HALF_EVEN)):
+                        armijo_rhs=value-Decimal.from_float(1e-4)*Decimal.from_float(alpha)*Decimal.from_float(float(descent))
+                    summary.update(Armijo_trials=trials,last_alpha=alpha,
+                        last_Decimal_candidate_value=str(candidate_value),last_Decimal_Armijo_rhs=str(armijo_rhs))
+                    row.update(last_candidate_theta=candidate.detach().clone(),last_Decimal_candidate_value=str(candidate_value),last_Decimal_Armijo_rhs=str(armijo_rhs))
+                    if candidate_value<=armijo_rhs: break
                     alpha*=.5
                 else: raise RuntimeError("Frozen Armijo60 exhausted")
                 theta=candidate.detach();iterations+=1;report["arithmetic_work"]["Newton_steps"]+=1
             row.update(theta=theta.clone(),head_gradient_abs_max=norm,Newton_steps=iterations,Armijo_trials=trials,
                 inner_loss=float(inner(x,t,theta)))
-            summary={name:row[name] for name in ("role","head_gradient_abs_max","Newton_steps","Armijo_trials","inner_loss")}
-            report["head_summaries"].append(summary);report["work"]["stationary_heads"]+=1
+            summary.update({name:row[name] for name in ("role","head_gradient_abs_max","Newton_steps","Armijo_trials","inner_loss")})
+            summary.update(completed=True,last_theta_FP64=theta.tolist())
+            report["work"]["stationary_heads"]+=1
             gate("stationary_head_"+role,norm<=1e-12 and bool(torch.isfinite(theta).all()))
             return theta,x,t,H
         theta0,x0,t0,H0=head(M0,"baseline")

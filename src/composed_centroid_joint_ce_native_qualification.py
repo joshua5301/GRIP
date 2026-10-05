@@ -10,7 +10,7 @@ import time
 from pathlib import Path
 
 KIND = "single_composed_centroid_joint_CE_native_qualification_and_continuation_v1"
-SCIENCE_SHA = "968b0f1c4a72ab4d75b8c78f2cad0581b570405877489c5847912065220e9459"
+SCIENCE_SHA = "4d2c097fb96d301cf4b59b4c32c8f11ed2fee6b92ad1a8a0cd46a7f43cee308d"
 ENGINE_SHA = "0299164068e1f52caac6d254bcf0d6cf1bb10029ade37e627e9bcbf648e8cefe"
 
 
