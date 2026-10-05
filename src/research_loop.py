@@ -32,6 +32,9 @@ def implementation_provenance():
 
 def dispatch(job, stop):
     options = dict(job["options"])
+    if job["kind"] == 'quotient_propagated_original_Nystrom_composed_uniform_CE_tiny_CPU_complete_chain_FIRST_v1':
+        from src.quotient_composed_ce_CPU_qualification import run
+        return run(**options, stop=stop)
     if job["kind"] == "three_FA153_twofold_crossFit25_canonical_sixarm_fullsource_RMS_serving_and_fresh3_validation_stageFP_v1":
         from src.FA153_three_budget_two_fold_crossFit25_common_physical_serving import run
         return run(**options, stop=stop)
