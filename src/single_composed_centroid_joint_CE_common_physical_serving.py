@@ -15,7 +15,7 @@ import signal
 import time
 
 KIND = "single_composed_centroid_joint_CE_common_RMS_inverse_physical_seven_arm_validation_v1"
-SCIENCE_SHA = "efcd3fe9e6323716c96a408cc9a15c05ef2d46ff4ecd77a54d1b4c96d26cc2fb"
+SCIENCE_SHA = "548bcf89153b34d7f78fe5188536873f683079b17db9097f1f126be221760009"
 ARMS = ("P0", "linear25", "centroidNy25", "unscaledjoint25", "centeredbalanced25", "physicalOuter25", "composedjoint25")
 OLD_ARM_KEYS = {name:name for name in ARMS[:-1]}
 SEEDS = [620400, 620401, 620402]
