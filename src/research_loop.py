@@ -32,6 +32,9 @@ def implementation_provenance():
 
 def dispatch(job, stop):
     options = dict(job["options"])
+    if job["kind"] == 'original_ROW_CSR_quotient_SGC_original_Nystrom_uniform_CE_native_acceptedE1_to_fixed25_v1':
+        from src.quotient_composed_ce_native_trajectory import run
+        return run(**options, stop=stop)
     if job["kind"] == 'original_ROW_CSR_quotient_SGC_original_Nystrom_composed_uniform_CE_native_FIRST0to1_v1':
         from src.quotient_composed_ce_native_qualification import run
         return run(**options, stop=stop)
