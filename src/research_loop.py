@@ -32,6 +32,9 @@ def implementation_provenance():
 
 def dispatch(job, stop):
     options = dict(job["options"])
+    if job["kind"] == 'three_original_FA153_two_fixed_source_fold_composed_uniform_CE_native_qualification_and_continuation_stageFO_v1':
+        from src.source_crossfit_composed_ce_FA153_native_qualification import run
+        return run(**options, stop=stop)
     if job["kind"] == "source_crossfit_composed_CE_fullsource_RMS_five_arm_common_physical_validation_stageFN_v1":
         from src.Cora70_Citeseer120_two_fold_crossFit25_common_physical_serving import run
         return run(**options, stop=stop)
