@@ -6,6 +6,43 @@ import torch
 import src.gcn_moment_sweep as module
 
 
+def test_dropout_comparison_reuses_saved_teachers_and_trains_only_missing(tmp_path, monkeypatch):
+    source = tmp_path / "source"
+    source.mkdir()
+    (source / "config.json").write_text(json.dumps(dict(
+        dataset="cora", data_digest="abc", seed=0,
+        training=dict(lr=.01, weight_decay=.0005, epochs=1000, eval_every=10))))
+    (source / "features.pt").write_bytes(b"features")
+    module.pd.DataFrame([dict(candidate=i, hidden=256, dropout=p) for i, p in enumerate((.1, .5))]).to_csv(
+        source / "teacher_grid.csv", index=False)
+    for i in range(2):
+        folder = source / f"candidate_{i:03d}"
+        folder.mkdir()
+        (folder / "teacher.pt").write_bytes(b"saved teacher")
+    calls = []
+
+    def fit(graph, train, validation, testing, settings, seed, folder):
+        assert testing is None
+        assert settings["hidden"] == 256
+        assert settings["weight_decay"] == .0005
+        calls.append(settings["dropout"])
+        result = dict(val_acc=80., val_ce=.7, epoch=10)
+        folder.mkdir(parents=True)
+        module.save_state(result, folder / "teacher.pt")
+        return result
+
+    monkeypatch.setattr(module, "_prepare_dataset", lambda *args: ({}, None, None, None, None))
+    monkeypatch.setattr(module, "_data_digest", lambda splits: "abc")
+    monkeypatch.setattr(module, "fit_teacher", fit)
+    paths = module.prepare_dropout_teachers(source, tmp_path / "output", device="cpu")
+    assert calls == [0.]
+    assert paths[.1] == dict(source=str(source), candidate=0)
+    assert paths[.5] == dict(source=str(source), candidate=1)
+    assert paths[0.]["source"] != str(source)
+    assert module.prepare_dropout_teachers(source, tmp_path / "output", device="cpu") == paths
+    assert calls == [0.]
+
+
 def test_width_teacher_identity_keeps_student_settings(tmp_path):
     config = dict(dataset="cora", data_digest="abc", seed=0, training={"lr": .01})
     (tmp_path / "config.json").write_text(json.dumps(config))

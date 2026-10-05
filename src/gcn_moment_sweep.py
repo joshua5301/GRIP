@@ -78,6 +78,64 @@ def load_width_teacher(identity, root, graph, testing):
     return result
 
 
+def prepare_dropout_teachers(source, output_dir, dropouts=(0., .1, .5), hidden=256,
+                              data_dir="/content/data/", device="cuda"):
+    source = Path(source)
+    previous = json.loads((source / "config.json").read_text())
+    grid = pd.read_csv(source / "teacher_grid.csv")
+    width_column = "hidden" if "hidden" in grid else "width"
+    sources, missing = {}, []
+    for dropout in dropouts:
+        if not 0 <= dropout < 1:
+            raise ValueError("Dropout must be in [0, 1)")
+        matches = grid[(grid[width_column] == hidden) & ((grid.dropout - dropout).abs() < 1e-12)]
+        if len(matches) > 1:
+            raise ValueError("Ambiguous saved teacher configuration")
+        if len(matches):
+            candidate = int(matches.iloc[0].candidate)
+            path = source / f"candidate_{candidate:03d}" / "teacher.pt"
+            if not path.exists():
+                raise FileNotFoundError(path)
+            sources[dropout] = dict(source=str(source), candidate=candidate)
+        else:
+            missing.append(dropout)
+    if not missing:
+        return sources
+    config = dict(dataset=previous["dataset"], data_digest=previous["data_digest"],
+                  seed=previous["seed"], training=previous["training"], hidden=hidden,
+                  dropouts=missing, source=str(source.resolve()),
+                  features_sha256=hashlib.sha256((source / "features.pt").read_bytes()).hexdigest(),
+                  code=hashlib.sha256(b"".join((Path(__file__).parent / name).read_bytes()
+                                             for name in ("gcn_moment_sweep.py", "models.py", "data.py", "evaluation.py"))).hexdigest(),
+                  torch=str(torch.__version__))
+    root = Path(output_dir) / _fingerprint(config)
+    root.mkdir(parents=True, exist_ok=True)
+    save_json(config, root / "config.json")
+    shutil.copy2(source / "features.pt", root / "features.pt")
+    graph = train = validation = testing = None
+    rows = []
+    for candidate, dropout in enumerate(missing):
+        folder = root / f"candidate_{candidate:03d}"
+        if (folder / "teacher.pt").exists():
+            teacher = torch.load(folder / "teacher.pt", map_location="cpu", weights_only=False)
+        else:
+            if graph is None:
+                torch.backends.cuda.matmul.allow_tf32 = False
+                torch.backends.cudnn.allow_tf32 = False
+                graph, train, validation, testing, computed = _prepare_dataset(config["dataset"], data_dir, device)
+                del computed
+                if _data_digest(dict(train=(graph, train), val=validation, test=testing)) != config["data_digest"]:
+                    raise ValueError("Data differ from the saved teacher experiment")
+            teacher = fit_teacher(graph, train, validation, None,
+                                  dict(config["training"], hidden=hidden, dropout=dropout),
+                                  config["seed"], folder)
+        rows.append(dict(candidate=candidate, hidden=hidden, dropout=dropout,
+                         val_acc=teacher["val_acc"], val_ce=teacher["val_ce"], epoch=teacher["epoch"]))
+        write_table(pd.DataFrame(rows), root / "teacher_grid.csv")
+        sources[dropout] = dict(source=str(root), candidate=candidate)
+    return sources
+
+
 def _metrics(model, pair):
     graph, mask = pair
     prediction = _forward(model, graph["x"], graph["adj"])
